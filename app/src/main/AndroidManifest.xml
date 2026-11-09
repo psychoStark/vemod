@@ -1,0 +1,153 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <uses-permission android:name="com.android.launcher.permission.INSTALL_SHORTCUT" />
+
+    <application
+        android:name=".VemodApp"
+        android:allowBackup="true"
+        android:label="Vemod"
+        android:supportsRtl="true"
+        android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
+
+        <activity
+            android:name=".ui.MainActivity"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!-- Isolated guest container process -->
+        <activity
+            android:name=".proxy.GuestProxyActivity"
+            android:process=":guest"
+            android:exported="true"
+            android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|keyboard" />
+
+        <!-- App Drawer Slots 1 to 10 for direct system launcher integration -->
+        <activity-alias
+            android:name=".slot.AppSlot1"
+            android:targetActivity=".proxy.GuestProxyActivity"
+            android:enabled="false"
+            android:exported="true"
+            android:label="32-Bit App 1">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity-alias>
+
+        <activity-alias
+            android:name=".slot.AppSlot2"
+            android:targetActivity=".proxy.GuestProxyActivity"
+            android:enabled="false"
+            android:exported="true"
+            android:label="32-Bit App 2">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity-alias>
+
+        <activity-alias
+            android:name=".slot.AppSlot3"
+            android:targetActivity=".proxy.GuestProxyActivity"
+            android:enabled="false"
+            android:exported="true"
+            android:label="32-Bit App 3">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity-alias>
+
+        <activity-alias
+            android:name=".slot.AppSlot4"
+            android:targetActivity=".proxy.GuestProxyActivity"
+            android:enabled="false"
+            android:exported="true"
+            android:label="32-Bit App 4">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity-alias>
+
+        <activity-alias
+            android:name=".slot.AppSlot5"
+            android:targetActivity=".proxy.GuestProxyActivity"
+            android:enabled="false"
+            android:exported="true"
+            android:label="32-Bit App 5">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity-alias>
+
+        <activity-alias
+            android:name=".slot.AppSlot6"
+            android:targetActivity=".proxy.GuestProxyActivity"
+            android:enabled="false"
+            android:exported="true"
+            android:label="32-Bit App 6">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity-alias>
+
+        <activity-alias
+            android:name=".slot.AppSlot7"
+            android:targetActivity=".proxy.GuestProxyActivity"
+            android:enabled="false"
+            android:exported="true"
+            android:label="32-Bit App 7">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity-alias>
+
+        <activity-alias
+            android:name=".slot.AppSlot8"
+            android:targetActivity=".proxy.GuestProxyActivity"
+            android:enabled="false"
+            android:exported="true"
+            android:label="32-Bit App 8">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity-alias>
+
+        <activity-alias
+            android:name=".slot.AppSlot9"
+            android:targetActivity=".proxy.GuestProxyActivity"
+            android:enabled="false"
+            android:exported="true"
+            android:label="32-Bit App 9">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity-alias>
+
+        <activity-alias
+            android:name=".slot.AppSlot10"
+            android:targetActivity=".proxy.GuestProxyActivity"
+            android:enabled="false"
+            android:exported="true"
+            android:label="32-Bit App 10">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity-alias>
+
+    </application>
+
+</manifest>
