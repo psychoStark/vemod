@@ -23,4 +23,6 @@ public:
 u32 jni_local(jobject o);  // host local ref -> guest handle in the current frame
 jobject jni_obj(u32 h);    // guest handle -> host reference
 
+void jni_sync_direct_buffers_to_host();
+
 }  // namespace nb

@@ -2,7 +2,11 @@ package com.vemod.container.ui
 
 import android.content.Intent
 import android.graphics.BitmapFactory
+import android.net.Uri
+import android.os.Build
 import android.os.Bundle
+import android.os.Environment
+import android.provider.Settings
 import android.util.Log
 import android.widget.Toast
 import androidx.activity.ComponentActivity
@@ -11,9 +15,11 @@ import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.selection.selectable
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.*
@@ -23,11 +29,14 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.vemod.container.R
+import com.vemod.container.bridge.VemodBridge
 import com.vemod.container.container.ApkExtractor
 import com.vemod.container.container.ContainerRegistry
 import com.vemod.container.model.ContainerApp
@@ -71,7 +80,7 @@ class MainActivity : ComponentActivity() {
                 val file = File(apkPath)
                 if (file.exists()) {
                     val app = ApkExtractor.extractFromFile(this@MainActivity, file)
-                    ContainerRegistry.assignSlot(this@MainActivity, app.packageName)
+                    ContainerRegistry.installToAppDrawer(this@MainActivity, app.packageName)
                     runOnUiThread {
                         globalRefreshTrigger++
                         Toast.makeText(this@MainActivity, "Installed ${app.appName}!", Toast.LENGTH_SHORT).show()
@@ -90,6 +99,9 @@ class MainActivity : ComponentActivity() {
         var extractingName by remember { mutableStateOf("") }
         var installedApps by remember { mutableStateOf<List<ContainerApp>>(emptyList()) }
         var refreshTrigger by remember { mutableStateOf(0) }
+        var showSettingsDialog by remember { mutableStateOf(false) }
+        val prefs = remember { getSharedPreferences("vemod_settings", android.content.Context.MODE_PRIVATE) }
+        var currentLogLevel by remember { mutableStateOf(prefs.getInt("log_level", VemodBridge.LOG_LEVEL_BASIC)) }
 
         // Refresh installed apps list
         LaunchedEffect(refreshTrigger, globalRefreshTrigger) {
@@ -105,8 +117,8 @@ class MainActivity : ComponentActivity() {
                 thread {
                     try {
                         val app = ApkExtractor.extract(this@MainActivity, uri)
-                        // Auto-assign App Drawer slot if available
-                        ContainerRegistry.assignSlot(this@MainActivity, app.packageName)
+                        // Auto-install App Drawer stub
+                        ContainerRegistry.installToAppDrawer(this@MainActivity, app.packageName)
                         runOnUiThread {
                             isExtracting = false
                             refreshTrigger++
@@ -123,25 +135,130 @@ class MainActivity : ComponentActivity() {
             }
         }
 
+        val manageStorageLauncher = rememberLauncherForActivityResult(
+            contract = ActivityResultContracts.StartActivityForResult()
+        ) {
+            refreshTrigger++
+        }
+
+        if (showSettingsDialog) {
+            val logOptions = listOf(
+                Triple(VemodBridge.LOG_LEVEL_NONE, "No logging", "Maximum performance - disables bridge logs"),
+                Triple(VemodBridge.LOG_LEVEL_BASIC, "Basic logs", "Default - lifecycle events and errors"),
+                Triple(VemodBridge.LOG_LEVEL_ADVANCED, "Advanced logging", "Sampled JNI dispatch & thread lifecycle"),
+                Triple(VemodBridge.LOG_LEVEL_FULL, "Full logging", "All JNI calls, raw syscalls & detailed tracing")
+            )
+
+            AlertDialog(
+                onDismissRequest = { showSettingsDialog = false },
+                title = {
+                    Text(
+                        text = "Debug Logging Level",
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 18.sp
+                    )
+                },
+                text = {
+                    Column(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Text(
+                            text = "Configure bridge and guest logging overhead. 'No logging' gives maximum frame rate.",
+                            fontSize = 13.sp,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                        Spacer(modifier = Modifier.height(4.dp))
+                        logOptions.forEach { (level, title, desc) ->
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clip(RoundedCornerShape(8.dp))
+                                    .clickable {
+                                        currentLogLevel = level
+                                        prefs.edit().putInt("log_level", level).apply()
+                                        VemodBridge.nativeSetLogLevel(level)
+                                        Toast.makeText(this@MainActivity, "Log level: $title", Toast.LENGTH_SHORT).show()
+                                        showSettingsDialog = false
+                                    }
+                                    .padding(vertical = 6.dp, horizontal = 4.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                RadioButton(
+                                    selected = (currentLogLevel == level),
+                                    onClick = {
+                                        currentLogLevel = level
+                                        prefs.edit().putInt("log_level", level).apply()
+                                        VemodBridge.nativeSetLogLevel(level)
+                                        Toast.makeText(this@MainActivity, "Log level: $title", Toast.LENGTH_SHORT).show()
+                                        showSettingsDialog = false
+                                    }
+                                )
+                                Spacer(modifier = Modifier.width(8.dp))
+                                Column {
+                                    Text(
+                                        text = title,
+                                        fontWeight = FontWeight.Medium,
+                                        fontSize = 15.sp,
+                                        color = MaterialTheme.colorScheme.onSurface
+                                    )
+                                    Text(
+                                        text = desc,
+                                        fontSize = 12.sp,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                }
+                            }
+                        }
+                    }
+                },
+                confirmButton = {
+                    TextButton(onClick = { showSettingsDialog = false }) {
+                        Text("Close")
+                    }
+                }
+            )
+        }
+
         Scaffold(
             topBar = {
                 TopAppBar(
                     title = {
-                        Column {
-                            Text(
-                                text = "Vemod",
-                                fontWeight = FontWeight.Bold,
-                                fontSize = 20.sp,
-                                color = MaterialTheme.colorScheme.primary
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Image(
+                                painter = painterResource(id = R.drawable.ic_vemod_logo),
+                                contentDescription = "Vemod Logo",
+                                modifier = Modifier
+                                    .size(36.dp)
+                                    .clip(RoundedCornerShape(8.dp))
                             )
-                            Text(
-                                text = "32-Bit APK Container Manager",
-                                fontSize = 12.sp,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant
-                            )
+                            Spacer(modifier = Modifier.width(12.dp))
+                            Column {
+                                Text(
+                                    text = "Vemod",
+                                    fontWeight = FontWeight.Bold,
+                                    fontSize = 20.sp,
+                                    color = MaterialTheme.colorScheme.primary
+                                )
+                                Text(
+                                    text = "32-Bit APK Container Manager",
+                                    fontSize = 12.sp,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
                         }
                     },
                     actions = {
+                        IconButton(
+                            onClick = { showSettingsDialog = true },
+                            modifier = Modifier.padding(end = 4.dp)
+                        ) {
+                            Icon(
+                                painter = painterResource(id = R.drawable.ic_settings),
+                                contentDescription = "Settings",
+                                tint = MaterialTheme.colorScheme.onSurface
+                            )
+                        }
                         Button(
                             onClick = { apkPicker.launch("*/*") },
                             enabled = !isExtracting,
@@ -172,7 +289,7 @@ class MainActivity : ComponentActivity() {
                             thread {
                                 try {
                                     val app = ApkExtractor.extractFromFile(this@MainActivity, apkFile)
-                                    ContainerRegistry.assignSlot(this@MainActivity, app.packageName)
+                                    ContainerRegistry.installToAppDrawer(this@MainActivity, app.packageName)
                                     runOnUiThread {
                                         isExtracting = false
                                         refreshTrigger++
@@ -216,10 +333,28 @@ class MainActivity : ComponentActivity() {
                                         Toast.makeText(this@MainActivity, "Pin shortcut not supported by launcher", Toast.LENGTH_SHORT).show()
                                     }
                                 },
-                                onToggleSlot = {
+                                onAddToAppDrawer = {
                                     thread {
-                                        ContainerRegistry.toggleAppDrawerSlot(this@MainActivity, app.packageName)
+                                        ContainerRegistry.installToAppDrawer(this@MainActivity, app.packageName)
                                         runOnUiThread { refreshTrigger++ }
+                                    }
+                                },
+                                onToggleExposeData = { checked ->
+                                    if (checked && Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && !Environment.isExternalStorageManager()) {
+                                        try {
+                                            val intent = Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION).apply {
+                                                data = Uri.parse("package:$packageName")
+                                            }
+                                            manageStorageLauncher.launch(intent)
+                                        } catch (_: Throwable) {
+                                            val intent = Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION)
+                                            manageStorageLauncher.launch(intent)
+                                        }
+                                    } else {
+                                        thread {
+                                            ContainerRegistry.setExposeAppData(this@MainActivity, app.packageName, checked)
+                                            runOnUiThread { refreshTrigger++ }
+                                        }
                                     }
                                 },
                                 onUninstall = {
@@ -272,9 +407,13 @@ class MainActivity : ComponentActivity() {
         app: ContainerApp,
         onLaunch: () -> Unit,
         onPinShortcut: () -> Unit,
-        onToggleSlot: () -> Unit,
+        onAddToAppDrawer: () -> Unit,
+        onToggleExposeData: (Boolean) -> Unit,
         onUninstall: () -> Unit
     ) {
+        val inAppDrawer = remember(globalRefreshTrigger, app.packageName) {
+            ContainerRegistry.isAppInAppDrawer(this@MainActivity, app.packageName)
+        }
         val iconBitmap = remember(app.iconFile?.absolutePath) {
             if (app.iconFile != null && app.iconFile.exists()) {
                 try {
@@ -357,14 +496,14 @@ class MainActivity : ComponentActivity() {
                                 )
                             }
 
-                            // App Drawer Slot Badge
-                            if (app.slotIndex > 0) {
+                            // App Drawer Badge
+                            if (inAppDrawer) {
                                 Surface(
                                     shape = RoundedCornerShape(4.dp),
                                     color = Color(0xFF1B5E20)
                                 ) {
                                     Text(
-                                        text = "App Drawer: Slot ${app.slotIndex}",
+                                        text = "✓ In App Drawer",
                                         fontSize = 10.sp,
                                         fontWeight = FontWeight.SemiBold,
                                         modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp),
@@ -412,11 +551,11 @@ class MainActivity : ComponentActivity() {
                     }
 
                     OutlinedButton(
-                        onClick = onToggleSlot,
+                        onClick = onAddToAppDrawer,
                         shape = RoundedCornerShape(10.dp),
                         contentPadding = PaddingValues(horizontal = 12.dp)
                     ) {
-                        Text(if (app.slotIndex > 0) "Hide Drawer" else "Show Drawer", fontSize = 12.sp)
+                        Text(if (inAppDrawer) "Update Drawer" else "+ App Drawer", fontSize = 12.sp)
                     }
 
                     IconButton(
@@ -425,6 +564,40 @@ class MainActivity : ComponentActivity() {
                     ) {
                         Text("🗑", fontSize = 16.sp)
                     }
+                }
+
+                HorizontalDivider(
+                    modifier = Modifier.padding(vertical = 10.dp),
+                    color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f)
+                )
+
+                // Expose App Data Row
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = "Expose App Data",
+                            fontSize = 13.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            color = MaterialTheme.colorScheme.onSurface
+                        )
+                        val folderName = remember(app.appName, app.packageName, globalRefreshTrigger) {
+                            ContainerRegistry.getExposedFolderRelativePath(this@MainActivity, app)
+                        }
+                        Text(
+                            text = if (app.isDataExposed) "internal storage/vemod/$folderName" else "data & obb isolated in private container",
+                            fontSize = 11.sp,
+                            color = if (app.isDataExposed) Color(0xFF81C784) else MaterialTheme.colorScheme.outline
+                        )
+                    }
+
+                    Switch(
+                        checked = app.isDataExposed,
+                        onCheckedChange = onToggleExposeData
+                    )
                 }
             }
         }
@@ -449,18 +622,16 @@ class MainActivity : ComponentActivity() {
             modifier = Modifier
                 .fillMaxSize()
                 .padding(24.dp),
-            horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.Center
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.Center
         ) {
-            Box(
+            Image(
+                painter = painterResource(id = R.drawable.ic_vemod_logo),
+                contentDescription = "Vemod Logo",
                 modifier = Modifier
-                    .size(72.dp)
-                    .clip(CircleShape)
-                    .background(MaterialTheme.colorScheme.primaryContainer),
-                contentAlignment = Alignment.Center
-            ) {
-                Text("📦", fontSize = 32.sp)
-            }
+                    .size(88.dp)
+                    .clip(RoundedCornerShape(20.dp))
+            )
 
             Spacer(modifier = Modifier.height(20.dp))
             Text(
@@ -504,29 +675,19 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun launchApp(app: ContainerApp) {
-        try {
-            val am = getSystemService(android.content.Context.ACTIVITY_SERVICE) as? android.app.ActivityManager
-            am?.runningAppProcesses?.forEach { p ->
-                if (p.processName == "$packageName:guest") {
-                    android.os.Process.killProcess(p.pid)
-                }
-            }
-        } catch (_: Throwable) {}
-
-        val targetClass = if (app.slotIndex > 0) {
-            "com.vemod.container.slot.AppSlot${app.slotIndex}"
-        } else {
-            GuestProxyActivity::class.java.name
-        }
-
         val intent = Intent().apply {
-            setClassName(this@MainActivity, targetClass)
+            setClassName(this@MainActivity, GuestProxyActivity::class.java.name)
             putExtra(GuestProxyActivity.EXTRA_CONTAINER_DIR, app.containerDir.absolutePath)
             putExtra(GuestProxyActivity.EXTRA_BASE_APK, app.baseApk.absolutePath)
             putExtra(GuestProxyActivity.EXTRA_PACKAGE_NAME, app.packageName)
             putExtra(GuestProxyActivity.EXTRA_LAUNCH_ACTIVITY, app.launchActivity)
             putExtra(GuestProxyActivity.EXTRA_SCREEN_ORIENTATION, app.screenOrientation)
-            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
+            putExtra(GuestProxyActivity.EXTRA_IS_DATA_EXPOSED, app.isDataExposed)
+            if (app.isDataExposed) {
+                val expDir = ContainerRegistry.getExposedDir(this@MainActivity, app)
+                putExtra(GuestProxyActivity.EXTRA_EXPOSED_DIR, expDir.absolutePath)
+            }
+            flags = Intent.FLAG_ACTIVITY_NEW_TASK
         }
         startActivity(intent)
     }

@@ -622,8 +622,15 @@ Inst* Inst::GetAssociatedPseudoOperation(Opcode opcode) {
 }
 
 Type Inst::GetType() const {
-    if (op == Opcode::Identity)
-        return args[0].GetType();
+    if (op == Opcode::Identity) {
+        Value curr = args[0];
+        size_t depth = 0;
+        while (curr.IsIdentity() && depth < 32) {
+            curr = curr.GetInst()->GetArg(0);
+            depth++;
+        }
+        return curr.GetType();
+    }
     return GetTypeOf(op);
 }
 
@@ -667,6 +674,19 @@ void Inst::ClearArgs() {
 }
 
 void Inst::ReplaceUsesWith(Value replacement) {
+    if (!replacement.IsImmediate() && replacement.GetInst() == this) {
+        return;
+    }
+    Value curr = replacement;
+    size_t depth = 0;
+    while (curr.IsIdentity() && depth < 32) {
+        if (!curr.IsImmediate() && curr.GetInst() == this) {
+            return;
+        }
+        curr = curr.GetInst()->GetArg(0);
+        depth++;
+    }
+
     Invalidate();
 
     op = Opcode::Identity;

@@ -2,6 +2,8 @@ package com.vemod.container.bridge
 
 import android.util.Log
 import java.io.File
+import java.lang.reflect.Constructor
+import java.lang.reflect.Field
 import java.lang.reflect.Method
 import java.lang.reflect.Modifier
 
@@ -17,11 +19,24 @@ object VemodBridge {
         }
     }
 
+    const val LOG_LEVEL_NONE = 0
+    const val LOG_LEVEL_BASIC = 1
+    const val LOG_LEVEL_ADVANCED = 2
+    const val LOG_LEVEL_FULL = 3
+
+    external fun nativeSetLogLevel(level: Int)
     external fun nativeInit(filesDir: String)
+    external fun nativeSetClassLoader(classLoader: ClassLoader)
+    external fun nativeSetSysrootDir(path: String)
     external fun nativeLoadLibrary(libPath: String): Boolean
     external fun nativeGetExports(): Array<String>
     external fun nativeGetGuestSymbol(symName: String): Long
     external fun nativeCallJniOnLoad(): Int
+    external fun nativeCallNativeActivityOnCreate(
+        activity: Long,
+        savedState: Long,
+        savedStateSize: Long
+    ): Boolean
     external fun nativeRegisterMethod(
         targetClass: Class<*>,
         methodName: String,
@@ -31,12 +46,25 @@ object VemodBridge {
 
     private var activeClassLoader: ClassLoader? = null
     private var pluginDir: File? = null
+    private val loadedProxies = java.util.Collections.synchronizedSet(mutableSetOf<String>())
 
     @JvmStatic
     fun setActivePlugin(dir: File, classLoader: ClassLoader) {
         pluginDir = dir
         activeClassLoader = classLoader
+        loadedProxies.clear()
+        nativeSetClassLoader(classLoader)
         nativeInit(dir.absolutePath)
+        try {
+            val app = com.vemod.container.VemodApp.instance
+            if (app != null) {
+                val prefs = app.getSharedPreferences("vemod_settings", android.content.Context.MODE_PRIVATE)
+                val level = prefs.getInt("log_level", LOG_LEVEL_BASIC)
+                nativeSetLogLevel(level)
+            }
+        } catch (e: Throwable) {
+            Log.w(TAG, "Failed to apply log level in setActivePlugin", e)
+        }
     }
 
     /**
@@ -45,6 +73,12 @@ object VemodBridge {
     @JvmStatic
     fun onProxyLoaded(proxyPath: String): Int {
         Log.i(TAG, "onProxyLoaded: $proxyPath")
+        if (loadedProxies.contains(proxyPath)) {
+            Log.i(TAG, "onProxyLoaded: $proxyPath already loaded, returning JNI_VERSION_1_6")
+            return 0x00010006
+        }
+        loadedProxies.add(proxyPath)
+
         val proxyFile = File(proxyPath)
         val fileName = proxyFile.name // e.g. libandengine.so
         val containerDir = proxyFile.parentFile?.parentFile ?: pluginDir
@@ -69,6 +103,15 @@ object VemodBridge {
         val jniVersion = nativeCallJniOnLoad()
         Log.i(TAG, "Loaded $fileName; JNI version = 0x${Integer.toHexString(jniVersion)}")
         return jniVersion
+    }
+
+    /**
+     * Called by libproxy.so's ANativeActivity_onCreate.
+     */
+    @JvmStatic
+    fun onNativeActivityCreated(activity: Long, savedState: Long, savedStateSize: Long, path: String): Boolean {
+        Log.i(TAG, "onNativeActivityCreated: activity=0x${activity.toString(16)}, path=$path")
+        return nativeCallNativeActivityOnCreate(activity, savedState, savedStateSize)
     }
 
     /**
@@ -160,6 +203,31 @@ object VemodBridge {
             }
         }
         return sb.toString()
+    }
+
+    @JvmStatic
+    fun getReflectedMethodSignature(methodOrConstructor: Any): String {
+        val sb = StringBuilder("(")
+        val params: Array<Class<*>> = when (methodOrConstructor) {
+            is Method -> methodOrConstructor.parameterTypes
+            is Constructor<*> -> methodOrConstructor.parameterTypes
+            else -> emptyArray()
+        }
+        for (param in params) {
+            sb.append(getTypeDescriptor(param))
+        }
+        sb.append(")")
+        val ret: Class<*> = when (methodOrConstructor) {
+            is Method -> methodOrConstructor.returnType
+            else -> java.lang.Void.TYPE
+        }
+        sb.append(getTypeDescriptor(ret))
+        return sb.toString()
+    }
+
+    @JvmStatic
+    fun getReflectedFieldSignature(field: Field): String {
+        return getTypeDescriptor(field.type)
     }
 
     private fun getMethodSignature(method: Method): String {

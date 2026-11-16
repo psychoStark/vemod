@@ -20,7 +20,8 @@ void IdentityRemovalPass(IR::Block& block) {
 
         const size_t num_args = inst.NumArgs();
         for (size_t i = 0; i < num_args; i++) {
-            while (true) {
+            size_t depth = 0;
+            while (depth++ < 32) {
                 IR::Value arg = inst.GetArg(i);
                 if (!arg.IsIdentity())
                     break;

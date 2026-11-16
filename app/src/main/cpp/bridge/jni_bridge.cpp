@@ -7,6 +7,7 @@
 #include <deque>
 #include <mutex>
 #include <unordered_map>
+#include <sys/mman.h>
 
 #include "cpu.h"
 #include "../jni/native_dispatch.h"
@@ -30,6 +31,9 @@ namespace {
 JavaVM* g_vm = nullptr;
 gaddr g_env_table = 0, g_guest_env = 0, g_vm_table = 0, g_guest_vm = 0;
 thread_local JNIEnv* t_env = nullptr;
+thread_local jobject t_pending_exception = nullptr;
+jobject g_guest_class_loader = nullptr;
+jmethodID g_load_class_mid = nullptr;
 
 JNIEnv* env() {
     if (t_env) return t_env;
@@ -284,11 +288,52 @@ jvalue param_value(char t, Ctx& c) {
 
 // ------------------------------------------------------------------ calls
 
+void set_pending_exception(JNIEnv* e, jthrowable ex) {
+    if (t_pending_exception) {
+        e->DeleteGlobalRef(t_pending_exception);
+        t_pending_exception = nullptr;
+    }
+    if (ex) {
+        t_pending_exception = static_cast<jthrowable>(e->NewGlobalRef(ex));
+        jclass exCls = e->GetObjectClass(ex);
+        if (exCls) {
+            jmethodID toStringMid = e->GetMethodID(exCls, "toString", "()Ljava/lang/String;");
+            if (e->ExceptionCheck()) e->ExceptionClear();
+            if (toStringMid) {
+                jstring msg = static_cast<jstring>(e->CallObjectMethod(ex, toStringMid));
+                if (e->ExceptionCheck()) e->ExceptionClear();
+                if (msg) {
+                    const char* str = e->GetStringUTFChars(msg, nullptr);
+                    if (str) {
+                        NB_LOGW("[JNI-EX] set_pending_exception: %s", str);
+                        e->ReleaseStringUTFChars(msg, str);
+                    }
+                    e->DeleteLocalRef(msg);
+                }
+            }
+            e->DeleteLocalRef(exCls);
+        }
+    }
+}
+
+void clear_pending_exception(JNIEnv* e) {
+    if (t_pending_exception) {
+        e->DeleteGlobalRef(t_pending_exception);
+        t_pending_exception = nullptr;
+    }
+    if (e && e->ExceptionCheck()) {
+        e->ExceptionClear();
+    }
+}
+
 enum Kind { kVirtual, kNonvirtual, kStatic };
 enum Form { kDots, kV, kA };
 
 jvalue host_call(Kind k, char ret, jobject o, jclass cls, jmethodID m, const jvalue* a) {
     JNIEnv* e = env();
+    if (e->ExceptionCheck()) {
+        e->ExceptionClear();
+    }
     jvalue r{};
 #define NB_CALL(T, field)                                     \
     if (k == kVirtual)                                        \
@@ -317,6 +362,22 @@ jvalue host_call(Kind k, char ret, jobject o, jclass cls, jmethodID m, const jva
     default: NB_CALL(Object, l) break;
     }
 #undef NB_CALL
+    if (e->ExceptionCheck()) {
+        jthrowable ex = e->ExceptionOccurred();
+        e->ExceptionClear();
+        jclass exCls = e->GetObjectClass(ex);
+        jmethodID toStringMid = exCls ? e->GetMethodID(exCls, "toString", "()Ljava/lang/String;") : nullptr;
+        if (e->ExceptionCheck()) e->ExceptionClear();
+        jstring msg = toStringMid ? static_cast<jstring>(e->CallObjectMethod(ex, toStringMid)) : nullptr;
+        if (e->ExceptionCheck()) e->ExceptionClear();
+        const char* str = msg ? e->GetStringUTFChars(msg, nullptr) : nullptr;
+        NB_LOGW("[JNI-EX] Exception in host_call: %s", str ? str : "unknown");
+        if (str) e->ReleaseStringUTFChars(msg, str);
+        if (msg) e->DeleteLocalRef(msg);
+        if (exCls) e->DeleteLocalRef(exCls);
+        set_pending_exception(e, ex);
+        e->DeleteLocalRef(ex);
+    }
     return r;
 }
 
@@ -358,7 +419,17 @@ void jni_new_object(Ctx& c) {
     jclass cls = static_cast<jclass>(obj(c.a32()));
     const MethodInfo& mi = method(c.a32());
     std::vector<jvalue> args = read_args(mi, Form(F), c);
-    c.ret(local(env()->NewObjectA(cls, mi.id, args.data())));
+    JNIEnv* e = env();
+    if (e->ExceptionCheck()) e->ExceptionClear();
+    jobject res = e->NewObjectA(cls, mi.id, args.data());
+    if (e->ExceptionCheck()) {
+        jthrowable ex = e->ExceptionOccurred();
+        e->ExceptionClear();
+        set_pending_exception(e, ex);
+        e->DeleteLocalRef(ex);
+        res = nullptr;
+    }
+    c.ret(local(res));
 }
 
 // ------------------------------------------------------------------ fields
@@ -369,6 +440,7 @@ void jni_get_field(Ctx& c) {
     jobject o = obj(c.a32());
     jfieldID f = field(c.a32());
     JNIEnv* e = env();
+    if (e->ExceptionCheck()) e->ExceptionClear();
     jvalue v{};
 #define NB_GET(Ty, fld) \
     v.fld = Static ? e->GetStatic##Ty##Field(static_cast<jclass>(o), f) : e->Get##Ty##Field(o, f);
@@ -384,6 +456,12 @@ void jni_get_field(Ctx& c) {
     default: NB_GET(Object, l) break;
     }
 #undef NB_GET
+    if (e->ExceptionCheck()) {
+        jthrowable ex = e->ExceptionOccurred();
+        e->ExceptionClear();
+        set_pending_exception(e, ex);
+        e->DeleteLocalRef(ex);
+    }
     put_value(c, T, v);
 }
 
@@ -394,6 +472,7 @@ void jni_set_field(Ctx& c) {
     jfieldID f = field(c.a32());
     jvalue v = param_value(T, c);
     JNIEnv* e = env();
+    if (e->ExceptionCheck()) e->ExceptionClear();
 #define NB_SET(Ty, fld)                                                     \
     if (Static)                                                             \
         e->SetStatic##Ty##Field(static_cast<jclass>(o), f, v.fld);          \
@@ -411,6 +490,12 @@ void jni_set_field(Ctx& c) {
     default: NB_SET(Object, l) break;
     }
 #undef NB_SET
+    if (e->ExceptionCheck()) {
+        jthrowable ex = e->ExceptionOccurred();
+        e->ExceptionClear();
+        set_pending_exception(e, ex);
+        e->DeleteLocalRef(ex);
+    }
 }
 
 // ------------------------------------------------------------------ primitive arrays
@@ -420,6 +505,7 @@ constexpr u32 elem_size(char t) {
 }
 
 void array_region(JNIEnv* e, char t, bool set, jarray a, jsize start, jsize len, void* buf) {
+    if (e->ExceptionCheck()) e->ExceptionClear();
 #define NB_REGION(Ty, jt)                                                                          \
     if (set)                                                                                       \
         e->Set##Ty##ArrayRegion(static_cast<jt##Array>(a), start, len, static_cast<const jt*>(buf)); \
@@ -436,6 +522,12 @@ void array_region(JNIEnv* e, char t, bool set, jarray a, jsize start, jsize len,
     case 'D': NB_REGION(Double, jdouble) break;
     }
 #undef NB_REGION
+    if (e->ExceptionCheck()) {
+        jthrowable ex = e->ExceptionOccurred();
+        e->ExceptionClear();
+        set_pending_exception(e, ex);
+        e->DeleteLocalRef(ex);
+    }
 }
 
 template <char T>
@@ -498,14 +590,22 @@ std::unordered_map<gaddr, char> g_crit_types;
 
 char array_type(jarray a) {
     JNIEnv* e = env();
+    if (e->ExceptionCheck()) e->ExceptionClear();
     jclass cls = e->GetObjectClass(a);
+    if (!cls) return 'B';
     jclass clsclass = e->GetObjectClass(cls);
+    if (!clsclass) {
+        e->DeleteLocalRef(cls);
+        return 'B';
+    }
     jmethodID getName = e->GetMethodID(clsclass, "getName", "()Ljava/lang/String;");
-    auto name = static_cast<jstring>(e->CallObjectMethod(cls, getName));
-    const char* s = e->GetStringUTFChars(name, nullptr);
+    if (e->ExceptionCheck()) e->ExceptionClear();
+    auto name = getName ? static_cast<jstring>(e->CallObjectMethod(cls, getName)) : nullptr;
+    if (e->ExceptionCheck()) e->ExceptionClear();
+    const char* s = name ? e->GetStringUTFChars(name, nullptr) : nullptr;
     char t = s && s[0] == '[' ? s[1] : 'B';
-    e->ReleaseStringUTFChars(name, s);
-    e->DeleteLocalRef(name);
+    if (s) e->ReleaseStringUTFChars(name, s);
+    if (name) e->DeleteLocalRef(name);
     e->DeleteLocalRef(clsclass);
     e->DeleteLocalRef(cls);
     return t;
@@ -549,11 +649,180 @@ void jni_release_critical(Ctx& c) {
 
 void jni_GetVersion(Ctx& c) { c.ret(JNI_VERSION_1_6); }
 
+void jni_DefineClass(Ctx& c) {
+    c.a32();
+    NB_LOGW("jni_DefineClass called (unsupported on Android ART)");
+    c.ret(0);
+}
+
 void jni_FindClass(Ctx& c) {
     c.a32();
     const char* name = hs(c.a32());
-    c.ret(local(env()->FindClass(name)));
+    if (!name) {
+        c.ret(0);
+        return;
+    }
+    JNIEnv* e = env();
+    jclass cls = e->FindClass(name);
+    if (e->ExceptionCheck()) {
+        e->ExceptionClear();
+        cls = nullptr;
+    }
+    if (!cls && g_guest_class_loader && g_load_class_mid) {
+        std::string dotted(name);
+        for (char& ch : dotted) {
+            if (ch == '/') ch = '.';
+        }
+        jstring jname = e->NewStringUTF(dotted.c_str());
+        cls = static_cast<jclass>(e->CallObjectMethod(g_guest_class_loader, g_load_class_mid, jname));
+        e->DeleteLocalRef(jname);
+        if (e->ExceptionCheck()) {
+            e->ExceptionClear();
+            cls = nullptr;
+        }
+    }
+    if (!cls) {
+        NB_LOGW("jni_FindClass(\"%s\") not found in host or guest ClassLoader", name);
+    } else {
+        NB_LOGI("jni_FindClass(\"%s\") resolved to %p", name, cls);
+    }
+    c.ret(local(cls));
 }
+
+void jni_FromReflectedMethod(Ctx& c) {
+    c.a32(); // env
+    u32 meth_hnd = c.a32();
+    if (!meth_hnd) {
+        c.ret(0);
+        return;
+    }
+    jobject m_obj = obj(meth_hnd);
+    if (!m_obj) {
+        c.ret(0);
+        return;
+    }
+    JNIEnv* e = env();
+    jmethodID mid = e->FromReflectedMethod(m_obj);
+    if (!mid) {
+        c.ret(0);
+        return;
+    }
+    {
+        std::lock_guard lk(g_id_mu);
+        auto it = g_method_handles.find(mid);
+        if (it != g_method_handles.end()) {
+            c.ret(it->second);
+            return;
+        }
+    }
+    jclass bridge_cls = e->FindClass("com/vemod/container/bridge/VemodBridge");
+    if (!bridge_cls) {
+        NB_LOGE("jni_FromReflectedMethod: VemodBridge class not found");
+        c.ret(0);
+        return;
+    }
+    jmethodID get_sig_mid = e->GetStaticMethodID(bridge_cls, "getReflectedMethodSignature", "(Ljava/lang/Object;)Ljava/lang/String;");
+    jstring sig_str = static_cast<jstring>(e->CallStaticObjectMethod(bridge_cls, get_sig_mid, m_obj));
+    if (e->ExceptionCheck()) {
+        e->ExceptionClear();
+    }
+    if (sig_str) {
+        const char* sig_chars = e->GetStringUTFChars(sig_str, nullptr);
+        u32 hnd = method_handle(mid, sig_chars);
+        e->ReleaseStringUTFChars(sig_str, sig_chars);
+        e->DeleteLocalRef(sig_str);
+        e->DeleteLocalRef(bridge_cls);
+        NB_LOGI("jni_FromReflectedMethod: mid=%p -> hnd=0x%x", mid, hnd);
+        c.ret(hnd);
+    } else {
+        e->DeleteLocalRef(bridge_cls);
+        c.ret(0);
+    }
+}
+
+void jni_FromReflectedField(Ctx& c) {
+    c.a32(); // env
+    u32 field_hnd = c.a32();
+    if (!field_hnd) {
+        c.ret(0);
+        return;
+    }
+    jobject f_obj = obj(field_hnd);
+    if (!f_obj) {
+        c.ret(0);
+        return;
+    }
+    JNIEnv* e = env();
+    jfieldID fid = e->FromReflectedField(f_obj);
+    if (!fid) {
+        c.ret(0);
+        return;
+    }
+    {
+        std::lock_guard lk(g_id_mu);
+        auto it = g_field_handles.find(fid);
+        if (it != g_field_handles.end()) {
+            c.ret(it->second);
+            return;
+        }
+    }
+    jclass bridge_cls = e->FindClass("com/vemod/container/bridge/VemodBridge");
+    if (!bridge_cls) {
+        NB_LOGE("jni_FromReflectedField: VemodBridge class not found");
+        c.ret(0);
+        return;
+    }
+    jmethodID get_sig_fid = e->GetStaticMethodID(bridge_cls, "getReflectedFieldSignature", "(Ljava/lang/reflect/Field;)Ljava/lang/String;");
+    jstring sig_str = static_cast<jstring>(e->CallStaticObjectMethod(bridge_cls, get_sig_fid, f_obj));
+    if (e->ExceptionCheck()) {
+        e->ExceptionClear();
+    }
+    if (sig_str) {
+        const char* sig_chars = e->GetStringUTFChars(sig_str, nullptr);
+        u32 hnd = field_handle(fid, sig_chars);
+        e->ReleaseStringUTFChars(sig_str, sig_chars);
+        e->DeleteLocalRef(sig_str);
+        e->DeleteLocalRef(bridge_cls);
+        NB_LOGI("jni_FromReflectedField: fid=%p -> hnd=0x%x", fid, hnd);
+        c.ret(hnd);
+    } else {
+        e->DeleteLocalRef(bridge_cls);
+        c.ret(0);
+    }
+}
+
+void jni_ToReflectedMethod(Ctx& c) {
+    c.a32(); // env
+    u32 cls_hnd = c.a32();
+    u32 mid_hnd = c.a32();
+    jboolean is_static = jboolean(c.a32());
+    jclass cls = static_cast<jclass>(obj(cls_hnd));
+    if (!mid_hnd) {
+        c.ret(0);
+        return;
+    }
+    const auto& m = method(mid_hnd);
+    JNIEnv* e = env();
+    jobject ref_obj = e->ToReflectedMethod(cls, m.id, is_static);
+    c.ret(local(ref_obj));
+}
+
+void jni_ToReflectedField(Ctx& c) {
+    c.a32(); // env
+    u32 cls_hnd = c.a32();
+    u32 fid_hnd = c.a32();
+    jboolean is_static = jboolean(c.a32());
+    jclass cls = static_cast<jclass>(obj(cls_hnd));
+    if (!fid_hnd) {
+        c.ret(0);
+        return;
+    }
+    jfieldID f_id = field(fid_hnd);
+    JNIEnv* e = env();
+    jobject ref_obj = e->ToReflectedField(cls, f_id, is_static);
+    c.ret(local(ref_obj));
+}
+
 void jni_GetSuperclass(Ctx& c) {
     c.a32();
     c.ret(local(env()->GetSuperclass(static_cast<jclass>(obj(c.a32())))));
@@ -566,17 +835,65 @@ void jni_IsAssignableFrom(Ctx& c) {
 }
 void jni_Throw(Ctx& c) {
     c.a32();
-    c.ret(u32(env()->Throw(static_cast<jthrowable>(obj(c.a32())))));
+    jthrowable ex = static_cast<jthrowable>(obj(c.a32()));
+    JNIEnv* e = env();
+    clear_pending_exception(e);
+    set_pending_exception(e, ex);
+    c.ret(0);
 }
 void jni_ThrowNew(Ctx& c) {
     c.a32();
     auto cls = static_cast<jclass>(obj(c.a32()));
-    c.ret(u32(env()->ThrowNew(cls, hs(c.a32()))));
+    const char* msg = hs(c.a32());
+    JNIEnv* e = env();
+    clear_pending_exception(e);
+    jint res = e->ThrowNew(cls, msg);
+    if (e->ExceptionCheck()) {
+        jthrowable ex = e->ExceptionOccurred();
+        e->ExceptionClear();
+        set_pending_exception(e, ex);
+        e->DeleteLocalRef(ex);
+    }
+    c.ret(u32(res));
 }
-void jni_ExceptionOccurred(Ctx& c) { c.ret(local(env()->ExceptionOccurred())); }
-void jni_ExceptionDescribe(Ctx&) { env()->ExceptionDescribe(); }
-void jni_ExceptionClear(Ctx&) { env()->ExceptionClear(); }
-void jni_ExceptionCheck(Ctx& c) { c.ret(env()->ExceptionCheck()); }
+void jni_ExceptionOccurred(Ctx& c) {
+    JNIEnv* e = env();
+    if (e->ExceptionCheck()) {
+        jthrowable ex = e->ExceptionOccurred();
+        e->ExceptionClear();
+        set_pending_exception(e, ex);
+        e->DeleteLocalRef(ex);
+    }
+    c.ret(t_pending_exception ? local(e->NewLocalRef(t_pending_exception)) : 0);
+}
+void jni_ExceptionDescribe(Ctx&) {
+    JNIEnv* e = env();
+    if (t_pending_exception) {
+        jclass exCls = e->GetObjectClass(t_pending_exception);
+        jmethodID printMid = exCls ? e->GetMethodID(exCls, "printStackTrace", "()V") : nullptr;
+        if (e->ExceptionCheck()) e->ExceptionClear();
+        if (printMid) {
+            e->CallVoidMethod(t_pending_exception, printMid);
+            if (e->ExceptionCheck()) e->ExceptionClear();
+        }
+        if (exCls) e->DeleteLocalRef(exCls);
+    } else {
+        if (e->ExceptionCheck()) e->ExceptionDescribe();
+    }
+}
+void jni_ExceptionClear(Ctx&) {
+    clear_pending_exception(env());
+}
+void jni_ExceptionCheck(Ctx& c) {
+    JNIEnv* e = env();
+    if (e->ExceptionCheck()) {
+        jthrowable ex = e->ExceptionOccurred();
+        e->ExceptionClear();
+        set_pending_exception(e, ex);
+        e->DeleteLocalRef(ex);
+    }
+    c.ret(t_pending_exception != nullptr ? JNI_TRUE : JNI_FALSE);
+}
 void jni_FatalError(Ctx& c) {
     c.a32();
     const char* msg = hs(c.a32());
@@ -649,11 +966,35 @@ void jni_EnsureLocalCapacity(Ctx& c) {
 }
 void jni_AllocObject(Ctx& c) {
     c.a32();
-    c.ret(local(env()->AllocObject(static_cast<jclass>(obj(c.a32())))));
+    JNIEnv* e = env();
+    if (e->ExceptionCheck()) e->ExceptionClear();
+    jobject res = e->AllocObject(static_cast<jclass>(obj(c.a32())));
+    if (e->ExceptionCheck()) {
+        jthrowable ex = e->ExceptionOccurred();
+        e->ExceptionClear();
+        set_pending_exception(e, ex);
+        e->DeleteLocalRef(ex);
+        res = nullptr;
+    }
+    c.ret(local(res));
 }
 void jni_GetObjectClass(Ctx& c) {
     c.a32();
-    c.ret(local(env()->GetObjectClass(obj(c.a32()))));
+    u32 hnd = c.a32();
+    jobject o = obj(hnd);
+    if (!o) {
+        NB_LOGW("jni_GetObjectClass: handle %#x is null or deleted", hnd);
+        c.ret(0);
+        return;
+    }
+    JNIEnv* e = env();
+    jobjectRefType refType = e->GetObjectRefType(o);
+    if (refType == JNIInvalidRefType) {
+        NB_LOGW("jni_GetObjectClass: handle %#x has invalid/deleted ART ref %p", hnd, o);
+        c.ret(0);
+        return;
+    }
+    c.ret(local(e->GetObjectClass(o)));
 }
 void jni_IsInstanceOf(Ctx& c) {
     c.a32();
@@ -666,7 +1007,16 @@ void jni_GetMethodID(Ctx& c) {
     auto cls = static_cast<jclass>(obj(c.a32()));
     const char* name = hs(c.a32());
     const char* sig = hs(c.a32());
-    jmethodID m = Static ? env()->GetStaticMethodID(cls, name, sig) : env()->GetMethodID(cls, name, sig);
+    JNIEnv* e = env();
+    if (e->ExceptionCheck()) e->ExceptionClear();
+    jmethodID m = Static ? e->GetStaticMethodID(cls, name, sig) : e->GetMethodID(cls, name, sig);
+    if (e->ExceptionCheck()) {
+        jthrowable ex = e->ExceptionOccurred();
+        e->ExceptionClear();
+        set_pending_exception(e, ex);
+        e->DeleteLocalRef(ex);
+        m = nullptr;
+    }
     c.ret(method_handle(m, sig));
 }
 template <bool Static>
@@ -675,7 +1025,16 @@ void jni_GetFieldID(Ctx& c) {
     auto cls = static_cast<jclass>(obj(c.a32()));
     const char* name = hs(c.a32());
     const char* sig = hs(c.a32());
-    jfieldID f = Static ? env()->GetStaticFieldID(cls, name, sig) : env()->GetFieldID(cls, name, sig);
+    JNIEnv* e = env();
+    if (e->ExceptionCheck()) e->ExceptionClear();
+    jfieldID f = Static ? e->GetStaticFieldID(cls, name, sig) : e->GetFieldID(cls, name, sig);
+    if (e->ExceptionCheck()) {
+        jthrowable ex = e->ExceptionOccurred();
+        e->ExceptionClear();
+        set_pending_exception(e, ex);
+        e->DeleteLocalRef(ex);
+        f = nullptr;
+    }
     c.ret(field_handle(f, sig));
 }
 
@@ -754,18 +1113,48 @@ void jni_NewObjectArray(Ctx& c) {
     jsize n = jsize(c.a32());
     auto cls = static_cast<jclass>(obj(c.a32()));
     jobject init = obj(c.a32());
-    c.ret(local(env()->NewObjectArray(n, cls, init)));
+    JNIEnv* e = env();
+    if (e->ExceptionCheck()) e->ExceptionClear();
+    jobject res = e->NewObjectArray(n, cls, init);
+    if (e->ExceptionCheck()) {
+        jthrowable ex = e->ExceptionOccurred();
+        e->ExceptionClear();
+        set_pending_exception(e, ex);
+        e->DeleteLocalRef(ex);
+        res = nullptr;
+    }
+    c.ret(local(res));
 }
 void jni_GetObjectArrayElement(Ctx& c) {
     c.a32();
     auto a = static_cast<jobjectArray>(obj(c.a32()));
-    c.ret(local(env()->GetObjectArrayElement(a, jsize(c.a32()))));
+    jsize idx = jsize(c.a32());
+    JNIEnv* e = env();
+    if (e->ExceptionCheck()) e->ExceptionClear();
+    jobject res = e->GetObjectArrayElement(a, idx);
+    if (e->ExceptionCheck()) {
+        jthrowable ex = e->ExceptionOccurred();
+        e->ExceptionClear();
+        set_pending_exception(e, ex);
+        e->DeleteLocalRef(ex);
+        res = nullptr;
+    }
+    c.ret(local(res));
 }
 void jni_SetObjectArrayElement(Ctx& c) {
     c.a32();
     auto a = static_cast<jobjectArray>(obj(c.a32()));
     jsize i = jsize(c.a32());
-    env()->SetObjectArrayElement(a, i, obj(c.a32()));
+    jobject val = obj(c.a32());
+    JNIEnv* e = env();
+    if (e->ExceptionCheck()) e->ExceptionClear();
+    e->SetObjectArrayElement(a, i, val);
+    if (e->ExceptionCheck()) {
+        jthrowable ex = e->ExceptionOccurred();
+        e->ExceptionClear();
+        set_pending_exception(e, ex);
+        e->DeleteLocalRef(ex);
+    }
 }
 void jni_RegisterNatives(Ctx& c) {
     c.a32(); // env
@@ -830,15 +1219,60 @@ void jni_NewDirectByteBuffer(Ctx& c) {
     jlong cap = jlong(c.a64());
     c.ret(local(env()->NewDirectByteBuffer(h(p), cap)));
 }
+struct DirectBufRecord {
+    gaddr guest_addr;
+    void* host_ptr;
+    size_t alloc_sz;
+    size_t capacity;
+};
+static std::mutex g_direct_buf_mu;
+static std::unordered_map<void*, DirectBufRecord> g_direct_buffers;
+
 void jni_GetDirectBufferAddress(Ctx& c) {
     c.a32();
-    void* p = env()->GetDirectBufferAddress(obj(c.a32()));
-    if (p && !in_guest(p)) {
-        NB_LOGW("GetDirectBufferAddress: buffer lives outside guest memory");
-        p = nullptr;
+    jobject buf = obj(c.a32());
+    void* p = env()->GetDirectBufferAddress(buf);
+    if (!p) {
+        c.ret(0);
+        return;
     }
-    c.ret(g(p));
+    if (in_guest(p)) {
+        c.ret(g(p));
+        return;
+    }
+    jlong cap = env()->GetDirectBufferCapacity(buf);
+    if (cap <= 0) {
+        c.ret(0);
+        return;
+    }
+    std::lock_guard lk(g_direct_buf_mu);
+    auto it = g_direct_buffers.find(p);
+    if (it != g_direct_buffers.end()) {
+        if (static_cast<size_t>(cap) <= it->second.alloc_sz) {
+            it->second.capacity = static_cast<size_t>(cap);
+            memcpy(h(it->second.guest_addr), p, cap);
+            c.ret(it->second.guest_addr);
+            return;
+        } else {
+            map_free(it->second.guest_addr, it->second.alloc_sz);
+            g_direct_buffers.erase(it);
+        }
+    }
+    u32 sz = host_page_round_up(static_cast<u32>(cap));
+    gaddr ga = map_alloc(sz, PROT_READ | PROT_WRITE);
+    if (!ga) {
+        NB_LOGE("jni_GetDirectBufferAddress: failed to allocate %u bytes in guest", sz);
+        c.ret(0);
+        return;
+    }
+    memcpy(h(ga), p, cap);
+    g_direct_buffers[p] = {ga, p, sz, static_cast<size_t>(cap)};
+    if (get_log_level() >= LOG_LEVEL_ADVANCED) {
+        NB_LOGI("jni_GetDirectBufferAddress: mirrored host buffer %p (%zu bytes) -> guest %#x", p, (size_t)cap, ga);
+    }
+    c.ret(ga);
 }
+
 void jni_GetDirectBufferCapacity(Ctx& c) {
     c.a32();
     c.ret64(u64(env()->GetDirectBufferCapacity(obj(c.a32()))));
@@ -901,6 +1335,16 @@ JNIEnv* jni_env() { return env(); }
 u32 jni_local(jobject o) { return local(o); }
 jobject jni_obj(u32 hnd) { return obj(hnd); }
 
+void jni_sync_direct_buffers_to_host() {
+    std::lock_guard lk(g_direct_buf_mu);
+    for (const auto& pair : g_direct_buffers) {
+        const auto& rec = pair.second;
+        if (rec.host_ptr && rec.guest_addr && rec.capacity > 0) {
+            memcpy(rec.host_ptr, h(rec.guest_addr), rec.capacity);
+        }
+    }
+}
+
 JniFrame::JniFrame(JNIEnv* e) {
     t_env = e;
     t_frames.push_back({g_frame_ids++, {}});
@@ -921,9 +1365,14 @@ void register_jni() {
 
 #define E(fn) set_entry(JNI_INDEX(fn), "JNI::" #fn, jni_##fn)
     E(GetVersion);
+    E(DefineClass);
     E(FindClass);
+    E(FromReflectedMethod);
+    E(FromReflectedField);
+    E(ToReflectedMethod);
     E(GetSuperclass);
     E(IsAssignableFrom);
+    E(ToReflectedField);
     E(Throw);
     E(ThrowNew);
     E(ExceptionOccurred);
@@ -1050,6 +1499,21 @@ void register_jni() {
     wr<u32>(g_vm_table + JII_INDEX(GetEnv) * 4, make_stub("JavaVM::GetEnv", vm_GetEnv));
     wr<u32>(g_vm_table + JII_INDEX(AttachCurrentThreadAsDaemon) * 4,
             make_stub("JavaVM::AttachCurrentThreadAsDaemon", vm_AttachCurrentThread));
+}
+
+void set_guest_class_loader(jobject loader) {
+    JNIEnv* e = env();
+    if (g_guest_class_loader) {
+        e->DeleteGlobalRef(g_guest_class_loader);
+        g_guest_class_loader = nullptr;
+        g_load_class_mid = nullptr;
+    }
+    if (loader) {
+        g_guest_class_loader = e->NewGlobalRef(loader);
+        jclass cl_class = e->GetObjectClass(loader);
+        g_load_class_mid = e->GetMethodID(cl_class, "loadClass", "(Ljava/lang/String;)Ljava/lang/Class;");
+        NB_LOGI("Registered guest ClassLoader %p with loadClass method %p", g_guest_class_loader, g_load_class_mid);
+    }
 }
 
 }  // namespace nb

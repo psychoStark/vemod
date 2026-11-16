@@ -21,7 +21,16 @@ namespace {
 constexpr u32 kMagic = 0x3150424e;  // "NBP1"
 
 std::string profile_path() {
-    if (const char* d = getenv("NB_PROFILE_DIR")) return std::string(d) + "/ninbridge-blocks.bin";
+    u32 img_id = guest_image_id();
+    const char* lib_name = guest_main_lib_name();
+    if (!img_id || !lib_name || !*lib_name) return {};
+    std::string safe_lib;
+    for (const char* p = lib_name; *p; ++p) {
+        if (isalnum(*p) || *p == '.' || *p == '_' || *p == '-') safe_lib += *p;
+    }
+    char fname[128];
+    snprintf(fname, sizeof(fname), "/ninbridge-blocks-%s-%08x.bin", safe_lib.c_str(), img_id);
+    if (const char* d = getenv("NB_PROFILE_DIR")) return std::string(d) + fname;
     // The package name is our process name; its private data directory is writable.
     char cmd[256] = {};
     int fd = open("/proc/self/cmdline", O_RDONLY | O_CLOEXEC);
@@ -33,7 +42,7 @@ std::string profile_path() {
     if (auto colon = pkg.find(':'); colon != std::string::npos) pkg.resize(colon);
     std::string dir = "/data/data/" + pkg + "/files";
     if (access(dir.c_str(), W_OK) != 0) return {};
-    return dir + "/ninbridge-blocks.bin";
+    return dir + fname;
 }
 
 double now_s() {
@@ -88,9 +97,11 @@ void warmup_precompile() {
     double t0 = now_s();
     size_t done = 0;
     for (u32 pc : pcs) {
-        if ((pc & 3) || !guest_is_code(pc)) continue;
-        cpu->jit->Precompile(pc);
-        ++done;
+        if (!guest_is_code(pc & ~1u)) continue;
+        try {
+            cpu->jit->Precompile(pc);
+            ++done;
+        } catch (...) {}
     }
     cpu->thread->compiled_hint = done;
     NB_LOGI("warmup: precompiled %zu blocks in %.0f ms", done, (now_s() - t0) * 1e3);
@@ -101,11 +112,11 @@ void warmup_note_frame() {
     static size_t saved_count = 0;
     double t = now_s();
     if (first == 0) first = t;
-    // Save once the keyboard has settled, again after some typing, then whenever it grows a lot.
-    static const double first_save = getenv("NB_WARMUP_FIRST_SAVE_S") ? atof(getenv("NB_WARMUP_FIRST_SAVE_S")) : 20;
+    // Save once early (after 3 seconds of gameplay), then periodically when new blocks compile
+    static const double first_save = getenv("NB_WARMUP_FIRST_SAVE_S") ? atof(getenv("NB_WARMUP_FIRST_SAVE_S")) : 3.0;
     double since = t - first;
-    bool due = (saved_count == 0 && since > first_save) || (last_save < first + 120 && since > 120) ||
-               (since > 120 && t - last_save > 600);
+    bool due = (saved_count == 0 && since > first_save) || (last_save < first + 30 && since > 30) ||
+               (since > 30 && t - last_save > 120);
     if (!due) return;
     Cpu* cpu = main_cpu();
     if (!cpu) return;

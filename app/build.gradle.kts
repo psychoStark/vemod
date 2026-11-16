@@ -10,11 +10,11 @@ android {
     ndkVersion = "28.2.13676358"
 
     defaultConfig {
-        applicationId = "com.vemod.container"
+        applicationId = "com.psychostark.vemod"
         minSdk = 26
         targetSdk = 35
-        versionCode = 1
-        versionName = "1.0.0"
+        versionCode = 50
+        versionName = "0.5.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         ndk {
@@ -92,6 +92,9 @@ dependencies {
 
     // Hidden API bypass for guest process environment injection
     implementation("org.lsposed.hiddenapibypass:hiddenapibypass:6.1")
+
+    // Official Google APK signature generator (v1, v2, v3) for micro-stubs
+    implementation("com.android.tools.build:apksig:8.7.3")
 
     debugImplementation("androidx.compose.ui:ui-tooling")
     debugImplementation("androidx.compose.ui:ui-test-manifest")

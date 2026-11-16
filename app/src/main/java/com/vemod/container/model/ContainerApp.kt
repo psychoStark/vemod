@@ -17,5 +17,7 @@ data class ContainerApp(
     val nativeLibraries: List<String>,
     var slotIndex: Int = -1,
     val installedAt: Long = System.currentTimeMillis(),
-    val screenOrientation: Int = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+    val screenOrientation: Int = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED,
+    var isDataExposed: Boolean = false,
+    val applicationClass: String? = null
 )

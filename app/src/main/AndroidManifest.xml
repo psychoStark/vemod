@@ -3,13 +3,39 @@
     xmlns:tools="http://schemas.android.com/tools">
 
     <uses-permission android:name="com.android.launcher.permission.INSTALL_SHORTCUT" />
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+    <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES" tools:ignore="QueryAllPackages" />
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32" />
+    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="29" tools:ignore="ScopedStorage" />
+    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" tools:ignore="ScopedStorage" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+    <uses-permission android:name="android.permission.CHANGE_WIFI_STATE" />
+    <uses-permission android:name="android.permission.VIBRATE" />
+    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
+    <uses-permission android:name="android.permission.HIGH_SAMPLING_RATE_SENSORS" />
+
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.MAIN" />
+        </intent>
+    </queries>
 
     <application
         android:name=".VemodApp"
         android:allowBackup="true"
         android:label="Vemod"
+        android:icon="@mipmap/ic_vemod_launcher"
+        android:roundIcon="@mipmap/ic_vemod_launcher_round"
         android:supportsRtl="true"
+        android:requestLegacyExternalStorage="true"
+        android:usesCleartextTraffic="true"
+        android:enableOnBackInvokedCallback="true"
         android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
+
+        <uses-library android:name="org.apache.http.legacy" android:required="false" />
 
         <activity
             android:name=".ui.MainActivity"
@@ -20,133 +46,158 @@
             </intent-filter>
         </activity>
 
-        <!-- Isolated guest container process -->
+        <!-- Router Activity (translucent, no preview) -->
         <activity
             android:name=".proxy.GuestProxyActivity"
-            android:process=":guest"
+            android:theme="@style/Theme.Vemod.Router"
             android:exported="true"
-            android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|keyboard" />
+            android:configChanges="mcc|mnc|locale|touchscreen|keyboard|keyboardHidden|navigation|orientation|screenLayout|uiMode|screenSize|smallestScreenSize|density|fontScale|layoutDirection" />
 
-        <!-- App Drawer Slots 1 to 10 for direct system launcher integration -->
-        <activity-alias
-            android:name=".slot.AppSlot1"
-            android:targetActivity=".proxy.GuestProxyActivity"
-            android:enabled="false"
-            android:exported="true"
-            android:label="32-Bit App 1">
-            <intent-filter>
-                <action android:name="android.intent.action.MAIN" />
-                <category android:name="android.intent.category.LAUNCHER" />
-            </intent-filter>
-        </activity-alias>
+        <!-- Concurrent Isolated Guest Container Processes (1 to 5) -->
+        <!-- Slot 1 -->
+        <activity
+            android:name=".proxy.GuestProxyActivity1"
+            android:process=":guest1"
+            android:taskAffinity="com.psychostark.vemod.task1"
+            android:theme="@style/Theme.Vemod.Guest"
+            android:exported="false"
+            android:configChanges="mcc|mnc|locale|touchscreen|keyboard|keyboardHidden|navigation|orientation|screenLayout|uiMode|screenSize|smallestScreenSize|density|fontScale|layoutDirection" />
+        <activity
+            android:name=".proxy.GuestProxyActivity1P"
+            android:process=":guest1"
+            android:taskAffinity="com.psychostark.vemod.task1"
+            android:theme="@style/Theme.Vemod.Guest"
+            android:screenOrientation="portrait"
+            android:exported="false"
+            android:configChanges="mcc|mnc|locale|touchscreen|keyboard|keyboardHidden|navigation|orientation|screenLayout|uiMode|screenSize|smallestScreenSize|density|fontScale|layoutDirection" />
+        <activity
+            android:name=".proxy.GuestProxyActivity1L"
+            android:process=":guest1"
+            android:taskAffinity="com.psychostark.vemod.task1"
+            android:theme="@style/Theme.Vemod.Guest"
+            android:screenOrientation="sensorLandscape"
+            android:exported="false"
+            android:configChanges="mcc|mnc|locale|touchscreen|keyboard|keyboardHidden|navigation|orientation|screenLayout|uiMode|screenSize|smallestScreenSize|density|fontScale|layoutDirection" />
 
-        <activity-alias
-            android:name=".slot.AppSlot2"
-            android:targetActivity=".proxy.GuestProxyActivity"
-            android:enabled="false"
-            android:exported="true"
-            android:label="32-Bit App 2">
-            <intent-filter>
-                <action android:name="android.intent.action.MAIN" />
-                <category android:name="android.intent.category.LAUNCHER" />
-            </intent-filter>
-        </activity-alias>
+        <!-- Slot 2 -->
+        <activity
+            android:name=".proxy.GuestProxyActivity2"
+            android:process=":guest2"
+            android:taskAffinity="com.psychostark.vemod.task2"
+            android:theme="@style/Theme.Vemod.Guest"
+            android:exported="false"
+            android:configChanges="mcc|mnc|locale|touchscreen|keyboard|keyboardHidden|navigation|orientation|screenLayout|uiMode|screenSize|smallestScreenSize|density|fontScale|layoutDirection" />
+        <activity
+            android:name=".proxy.GuestProxyActivity2P"
+            android:process=":guest2"
+            android:taskAffinity="com.psychostark.vemod.task2"
+            android:theme="@style/Theme.Vemod.Guest"
+            android:screenOrientation="portrait"
+            android:exported="false"
+            android:configChanges="mcc|mnc|locale|touchscreen|keyboard|keyboardHidden|navigation|orientation|screenLayout|uiMode|screenSize|smallestScreenSize|density|fontScale|layoutDirection" />
+        <activity
+            android:name=".proxy.GuestProxyActivity2L"
+            android:process=":guest2"
+            android:taskAffinity="com.psychostark.vemod.task2"
+            android:theme="@style/Theme.Vemod.Guest"
+            android:screenOrientation="sensorLandscape"
+            android:exported="false"
+            android:configChanges="mcc|mnc|locale|touchscreen|keyboard|keyboardHidden|navigation|orientation|screenLayout|uiMode|screenSize|smallestScreenSize|density|fontScale|layoutDirection" />
 
-        <activity-alias
-            android:name=".slot.AppSlot3"
-            android:targetActivity=".proxy.GuestProxyActivity"
-            android:enabled="false"
-            android:exported="true"
-            android:label="32-Bit App 3">
-            <intent-filter>
-                <action android:name="android.intent.action.MAIN" />
-                <category android:name="android.intent.category.LAUNCHER" />
-            </intent-filter>
-        </activity-alias>
+        <!-- Slot 3 -->
+        <activity
+            android:name=".proxy.GuestProxyActivity3"
+            android:process=":guest3"
+            android:taskAffinity="com.psychostark.vemod.task3"
+            android:theme="@style/Theme.Vemod.Guest"
+            android:exported="false"
+            android:configChanges="mcc|mnc|locale|touchscreen|keyboard|keyboardHidden|navigation|orientation|screenLayout|uiMode|screenSize|smallestScreenSize|density|fontScale|layoutDirection" />
+        <activity
+            android:name=".proxy.GuestProxyActivity3P"
+            android:process=":guest3"
+            android:taskAffinity="com.psychostark.vemod.task3"
+            android:theme="@style/Theme.Vemod.Guest"
+            android:screenOrientation="portrait"
+            android:exported="false"
+            android:configChanges="mcc|mnc|locale|touchscreen|keyboard|keyboardHidden|navigation|orientation|screenLayout|uiMode|screenSize|smallestScreenSize|density|fontScale|layoutDirection" />
+        <activity
+            android:name=".proxy.GuestProxyActivity3L"
+            android:process=":guest3"
+            android:taskAffinity="com.psychostark.vemod.task3"
+            android:theme="@style/Theme.Vemod.Guest"
+            android:screenOrientation="sensorLandscape"
+            android:exported="false"
+            android:configChanges="mcc|mnc|locale|touchscreen|keyboard|keyboardHidden|navigation|orientation|screenLayout|uiMode|screenSize|smallestScreenSize|density|fontScale|layoutDirection" />
 
-        <activity-alias
-            android:name=".slot.AppSlot4"
-            android:targetActivity=".proxy.GuestProxyActivity"
-            android:enabled="false"
-            android:exported="true"
-            android:label="32-Bit App 4">
-            <intent-filter>
-                <action android:name="android.intent.action.MAIN" />
-                <category android:name="android.intent.category.LAUNCHER" />
-            </intent-filter>
-        </activity-alias>
+        <!-- Slot 4 -->
+        <activity
+            android:name=".proxy.GuestProxyActivity4"
+            android:process=":guest4"
+            android:taskAffinity="com.psychostark.vemod.task4"
+            android:theme="@style/Theme.Vemod.Guest"
+            android:exported="false"
+            android:configChanges="mcc|mnc|locale|touchscreen|keyboard|keyboardHidden|navigation|orientation|screenLayout|uiMode|screenSize|smallestScreenSize|density|fontScale|layoutDirection" />
+        <activity
+            android:name=".proxy.GuestProxyActivity4P"
+            android:process=":guest4"
+            android:taskAffinity="com.psychostark.vemod.task4"
+            android:theme="@style/Theme.Vemod.Guest"
+            android:screenOrientation="portrait"
+            android:exported="false"
+            android:configChanges="mcc|mnc|locale|touchscreen|keyboard|keyboardHidden|navigation|orientation|screenLayout|uiMode|screenSize|smallestScreenSize|density|fontScale|layoutDirection" />
+        <activity
+            android:name=".proxy.GuestProxyActivity4L"
+            android:process=":guest4"
+            android:taskAffinity="com.psychostark.vemod.task4"
+            android:theme="@style/Theme.Vemod.Guest"
+            android:screenOrientation="sensorLandscape"
+            android:exported="false"
+            android:configChanges="mcc|mnc|locale|touchscreen|keyboard|keyboardHidden|navigation|orientation|screenLayout|uiMode|screenSize|smallestScreenSize|density|fontScale|layoutDirection" />
 
-        <activity-alias
-            android:name=".slot.AppSlot5"
-            android:targetActivity=".proxy.GuestProxyActivity"
-            android:enabled="false"
-            android:exported="true"
-            android:label="32-Bit App 5">
-            <intent-filter>
-                <action android:name="android.intent.action.MAIN" />
-                <category android:name="android.intent.category.LAUNCHER" />
-            </intent-filter>
-        </activity-alias>
+        <!-- Slot 5 -->
+        <activity
+            android:name=".proxy.GuestProxyActivity5"
+            android:process=":guest5"
+            android:taskAffinity="com.psychostark.vemod.task5"
+            android:theme="@style/Theme.Vemod.Guest"
+            android:exported="false"
+            android:configChanges="mcc|mnc|locale|touchscreen|keyboard|keyboardHidden|navigation|orientation|screenLayout|uiMode|screenSize|smallestScreenSize|density|fontScale|layoutDirection" />
+        <activity
+            android:name=".proxy.GuestProxyActivity5P"
+            android:process=":guest5"
+            android:taskAffinity="com.psychostark.vemod.task5"
+            android:theme="@style/Theme.Vemod.Guest"
+            android:screenOrientation="portrait"
+            android:exported="false"
+            android:configChanges="mcc|mnc|locale|touchscreen|keyboard|keyboardHidden|navigation|orientation|screenLayout|uiMode|screenSize|smallestScreenSize|density|fontScale|layoutDirection" />
+        <activity
+            android:name=".proxy.GuestProxyActivity5L"
+            android:process=":guest5"
+            android:taskAffinity="com.psychostark.vemod.task5"
+            android:theme="@style/Theme.Vemod.Guest"
+            android:screenOrientation="sensorLandscape"
+            android:exported="false"
+            android:configChanges="mcc|mnc|locale|touchscreen|keyboard|keyboardHidden|navigation|orientation|screenLayout|uiMode|screenSize|smallestScreenSize|density|fontScale|layoutDirection" />
 
-        <activity-alias
-            android:name=".slot.AppSlot6"
-            android:targetActivity=".proxy.GuestProxyActivity"
-            android:enabled="false"
-            android:exported="true"
-            android:label="32-Bit App 6">
-            <intent-filter>
-                <action android:name="android.intent.action.MAIN" />
-                <category android:name="android.intent.category.LAUNCHER" />
-            </intent-filter>
-        </activity-alias>
+        <!-- FileProvider for installing generated stub APKs -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
 
-        <activity-alias
-            android:name=".slot.AppSlot7"
-            android:targetActivity=".proxy.GuestProxyActivity"
-            android:enabled="false"
-            android:exported="true"
-            android:label="32-Bit App 7">
+        <!-- Receiver for PackageInstaller completion -->
+        <receiver
+            android:name=".container.StubInstallReceiver"
+            android:exported="true">
             <intent-filter>
-                <action android:name="android.intent.action.MAIN" />
-                <category android:name="android.intent.category.LAUNCHER" />
+                <action android:name="com.vemod.action.STUB_INSTALLED" />
             </intent-filter>
-        </activity-alias>
-
-        <activity-alias
-            android:name=".slot.AppSlot8"
-            android:targetActivity=".proxy.GuestProxyActivity"
-            android:enabled="false"
-            android:exported="true"
-            android:label="32-Bit App 8">
-            <intent-filter>
-                <action android:name="android.intent.action.MAIN" />
-                <category android:name="android.intent.category.LAUNCHER" />
-            </intent-filter>
-        </activity-alias>
-
-        <activity-alias
-            android:name=".slot.AppSlot9"
-            android:targetActivity=".proxy.GuestProxyActivity"
-            android:enabled="false"
-            android:exported="true"
-            android:label="32-Bit App 9">
-            <intent-filter>
-                <action android:name="android.intent.action.MAIN" />
-                <category android:name="android.intent.category.LAUNCHER" />
-            </intent-filter>
-        </activity-alias>
-
-        <activity-alias
-            android:name=".slot.AppSlot10"
-            android:targetActivity=".proxy.GuestProxyActivity"
-            android:enabled="false"
-            android:exported="true"
-            android:label="32-Bit App 10">
-            <intent-filter>
-                <action android:name="android.intent.action.MAIN" />
-                <category android:name="android.intent.category.LAUNCHER" />
-            </intent-filter>
-        </activity-alias>
+        </receiver>
 
     </application>
 

@@ -57,7 +57,43 @@ static int supported_version(jint version) {
 }
 
 static jclass find_bridge(JNIEnv* env, jobject activity) {
-    if (activity == NULL) return (*env)->FindClass(env, kBridgeClass);
+    if (activity == NULL) {
+        jclass bridge = (*env)->FindClass(env, kBridgeClass);
+        if (bridge != NULL) return bridge;
+        if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
+
+        jclass thread_cls = (*env)->FindClass(env, "java/lang/Thread");
+        if (thread_cls != NULL) {
+            jmethodID cur_mid = (*env)->GetStaticMethodID(env, thread_cls, "currentThread", "()Ljava/lang/Thread;");
+            if (cur_mid != NULL) {
+                jobject thread_obj = (*env)->CallStaticObjectMethod(env, thread_cls, cur_mid);
+                if (thread_obj != NULL) {
+                    jmethodID get_cl_mid = (*env)->GetMethodID(env, thread_cls, "getContextClassLoader", "()Ljava/lang/ClassLoader;");
+                    if (get_cl_mid != NULL) {
+                        jobject loader = (*env)->CallObjectMethod(env, thread_obj, get_cl_mid);
+                        if (loader != NULL) {
+                            jclass loader_cls = (*env)->GetObjectClass(env, loader);
+                            jmethodID load_cls_mid = (*env)->GetMethodID(env, loader_cls, "loadClass", "(Ljava/lang/String;)Ljava/lang/Class;");
+                            jstring name = (*env)->NewStringUTF(env, "com.vemod.container.bridge.VemodBridge");
+                            if (load_cls_mid != NULL && name != NULL) {
+                                bridge = (jclass)(*env)->CallObjectMethod(env, loader, load_cls_mid, name);
+                                if ((*env)->ExceptionCheck(env)) {
+                                    (*env)->ExceptionClear(env);
+                                    bridge = NULL;
+                                }
+                            }
+                            if (name != NULL) (*env)->DeleteLocalRef(env, name);
+                            if (loader_cls != NULL) (*env)->DeleteLocalRef(env, loader_cls);
+                            (*env)->DeleteLocalRef(env, loader);
+                        }
+                    }
+                    (*env)->DeleteLocalRef(env, thread_obj);
+                }
+            }
+            (*env)->DeleteLocalRef(env, thread_cls);
+        }
+        return bridge;
+    }
 
     jclass activity_class = NULL;
     jobject loader = NULL;

@@ -1,6 +1,27 @@
 #include <pthread.h>
+#include <dirent.h>
+#include <fcntl.h>
+#include <linux/futex.h>
+#include <poll.h>
+#include <sched.h>
+#include <sys/epoll.h>
+#include <sys/eventfd.h>
+#include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/prctl.h>
+#include <sys/resource.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/syscall.h>
+#include <sys/sysinfo.h>
+#include <sys/time.h>
+#include <sys/timerfd.h>
+#include <sys/times.h>
+#include <sys/types.h>
+#include <sys/uio.h>
+#include <sys/utsname.h>
+#include <sys/vfs.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #ifdef __ANDROID__
@@ -11,8 +32,12 @@
 #include <cerrno>
 #include <cstdarg>
 #include <cstdio>
+#include <chrono>
 #include <mutex>
+#include <thread>
 #include <unordered_map>
+#include <unordered_set>
+#include <vector>
 
 #include <dynarmic/interface/A32/a32.h>
 #include <dynarmic/interface/A32/config.h>
@@ -21,6 +46,20 @@
 
 #include "cpu.h"
 #include "nb.h"
+
+#ifndef SYS_futex
+#if defined(__NR_futex)
+#define SYS_futex __NR_futex
+#elif defined(__NR_futex_time64)
+#define SYS_futex __NR_futex_time64
+#endif
+#endif
+
+#ifndef SYS_getdents64
+#if defined(__NR_getdents64)
+#define SYS_getdents64 __NR_getdents64
+#endif
+#endif
 
 namespace nb {
 
@@ -85,13 +124,27 @@ void reg_data(const char* name, gaddr addr) {
 Handler find_handler(const char* name) {
     std::lock_guard lk(g_reg_mu);
     auto it = g_by_name.find(name);
-    return it == g_by_name.end() ? nullptr : it->second;
+    if (it != g_by_name.end()) return it->second;
+    const char* at = strchr(name, '@');
+    if (at) {
+        std::string unversioned(name, at - name);
+        it = g_by_name.find(unversioned);
+        if (it != g_by_name.end()) return it->second;
+    }
+    return nullptr;
 }
 
 gaddr find_data(const char* name) {
     std::lock_guard lk(g_reg_mu);
     auto it = g_data.find(name);
-    return it == g_data.end() ? 0 : it->second;
+    if (it != g_data.end()) return it->second;
+    const char* at = strchr(name, '@');
+    if (at) {
+        std::string unversioned(name, at - name);
+        it = g_data.find(unversioned);
+        if (it != g_data.end()) return it->second;
+    }
+    return 0;
 }
 
 gaddr make_stub(const char* name, Handler fn) {
@@ -115,7 +168,7 @@ static gaddr g_return_trap = 0;
 
 namespace {
 
-// Minimal CP15: barrier operations and the user read-only thread ID register (TPIDRURO).
+// Comprehensive CP15 implementation: ID registers, feature registers, barriers, cycle counter, TPIDRURO/TPIDRURW.
 using Dynarmic::A32::CoprocReg;
 
 class Cp15 final : public Dynarmic::A32::Coprocessor {
@@ -123,32 +176,99 @@ public:
     explicit Cp15(u32* tls) : tls_(tls) {}
 
     std::optional<Callback> CompileInternalOperation(bool, unsigned, CoprocReg, CoprocReg, CoprocReg, unsigned) override {
-        return std::nullopt;
+        return Callback{[](void*, u32, u32) -> u64 { return 0; }, std::nullopt};
     }
+
     CallbackOrAccessOneWord CompileSendOneWord(bool two, unsigned opc1, CoprocReg CRn, CoprocReg CRm, unsigned opc2) override {
-        // c7 barriers: CP15ISB (c5,4), CP15DSB (c10,4), CP15DMB (c10,5)
         if (!two && opc1 == 0 && CRn == CoprocReg::C7) {
+            // Memory barriers (CP15ISB, CP15DSB, CP15DMB) or cache ops
             if ((CRm == CoprocReg::C5 && opc2 == 4) || (CRm == CoprocReg::C10 && (opc2 == 4 || opc2 == 5))) {
                 return Callback{[](void*, u32, u32) -> u64 {
-                                    std::atomic_thread_fence(std::memory_order_seq_cst);
-                                    return 0;
-                                },
-                                std::nullopt};
+                    std::atomic_thread_fence(std::memory_order_seq_cst);
+                    return 0;
+                }, std::nullopt};
             }
         }
-        return std::monostate{};
+        if (!two && opc1 == 0 && CRn == CoprocReg::C13 && CRm == CoprocReg::C0 && opc2 == 2) {
+            return &tpidrurw_;
+        }
+        return Callback{[](void*, u32, u32) -> u64 { return 0; }, std::nullopt};
     }
-    CallbackOrAccessTwoWords CompileSendTwoWords(bool, unsigned, CoprocReg) override { return std::monostate{}; }
+
+    CallbackOrAccessTwoWords CompileSendTwoWords(bool, unsigned, CoprocReg) override {
+        return Callback{[](void*, u32, u32) -> u64 { return 0; }, std::nullopt};
+    }
+
     CallbackOrAccessOneWord CompileGetOneWord(bool two, unsigned opc1, CoprocReg CRn, CoprocReg CRm, unsigned opc2) override {
-        if (!two && opc1 == 0 && CRn == CoprocReg::C13 && CRm == CoprocReg::C0 && opc2 == 3) return tls_;
-        return std::monostate{};
+        if (!two && opc1 == 0) {
+            if (CRn == CoprocReg::C0) {
+                if (CRm == CoprocReg::C0) {
+                    if (opc2 == 0) return &kMIDR;      // Main ID: Cortex-A15 r0p2
+                    if (opc2 == 1) return &kCTR;       // Cache type (64B lines)
+                    if (opc2 == 5) return &kMPIDR;     // Multiprocessor affinity
+                    return &kZero;
+                }
+                if (CRm == CoprocReg::C1) {
+                    // ID_PFR0, ID_PFR1, ID_DFR0, ID_AFR0, ID_MMFR0..3
+                    static u32 kPFR0 = 0x00001131;
+                    static u32 kPFR1 = 0x00011011;
+                    if (opc2 == 0) return &kPFR0;
+                    if (opc2 == 1) return &kPFR1;
+                    return &kZero;
+                }
+                if (CRm == CoprocReg::C2) {
+                    // ID_ISAR0 .. ID_ISAR5
+                    static u32 kISAR0 = 0x02101110;
+                    static u32 kISAR1 = 0x13112111;
+                    static u32 kISAR2 = 0x21232141;
+                    static u32 kISAR3 = 0x01112131;
+                    static u32 kISAR4 = 0x00010142;
+                    static u32 kISAR5 = 0x00000000;
+                    if (opc2 == 0) return &kISAR0;
+                    if (opc2 == 1) return &kISAR1;
+                    if (opc2 == 2) return &kISAR2;
+                    if (opc2 == 3) return &kISAR3;
+                    if (opc2 == 4) return &kISAR4;
+                    if (opc2 == 5) return &kISAR5;
+                    return &kZero;
+                }
+            }
+            if (CRn == CoprocReg::C9 && CRm == CoprocReg::C13 && opc2 == 0) {
+                // PMCCNTR: Cycle count
+                return Callback{[](void*, u32, u32) -> u64 {
+                    struct timespec ts;
+                    clock_gettime(CLOCK_MONOTONIC, &ts);
+                    return u32(ts.tv_sec * 1000000000ull + ts.tv_nsec);
+                }, std::nullopt};
+            }
+            if (CRn == CoprocReg::C13 && CRm == CoprocReg::C0) {
+                if (opc2 == 2) return &tpidrurw_; // User Read/Write Thread ID
+                if (opc2 == 3) return tls_;       // User Read-Only Thread ID (TPIDRURO)
+                return &kZero;
+            }
+        }
+        return &kZero;
     }
-    CallbackOrAccessTwoWords CompileGetTwoWords(bool, unsigned, CoprocReg) override { return std::monostate{}; }
-    std::optional<Callback> CompileLoadWords(bool, bool, CoprocReg, std::optional<u8>) override { return std::nullopt; }
-    std::optional<Callback> CompileStoreWords(bool, bool, CoprocReg, std::optional<u8>) override { return std::nullopt; }
+
+    CallbackOrAccessTwoWords CompileGetTwoWords(bool, unsigned, CoprocReg) override {
+        static u32 kTwoWords[2] = {0, 0};
+        return std::array<u32*, 2>{&kTwoWords[0], &kTwoWords[1]};
+    }
+
+    std::optional<Callback> CompileLoadWords(bool, bool, CoprocReg, std::optional<u8>) override {
+        return Callback{[](void*, u32, u32) -> u64 { return 0; }, std::nullopt};
+    }
+    std::optional<Callback> CompileStoreWords(bool, bool, CoprocReg, std::optional<u8>) override {
+        return Callback{[](void*, u32, u32) -> u64 { return 0; }, std::nullopt};
+    }
 
 private:
     u32* tls_;
+    u32 tpidrurw_ = 0;
+    static inline u32 kZero = 0;
+    static inline u32 kMIDR = 0x410fc0f2;
+    static inline u32 kCTR = 0x8444c004;
+    static inline u32 kMPIDR = 0x80000000;
 };
 
 // ---------------------------------------------------------------- processor ids for the monitor
@@ -180,6 +300,8 @@ void free_pid(size_t p) {
 
 // ---------------------------------------------------------------- Cpu
 
+static std::atomic<Dynarmic::A32::Jit*> g_active_jits[kMaxCpus]{};
+
 Cpu::Cpu(GuestThread* t, int depth) : thread(t), depth(depth), pid(alloc_pid()) {
     tls_word = t->tls;
     Dynarmic::A32::UserConfig cfg;
@@ -193,20 +315,32 @@ Cpu::Cpu(GuestThread* t, int depth) : thread(t), depth(depth), pid(alloc_pid()) 
     cfg.track_code_ranges = false;
     // Every thread has its own JIT (dynarmic is not re-entrant); nested ones run little code.
     cfg.code_cache_size = depth == 0 ? 128u * 1024 * 1024 : 16u * 1024 * 1024;
-    cfg.coprocessors[15] = std::make_shared<Cp15>(&tls_word);
+    cfg.optimizations = Dynarmic::all_safe_optimizations |
+                        Dynarmic::OptimizationFlag::Unsafe_ReducedErrorFP |
+                        Dynarmic::OptimizationFlag::Unsafe_InaccurateNaN |
+                        Dynarmic::OptimizationFlag::Unsafe_IgnoreStandardFPCRValue;
+    cfg.unsafe_optimizations = true;
+    auto cp15 = std::make_shared<Cp15>(&tls_word);
+    for (size_t i = 0; i < 16; ++i) {
+        cfg.coprocessors[i] = cp15;
+    }
     jit = std::make_unique<Dynarmic::A32::Jit>(cfg);
+    g_active_jits[pid].store(jit.get(), std::memory_order_release);
 }
 
 Cpu::~Cpu() {
+    g_active_jits[pid].store(nullptr, std::memory_order_release);
     jit.reset();
     free_pid(pid);
 }
 
-void Cpu::check(gaddr a, u32 n, const char* what) {
+bool Cpu::check(gaddr a, u32 n, const char* what) {
     if (!is_mapped(a) || !is_mapped(a + n - 1)) {
         dump("bad memory access");
         fatal("guest %s of %u bytes at unmapped address %#x", what, n, a);
+        return false;
     }
+    return true;
 }
 
 std::optional<u32> Cpu::MemoryReadCode(u32 a) {
@@ -263,6 +397,30 @@ void Cpu::ExceptionRaised(u32 pc, Dynarmic::A32::Exception e) {
 
 void Cpu::dump(const char* why) {
     auto& r = jit->Regs();
+    gaddr sp = r[13];
+    int found = 0;
+#ifdef __ANDROID__
+    __android_log_print(ANDROID_LOG_ERROR, "VemodBridge", "=== guest state (%s), thread %u depth %d ===", why, thread->tid, depth);
+    for (int i = 0; i < 16; i += 4)
+        __android_log_print(ANDROID_LOG_ERROR, "VemodBridge", "r%-2d %08x  r%-2d %08x  r%-2d %08x  r%-2d %08x",
+                            i, r[i], i + 1, r[i + 1], i + 2, r[i + 2], i + 3, r[i + 3]);
+    __android_log_print(ANDROID_LOG_ERROR, "VemodBridge", "cpsr %08x", jit->Cpsr());
+    __android_log_print(ANDROID_LOG_ERROR, "VemodBridge", "pc %s", symbolize(r[15]).c_str());
+    __android_log_print(ANDROID_LOG_ERROR, "VemodBridge", "lr %s", symbolize(r[14]).c_str());
+    __android_log_print(ANDROID_LOG_ERROR, "VemodBridge", "raw stack at sp=%#x:", sp);
+    for (int offset = 0; offset < 64 && is_mapped(sp + offset); offset += 16) {
+        __android_log_print(ANDROID_LOG_ERROR, "VemodBridge", "  +%02x: %08x %08x %08x %08x", offset,
+                            rd<u32>(sp + offset), rd<u32>(sp + offset + 4),
+                            rd<u32>(sp + offset + 8), rd<u32>(sp + offset + 12));
+    }
+    for (gaddr p = sp; p < sp + 1024 && found < 12 && is_mapped(p); p += 4) {
+        u32 v = rd<u32>(p);
+        if (v >= layout::kLibBase && v < layout::kLibBase + 0x1b40000 && v != r[14]) {
+            __android_log_print(ANDROID_LOG_ERROR, "VemodBridge", "  stack[%#x] %s", p - sp, symbolize(v).c_str());
+            ++found;
+        }
+    }
+#endif
     NB_LOGE("=== guest state (%s), thread %u depth %d ===", why, thread->tid, depth);
     for (int i = 0; i < 16; i += 4)
         NB_LOGE("r%-2d %08x  r%-2d %08x  r%-2d %08x  r%-2d %08x", i, r[i], i + 1, r[i + 1], i + 2, r[i + 2], i + 3,
@@ -271,8 +429,13 @@ void Cpu::dump(const char* why) {
     NB_LOGE("pc %s", symbolize(r[15]).c_str());
     NB_LOGE("lr %s", symbolize(r[14]).c_str());
     // Heuristic backtrace: code addresses found on the stack.
-    gaddr sp = r[13];
-    int found = 0;
+    NB_LOGE("raw stack at sp=%#x:", sp);
+    for (int offset = 0; offset < 64 && is_mapped(sp + offset); offset += 16) {
+        NB_LOGE("  +%02x: %08x %08x %08x %08x", offset,
+                rd<u32>(sp + offset), rd<u32>(sp + offset + 4),
+                rd<u32>(sp + offset + 8), rd<u32>(sp + offset + 12));
+    }
+    found = 0;
     for (gaddr p = sp; p < sp + 1024 && found < 12 && is_mapped(p); p += 4) {
         u32 v = rd<u32>(p);
         if (v >= layout::kLibBase && v < layout::kLibBase + 0x1b40000 && v != r[14]) {
@@ -281,74 +444,6 @@ void Cpu::dump(const char* why) {
         }
     }
 }
-
-// ---------------------------------------------------------------- SVC dispatch
-
-static void do_syscall(Cpu& cpu) {
-    auto& r = cpu.jit->Regs();
-    u32 nr = r[7];
-    switch (nr) {
-    case 0xf0002:  // __ARM_NR_cacheflush
-        cpu.jit->InvalidateCacheRange(r[0], r[1] - r[0]);
-        r[0] = 0;
-        return;
-    case 20:  // getpid
-        r[0] = u32(getpid());
-        return;
-    case 224:  // gettid
-        r[0] = cpu.thread->tid;
-        return;
-    default:
-        cpu.dump("raw syscall");
-        NB_LOGW("unsupported raw syscall %u", nr);
-        r[0] = u32(-ENOSYS);
-    }
-}
-
-void Cpu::CallSVC(u32 swi) {
-    auto& r = jit->Regs();
-    if (swi >= kSvcThunkBase) {
-        u32 idx = swi - kSvcThunkBase;
-        if (idx >= g_handler_count.load(std::memory_order_acquire)) fatal("bad thunk svc %#x", swi);
-        const Import* imp = &g_handlers[idx];
-        Ctx c(*this, imp->name.c_str());
-        imp->fn(c);
-        return;
-    }
-    switch (swi) {
-    case kSvcReturn:
-        returned = true;
-        jit->HaltExecution();
-        return;
-    case kSvcKuserCmpxchg: {
-        bool ok = cas<u32>(r[2], r[1], r[0]);
-        r[0] = ok ? 0 : 1;
-        u32 cpsr = jit->Cpsr();
-        jit->SetCpsr(ok ? (cpsr | (1u << 29)) : (cpsr & ~(1u << 29)));
-        return;
-    }
-    case kSvcKuserCmpxchg64: {
-        u64 oldv = rd<u64>(r[0]), newv = rd<u64>(r[1]);
-        bool ok = cas<u64>(r[2], newv, oldv);
-        r[0] = ok ? 0 : 1;
-        u32 cpsr = jit->Cpsr();
-        jit->SetCpsr(ok ? (cpsr | (1u << 29)) : (cpsr & ~(1u << 29)));
-        return;
-    }
-    case kSvcKuserGetTls:
-        r[0] = thread->tls;
-        return;
-    case 0:
-        do_syscall(*this);
-        return;
-    default:
-        dump("unknown svc");
-        fatal("unknown svc #%#x", swi);
-    }
-}
-
-Ctx::Ctx(Cpu& c, const char* nm) : cpu(c), r(c.jit->Regs()), name(nm), nsaa(c.jit->Regs()[13]) {}
-GuestThread& Ctx::thread() { return *cpu.thread; }
 
 // ---------------------------------------------------------------- threads
 
@@ -362,7 +457,7 @@ std::mutex g_pool_mu;
 // Deliberately leaked: destroying JITs during static destruction at process exit races dynarmic's
 // own statics (and the OS reclaims everything anyway).
 auto& g_pool = *new std::vector<std::unique_ptr<GuestThread>>;
-constexpr size_t kPoolMax = 2;
+constexpr size_t kPoolMax = 8;
 
 size_t warmth(const GuestThread& t) { return t.cpus.empty() ? 0 : t.compiled_hint; }
 
@@ -403,15 +498,39 @@ GuestThread::GuestThread() {
     mem_protect(stack_base + kPageSize, stack_size, PROT_READ | PROT_WRITE);
     stack_base += kPageSize;
     tls = map_alloc(tlsoff::kSize, PROT_READ | PROT_WRITE);
+    memset(h(tls), 0, tlsoff::kSize);
+
+    // Setup Bionic TLS slots
+    wr<u32>(tls + tlsoff::kSlotSelf, tls);
+    wr<u32>(tls + tlsoff::kSlotThreadId, tls + tlsoff::kPthreadInternal);
+    wr<u32>(tls + tlsoff::kSlotErrno, 0);
+    wr<u32>(tls + tlsoff::kSlotStackGuard, 0xdeadbeef);
+
+    // Setup pthread_internal_t at offset 0x400:
+    // [0]: next, [4]: prev, [8]: tid
+    gaddr pth = tls + tlsoff::kPthreadInternal;
+    wr<u32>(pth + 0, pth);
+    wr<u32>(pth + 4, pth);
+    wr<u32>(pth + 8, tid);
+
     char name[32] = "?";
     prctl(PR_GET_NAME, name);
     NB_LOGI("host thread '%s' entered the guest (guest tid %u)", name, tid);
 }
 
 GuestThread::~GuestThread() {
+    if (clear_child_tid && is_mapped(clear_child_tid)) {
+        wr<u32>(clear_child_tid, 0);
+        syscall(SYS_futex, h(clear_child_tid), FUTEX_WAKE, 1, nullptr, nullptr, 0);
+        syscall(SYS_futex, h(clear_child_tid), FUTEX_WAKE_PRIVATE, 1, nullptr, nullptr, 0);
+    }
     cpus.clear();
-    map_free(stack_base - kPageSize, stack_size + kPageSize);
-    map_free(tls, tlsoff::kSize);
+    if (own_stack && stack_base) {
+        map_free(stack_base - kPageSize, stack_size + kPageSize);
+    }
+    if (own_tls && tls) {
+        map_free(tls, tlsoff::kSize);
+    }
 }
 
 GuestThread& cur_thread() {
@@ -437,6 +556,1087 @@ GuestThread& cur_thread() {
 }
 
 void set_guest_errno(int e) { wr<s32>(cur_thread().tls + tlsoff::kErrno, e); }
+
+// ---------------------------------------------------------------- SVC dispatch
+
+static void do_syscall(Cpu& cpu) {
+    auto& r = cpu.jit->Regs();
+    u32 nr = r[7];
+    if (get_log_level() >= LOG_LEVEL_FULL && nr != 240 && nr != 78 && nr != 174 && nr != 175 && nr != 162 && nr != 0xf0002 && nr != 327) {
+        NB_LOGI("raw syscall nr=%u r0=%#x r1=%#x r2=%#x r3=%#x", nr, r[0], r[1], r[2], r[3]);
+    }
+    switch (nr) {
+    // ARM Private
+    case 0xf0001:  // __ARM_NR_breakpoint
+        cpu.dump("guest breakpoint");
+        r[0] = 0;
+        return;
+    case 0xf0002:  // __ARM_NR_cacheflush
+        // Guest JITted code in data memory is already coherent with host fastmem reads.
+        // Without track_code_ranges, calling InvalidateCacheRange flushes the entire 128MB JIT cache,
+        // causing severe stuttering on every Mono JIT compilation during animations and gameplay turns.
+        r[0] = 0;
+        return;
+    case 0xf0005:  // __ARM_NR_set_tls
+        cpu.tls_word = r[0];
+        r[0] = 0;
+        return;
+
+    // Process & thread lifecycle
+    case 1:  // exit
+        cpu.thread->exiting = true;
+        cpu.jit->HaltExecution();
+        return;
+    case 248:  // exit_group
+        exit(int(r[0]));
+        return;
+    case 120: {  // clone
+        u32 flags = r[0];
+        gaddr child_sp = r[1];
+        gaddr parent_tidptr = r[2];
+        gaddr new_tls = r[3];
+        gaddr child_tidptr = r[4];
+
+        auto child_t = std::make_unique<GuestThread>();
+        u32 child_tid = child_t->tid;
+        if (flags & 0x00080000) {  // CLONE_SETTLS
+            child_t->tls = new_tls;
+            child_t->own_tls = false;
+        }
+        if (child_sp) {
+            child_t->own_stack = false;
+        }
+        if (flags & 0x00200000) {  // CLONE_CHILD_CLEARTID
+            child_t->clear_child_tid = child_tidptr;
+        }
+        if (flags & 0x01000000) {  // CLONE_CHILD_SETTID
+            if (is_mapped(child_tidptr)) wr<u32>(child_tidptr, child_tid);
+        }
+        if (flags & 0x00100000) {  // CLONE_PARENT_SETTID
+            if (is_mapped(parent_tidptr)) wr<u32>(parent_tidptr, child_tid);
+        }
+
+        r[0] = child_tid;
+
+        auto parent_regs = r;
+        u32 parent_cpsr = cpu.jit->Cpsr();
+        u32 parent_fpscr = cpu.jit->Fpscr();
+
+        NB_LOGI("SYS_clone: guest parent_pc=%#x sp=%#x flags=%#x, spawning child_tid=%u",
+                parent_regs[15], child_sp, flags, child_tid);
+
+        std::thread([ct = std::move(child_t), child_sp, parent_regs, parent_cpsr, parent_fpscr, flags, new_tls]() mutable {
+            t_slot.t = std::move(ct);
+            GuestThread& t = *t_slot.t;
+            t.depth = 0;
+            if (t.cpus.empty()) t.cpus.push_back(std::make_unique<Cpu>(&t, 0));
+            Cpu& c = *t.cpus[0];
+            if (flags & 0x00080000) c.tls_word = new_tls;
+            auto& cr = c.jit->Regs();
+            cr = parent_regs;
+            cr[0] = 0;  // child returns 0
+            cr[13] = child_sp;
+            c.jit->SetCpsr(parent_cpsr);
+            c.jit->SetFpscr(parent_fpscr);
+            c.jit->ClearExclusiveState();
+            c.returned = false;
+            char name[32] = "?";
+            prctl(PR_GET_NAME, name);
+            NB_LOGI("clone child started: guest tid=%u host name='%s' pc=%#x", t.tid, name, cr[15]);
+            while (!c.returned && !t.exiting) {
+                auto hr = c.jit->Run();
+                if (bool(hr & Dynarmic::HaltReason::UserDefined1)) {
+                    c.jit->ClearHalt(Dynarmic::HaltReason::UserDefined1);
+                }
+            }
+            NB_LOGI("clone child exited: guest tid=%u", t.tid);
+        }).detach();
+        return;
+    }
+    case 114: {  // wait4(pid, wstatus, options, rusage)
+        int status = 0;
+        int res = wait4(r[0], &status, r[2], nullptr);
+        if (r[1] && is_mapped(r[1])) wr<s32>(r[1], status);
+        r[0] = res < 0 ? -errno : res;
+        return;
+    }
+    case 256:  // set_tid_address
+        cpu.thread->clear_child_tid = r[0];
+        r[0] = cpu.thread->tid;
+        return;
+
+    // Futex & synchronization
+    case 240: {  // futex
+        if (!r[0] || !is_mapped(r[0])) {
+            r[0] = u32(-EFAULT);
+            return;
+        }
+        int cmd = r[1] & ~(FUTEX_PRIVATE_FLAG | FUTEX_CLOCK_REALTIME);
+        bool takes_timespec = (cmd == FUTEX_WAIT || cmd == FUTEX_WAIT_BITSET ||
+                               cmd == FUTEX_LOCK_PI || cmd == FUTEX_WAIT_REQUEUE_PI);
+        bool takes_val2 = (cmd == FUTEX_REQUEUE || cmd == FUTEX_CMP_REQUEUE || cmd == FUTEX_WAKE_OP);
+        bool takes_uaddr2 = (cmd == FUTEX_REQUEUE || cmd == FUTEX_CMP_REQUEUE ||
+                             cmd == FUTEX_WAKE_OP || cmd == FUTEX_WAIT_REQUEUE_PI ||
+                             cmd == FUTEX_CMP_REQUEUE_PI);
+
+        void* arg4 = nullptr;
+        struct timespec host_ts;
+        if (takes_timespec) {
+            if (r[3] && is_mapped(r[3])) {
+                struct guest_ts { s32 sec; s32 nsec; };
+                guest_ts* gts = reinterpret_cast<guest_ts*>(h(r[3]));
+                host_ts.tv_sec = gts->sec;
+                host_ts.tv_nsec = gts->nsec;
+                arg4 = &host_ts;
+            }
+        } else if (takes_val2) {
+            arg4 = reinterpret_cast<void*>(static_cast<uintptr_t>(r[3]));
+        }
+
+        void* uaddr2 = (takes_uaddr2 && r[4] && is_mapped(r[4])) ? h(r[4]) : nullptr;
+        u32 val3 = r[5];
+
+        int res = syscall(SYS_futex, h(r[0]), r[1], r[2], arg4, uaddr2, val3);
+        r[0] = res < 0 ? -errno : res;
+        return;
+    }
+    case 154: {  // sched_setparam
+        struct sched_param p{};
+        if (r[1] && is_mapped(r[1])) p.sched_priority = rd<s32>(r[1]);
+        int res = sched_setparam(r[0], &p);
+        if (res < 0 && (errno == EPERM || errno == EACCES)) {
+            r[0] = 0;
+        } else {
+            r[0] = res < 0 ? -errno : res;
+        }
+        return;
+    }
+    case 155: {  // sched_getparam
+        struct sched_param p{};
+        int res = sched_getparam(r[0], &p);
+        if (res < 0) {
+            r[0] = -errno;
+        } else {
+            if (r[1] && is_mapped(r[1])) wr<s32>(r[1], p.sched_priority);
+            r[0] = 0;
+        }
+        return;
+    }
+    case 156: {  // sched_setscheduler
+        struct sched_param p{};
+        if (r[2] && is_mapped(r[2])) p.sched_priority = rd<s32>(r[2]);
+        int res = sched_setscheduler(r[0], r[1], &p);
+        if (res < 0 && (errno == EPERM || errno == EACCES)) {
+            r[0] = 0;
+        } else {
+            r[0] = res < 0 ? -errno : res;
+        }
+        return;
+    }
+    case 157: {  // sched_getscheduler
+        int res = sched_getscheduler(r[0]);
+        r[0] = res < 0 ? -errno : res;
+        return;
+    }
+    case 158:  // sched_yield
+        r[0] = sched_yield();
+        return;
+    case 159: {  // sched_get_priority_max
+        int res = sched_get_priority_max(r[0]);
+        r[0] = res < 0 ? -errno : res;
+        return;
+    }
+    case 160: {  // sched_get_priority_min
+        int res = sched_get_priority_min(r[0]);
+        r[0] = res < 0 ? -errno : res;
+        return;
+    }
+    case 241: {  // sched_setaffinity
+        int res = sched_setaffinity(r[0], r[1], reinterpret_cast<const cpu_set_t*>(h(r[2])));
+        if (res < 0 && (errno == EPERM || errno == EACCES || errno == EINVAL)) {
+            r[0] = 0;
+        } else {
+            r[0] = res < 0 ? -errno : res;
+        }
+        return;
+    }
+    case 242: {  // sched_getaffinity
+        int res = sched_getaffinity(r[0], r[1], reinterpret_cast<cpu_set_t*>(h(r[2])));
+        r[0] = res < 0 ? -errno : res;
+        return;
+    }
+    case 238: {  // tkill(tid, sig)
+        int tid = (int)r[0];
+        int sig = (int)r[1];
+        if (get_log_level() >= LOG_LEVEL_ADVANCED) {
+            NB_LOGI("raw syscall tkill: tid=%d sig=%d", tid, sig);
+        }
+        if (sig == 0) {
+            r[0] = 0; // thread alive check
+        } else if (sig == 30 || sig == 24 || sig >= 32) {
+            // Signal-based GC thread suspension (e.g. SIGPWR/SIGXCPU in Boehm GC / Mono).
+            // Under JIT, guest threads cannot be asynchronously interrupted via signals.
+            // Returning -ESRCH signals to Boehm GC that this thread is not suspendable via signals,
+            // causing it to decrement its expected ack counter and proceed without deadlocking on sem_wait.
+            r[0] = -ESRCH;
+        } else {
+            r[0] = 0;
+        }
+        return;
+    }
+    case 268: {  // tgkill(tgid, tid, sig)
+        int tgid = (int)r[0];
+        int tid = (int)r[1];
+        int sig = (int)r[2];
+        if (get_log_level() >= LOG_LEVEL_ADVANCED) {
+            NB_LOGI("raw syscall tgkill: tgid=%d tid=%d sig=%d", tgid, tid, sig);
+        }
+        if (sig == 0) {
+            r[0] = 0;
+        } else if (sig == 30 || sig == 24 || sig >= 32) {
+            r[0] = -ESRCH;
+        } else {
+            r[0] = 0;
+        }
+        return;
+    }
+
+    // Memory
+    case 45:  // brk
+        r[0] = mem_brk(r[0]);
+        return;
+    case 91:  // munmap
+        r[0] = x_munmap(r[0], r[1]) < 0 ? -errno : 0;
+        return;
+    case 125:  // mprotect
+        mem_protect(r[0], host_page_round_up(r[1]), r[2]);
+        r[0] = 0;
+        return;
+    case 192: {  // mmap2
+        gaddr addr = r[0];
+        u32 len = r[1];
+        int prot = int(r[2]);
+        int flags = int(r[3]);
+        int fd = int(r[4]);
+        u32 pgoff = r[5];
+        u32 off = pgoff << 12;
+        if (!len) { r[0] = u32(-EINVAL); return; }
+        u32 size = host_page_round_up(len);
+        gaddr a = 0;
+        if (flags & MAP_FIXED) {
+            if (addr < layout::kMapBase || u64(addr) + size > layout::kMapEnd) {
+                r[0] = u32(-EINVAL);
+                return;
+            }
+            map_claim(addr, size);
+            a = addr;
+        } else {
+            if (addr && (addr & (kPageSize - 1)) == 0 && addr >= layout::kMapBase && u64(addr) + size <= layout::kMapEnd && map_claim(addr, size)) {
+                a = addr;
+            } else {
+                a = map_alloc(size, PROT_NONE);
+                if (!a) { r[0] = u32(-ENOMEM); return; }
+            }
+        }
+        int hflags = (flags & (MAP_SHARED | MAP_PRIVATE | MAP_ANONYMOUS)) | MAP_FIXED;
+        void* p = mmap(g_base + a, size, prot, hflags, (flags & MAP_ANONYMOUS) ? -1 : fd, off);
+        if (p == MAP_FAILED) {
+            map_free(a, size);
+            r[0] = u32(-errno);
+            return;
+        }
+        mem_protect(a, size, prot == PROT_NONE ? PROT_NONE : prot | PROT_READ);
+        r[0] = a;
+        return;
+    }
+    case 220:  // madvise
+        madvise(g_base + r[0], host_page_round_up(r[1]), r[2]);
+        r[0] = 0;
+        return;
+
+    // File I/O
+    case 3: {  // read
+        s32 n = x_read(r[0], h(r[1]), r[2]);
+        r[0] = n < 0 ? -errno : n;
+        return;
+    }
+    case 4: {  // write
+        s32 n = x_write(r[0], h(r[1]), r[2]);
+        r[0] = n < 0 ? -errno : n;
+        return;
+    }
+    case 5: {  // open
+        const char* p = hs(r[0]);
+        int fd = open(headless_path(p), oflags_from_guest(r[1]) | O_CLOEXEC, r[2]);
+        r[0] = fd < 0 ? -errno : fd;
+        return;
+    }
+    case 6:  // close
+        r[0] = x_close(r[0]) < 0 ? -errno : 0;
+        return;
+    case 10: {  // unlink
+        int res = unlink(hs(r[0]));
+        r[0] = res < 0 ? -errno : res;
+        return;
+    }
+    case 12: {  // chdir
+        int res = chdir(hs(r[0]));
+        r[0] = res < 0 ? -errno : res;
+        return;
+    }
+    case 19: {  // lseek
+        s32 res = x_lseek(r[0], s32(r[1]), r[2]);
+        r[0] = res < 0 ? -errno : res;
+        return;
+    }
+    case 33: {  // access
+        int res = access(headless_path(hs(r[0])), r[1]);
+        r[0] = res < 0 ? -errno : res;
+        return;
+    }
+    case 38: {  // rename
+        int res = rename(hs(r[0]), hs(r[1]));
+        r[0] = res < 0 ? -errno : res;
+        return;
+    }
+    case 39: {  // mkdir
+        int res = mkdir(hs(r[0]), r[1]);
+        r[0] = res < 0 ? -errno : res;
+        return;
+    }
+    case 40: {  // rmdir
+        int res = rmdir(hs(r[0]));
+        r[0] = res < 0 ? -errno : res;
+        return;
+    }
+    case 41: {  // dup
+        int res = dup(r[0]);
+        r[0] = res < 0 ? -errno : res;
+        return;
+    }
+    case 42: {  // pipe
+        int fds[2];
+        int res = pipe(fds);
+        if (res < 0) {
+            r[0] = -errno;
+        } else {
+            wr<s32>(r[0], fds[0]);
+            wr<s32>(r[0] + 4, fds[1]);
+            r[0] = 0;
+        }
+        return;
+    }
+    case 54: {  // ioctl
+        int fd = r[0];
+        u32 cmd = r[1];
+        gaddr arg = r[2];
+        if (fd == kAlarmFd) { r[0] = 0; return; }
+        int res = ioctl(fd, cmd, arg ? h(arg) : nullptr);
+        r[0] = res < 0 ? -errno : res;
+        return;
+    }
+    case 63: {  // dup2
+        int res = dup2(r[0], r[1]);
+        r[0] = res < 0 ? -errno : res;
+        return;
+    }
+    case 85: {  // readlink
+        ssize_t res = readlink(hs(r[0]), reinterpret_cast<char*>(h(r[1])), r[2]);
+        r[0] = res < 0 ? -errno : res;
+        return;
+    }
+    case 93: {  // ftruncate
+        int res = ftruncate(r[0], r[1]);
+        r[0] = res < 0 ? -errno : res;
+        return;
+    }
+    case 94: {  // fchmod
+        int res = fchmod(r[0], r[1]);
+        r[0] = res < 0 ? -errno : res;
+        return;
+    }
+    case 118: {  // fsync
+        int res = fsync(r[0]);
+        r[0] = res < 0 ? -errno : res;
+        return;
+    }
+    case 133: {  // fchdir
+        int res = fchdir(r[0]);
+        r[0] = res < 0 ? -errno : res;
+        return;
+    }
+    case 140: {  // _llseek
+        int fd = r[0];
+        u64 off = (u64(r[1]) << 32) | r[2];
+        gaddr res_ptr = r[3];
+        int whence = r[4];
+        off_t res = vfd_is(fd) ? vfd_lseek(fd, off, whence) : lseek(fd, off, whence);
+        if (res == (off_t)-1) {
+            r[0] = -errno;
+        } else {
+            wr<s64>(res_ptr, res);
+            r[0] = 0;
+        }
+        return;
+    }
+    case 145: {  // readv
+        int fd = r[0];
+        gaddr iov_p = r[1];
+        int iovcnt = r[2];
+        if (iovcnt < 0 || iovcnt > 1024) { r[0] = u32(-EINVAL); return; }
+        std::vector<iovec> h_iov(iovcnt);
+        for (int i = 0; i < iovcnt; ++i) {
+            gaddr base = rd<u32>(iov_p + i * 8);
+            u32 len = rd<u32>(iov_p + i * 8 + 4);
+            h_iov[i].iov_base = h(base);
+            h_iov[i].iov_len = len;
+        }
+        ssize_t n = readv(fd, h_iov.data(), iovcnt);
+        r[0] = n < 0 ? -errno : n;
+        return;
+    }
+    case 146: {  // writev
+        int fd = r[0];
+        gaddr iov_p = r[1];
+        int iovcnt = r[2];
+        if (iovcnt < 0 || iovcnt > 1024) { r[0] = u32(-EINVAL); return; }
+        std::vector<iovec> h_iov(iovcnt);
+        for (int i = 0; i < iovcnt; ++i) {
+            gaddr base = rd<u32>(iov_p + i * 8);
+            u32 len = rd<u32>(iov_p + i * 8 + 4);
+            h_iov[i].iov_base = h(base);
+            h_iov[i].iov_len = len;
+        }
+        ssize_t n = writev(fd, h_iov.data(), iovcnt);
+        r[0] = n < 0 ? -errno : n;
+        return;
+    }
+    case 148: {  // fdatasync
+        int res = fdatasync(r[0]);
+        r[0] = res < 0 ? -errno : res;
+        return;
+    }
+    case 180: {  // pread64
+        int fd = r[0];
+        gaddr buf = r[1];
+        size_t count = r[2];
+        off64_t off = (u64(r[5]) << 32) | r[4];
+        ssize_t n = pread(fd, h(buf), count, off);
+        r[0] = n < 0 ? -errno : n;
+        return;
+    }
+    case 181: {  // pwrite64
+        int fd = r[0];
+        gaddr buf = r[1];
+        size_t count = r[2];
+        off64_t off = (u64(r[5]) << 32) | r[4];
+        ssize_t n = pwrite(fd, h(buf), count, off);
+        r[0] = n < 0 ? -errno : n;
+        return;
+    }
+    case 183: {  // getcwd
+        char* p = getcwd(reinterpret_cast<char*>(h(r[0])), r[1]);
+        r[0] = p ? u32(strlen(p) + 1) : -errno;
+        return;
+    }
+    case 193: {  // truncate64
+        off64_t len = (u64(r[3]) << 32) | r[2];
+        int res = truncate(hs(r[0]), len);
+        r[0] = res < 0 ? -errno : res;
+        return;
+    }
+    case 194: {  // ftruncate64
+        off64_t len = (u64(r[3]) << 32) | r[2];
+        int res = ftruncate(r[0], len);
+        r[0] = res < 0 ? -errno : res;
+        return;
+    }
+    case 324: {  // fallocate
+        int fd = r[0];
+        int mode = r[1];
+        off64_t offset = (u64(r[3]) << 32) | r[2];
+        off64_t len = (u64(r[5]) << 32) | r[4];
+        int res = fallocate(fd, mode, offset, len);
+        r[0] = res < 0 ? -errno : res;
+        return;
+    }
+    case 195: {  // stat64
+        struct stat s;
+        int res = stat(headless_path(hs(r[0])), &s);
+        if (res < 0) { r[0] = -errno; } else { stat_to_guest(r[1], s); r[0] = 0; }
+        return;
+    }
+    case 196: {  // lstat64
+        struct stat s;
+        int res = lstat(headless_path(hs(r[0])), &s);
+        if (res < 0) { r[0] = -errno; } else { stat_to_guest(r[1], s); r[0] = 0; }
+        return;
+    }
+    case 197: {  // fstat64
+        struct stat s;
+        int res = fstat(r[0], &s);
+        if (res < 0) { r[0] = -errno; } else { stat_to_guest(r[1], s); r[0] = 0; }
+        return;
+    }
+    case 205: {  // getgroups32
+        int sz = r[0];
+        if (sz > 0 && r[1]) {
+            wr<u32>(r[1], getgid());
+        }
+        r[0] = 1;
+        return;
+    }
+    case 217: {  // getdents64
+        int res = syscall(SYS_getdents64, r[0], h(r[1]), r[2]);
+        r[0] = res < 0 ? -errno : res;
+        return;
+    }
+    case 221: {  // fcntl64
+        int fd = r[0];
+        int cmd = r[1];
+        u32 arg = r[2];
+        if (cmd == F_GETFL) {
+            int fl = fcntl(fd, F_GETFL);
+            r[0] = fl < 0 ? -errno : oflags_to_guest(fl);
+        } else if (cmd == F_SETFL) {
+            int res = fcntl(fd, F_SETFL, oflags_from_guest(arg));
+            r[0] = res < 0 ? -errno : res;
+        } else {
+            int res = fcntl(fd, cmd, arg);
+            r[0] = res < 0 ? -errno : res;
+        }
+        return;
+    }
+    case 322: {  // openat
+        const char* p = hs(r[1]);
+        int fd = openat(r[0], headless_path(p), oflags_from_guest(r[2]) | O_CLOEXEC, r[3]);
+        r[0] = fd < 0 ? -errno : fd;
+        return;
+    }
+    case 323: {  // mkdirat
+        int res = mkdirat(r[0], hs(r[1]), r[2]);
+        r[0] = res < 0 ? -errno : res;
+        return;
+    }
+    case 327: {  // fstatat64
+        struct stat s;
+        int res = fstatat(r[0], headless_path(hs(r[1])), &s, r[3]);
+        if (res < 0) { r[0] = -errno; } else { stat_to_guest(r[2], s); r[0] = 0; }
+        return;
+    }
+    case 328: {  // unlinkat
+        int res = unlinkat(r[0], hs(r[1]), r[2]);
+        r[0] = res < 0 ? -errno : res;
+        return;
+    }
+    case 329: {  // renameat
+        int res = renameat(r[0], hs(r[1]), r[2], hs(r[3]));
+        r[0] = res < 0 ? -errno : res;
+        return;
+    }
+    case 332: {  // readlinkat
+        ssize_t res = readlinkat(r[0], hs(r[1]), reinterpret_cast<char*>(h(r[2])), r[3]);
+        r[0] = res < 0 ? -errno : res;
+        return;
+    }
+    case 333: {  // fchmodat
+        int res = fchmodat(r[0], hs(r[1]), r[2], r[3]);
+        r[0] = res < 0 ? -errno : res;
+        return;
+    }
+    case 334: {  // faccessat
+        int res = faccessat(r[0], hs(r[1]), r[2], r[3]);
+        r[0] = res < 0 ? -errno : res;
+        return;
+    }
+    case 358: {  // dup3
+        int res = dup3(r[0], r[1], r[2]);
+        r[0] = res < 0 ? -errno : res;
+        return;
+    }
+    case 359: {  // pipe2
+        int fds[2];
+        int res = pipe2(fds, r[1]);
+        if (res < 0) {
+            r[0] = -errno;
+        } else {
+            wr<s32>(r[0], fds[0]);
+            wr<s32>(r[0] + 4, fds[1]);
+            r[0] = 0;
+        }
+        return;
+    }
+
+    // Time
+    case 43: {  // times
+        struct tms host_tms{};
+        clock_t ret = times(&host_tms);
+        if (ret == (clock_t)-1) {
+            r[0] = -errno;
+        } else {
+            if (r[0] && is_mapped(r[0])) {
+                wr<s32>(r[0] + 0, s32(host_tms.tms_utime));
+                wr<s32>(r[0] + 4, s32(host_tms.tms_stime));
+                wr<s32>(r[0] + 8, s32(host_tms.tms_cutime));
+                wr<s32>(r[0] + 12, s32(host_tms.tms_cstime));
+            }
+            r[0] = u32(ret);
+        }
+        return;
+    }
+    case 78: {  // gettimeofday
+        struct timeval tv;
+        int res = gettimeofday(&tv, nullptr);
+        if (res < 0) {
+            r[0] = -errno;
+        } else {
+            if (r[0]) {
+                wr<s32>(r[0], s32(tv.tv_sec));
+                wr<s32>(r[0] + 4, s32(tv.tv_usec));
+            }
+            r[0] = 0;
+        }
+        return;
+    }
+    case 162: {  // nanosleep
+        struct timespec req = {rd<s32>(r[0]), rd<s32>(r[0] + 4)};
+        struct timespec rem = {};
+        int res = nanosleep(&req, r[1] ? &rem : nullptr);
+        if (res < 0) {
+            r[0] = -errno;
+        } else {
+            if (r[1]) {
+                wr<s32>(r[1], s32(rem.tv_sec));
+                wr<s32>(r[1] + 4, s32(rem.tv_nsec));
+            }
+            r[0] = 0;
+        }
+        return;
+    }
+    case 263: {  // clock_gettime
+        struct timespec ts;
+        int res = clock_gettime(r[0], &ts);
+        if (res < 0) {
+            r[0] = -errno;
+        } else {
+            wr<s32>(r[1], s32(ts.tv_sec));
+            wr<s32>(r[1] + 4, s32(ts.tv_nsec));
+            r[0] = 0;
+        }
+        return;
+    }
+    case 264: {  // clock_getres
+        struct timespec ts;
+        int res = clock_getres(r[0], &ts);
+        if (res < 0) {
+            r[0] = -errno;
+        } else {
+            if (r[1]) {
+                wr<s32>(r[1], s32(ts.tv_sec));
+                wr<s32>(r[1] + 4, s32(ts.tv_nsec));
+            }
+            r[0] = 0;
+        }
+        return;
+    }
+    case 265: {  // clock_nanosleep
+        struct timespec req = {rd<s32>(r[2]), rd<s32>(r[2] + 4)};
+        struct timespec rem = {};
+        int res = clock_nanosleep(r[0], r[1], &req, r[3] ? &rem : nullptr);
+        if (res != 0) {
+            r[0] = -res;
+        } else {
+            if (r[3] && !r[1]) {
+                wr<s32>(r[3], s32(rem.tv_sec));
+                wr<s32>(r[3] + 4, s32(rem.tv_nsec));
+            }
+            r[0] = 0;
+        }
+        return;
+    }
+    case 104: {  // setitimer
+        struct itimerval new_it{}, old_it{};
+        if (r[1] && is_mapped(r[1])) {
+            new_it.it_interval.tv_sec = rd<s32>(r[1] + 0);
+            new_it.it_interval.tv_usec = rd<s32>(r[1] + 4);
+            new_it.it_value.tv_sec = rd<s32>(r[1] + 8);
+            new_it.it_value.tv_usec = rd<s32>(r[1] + 12);
+        }
+        int res = setitimer(r[0], r[1] ? &new_it : nullptr, r[2] ? &old_it : nullptr);
+        if (res < 0) {
+            r[0] = -errno;
+        } else {
+            if (r[2] && is_mapped(r[2])) {
+                wr<s32>(r[2] + 0, s32(old_it.it_interval.tv_sec));
+                wr<s32>(r[2] + 4, s32(old_it.it_interval.tv_usec));
+                wr<s32>(r[2] + 8, s32(old_it.it_value.tv_sec));
+                wr<s32>(r[2] + 12, s32(old_it.it_value.tv_usec));
+            }
+            r[0] = 0;
+        }
+        return;
+    }
+    case 105: {  // getitimer
+        struct itimerval curr_it{};
+        int res = getitimer(r[0], &curr_it);
+        if (res < 0) {
+            r[0] = -errno;
+        } else {
+            if (r[1] && is_mapped(r[1])) {
+                wr<s32>(r[1] + 0, s32(curr_it.it_interval.tv_sec));
+                wr<s32>(r[1] + 4, s32(curr_it.it_interval.tv_usec));
+                wr<s32>(r[1] + 8, s32(curr_it.it_value.tv_sec));
+                wr<s32>(r[1] + 12, s32(curr_it.it_value.tv_usec));
+            }
+            r[0] = 0;
+        }
+        return;
+    }
+    case 350: {  // timerfd_create
+        int res = timerfd_create(r[0], r[1]);
+        r[0] = res < 0 ? -errno : res;
+        return;
+    }
+    case 353: {  // timerfd_settime
+        int fd = r[0];
+        int flags = r[1];
+        struct itimerspec new_val{}, old_val{};
+        if (r[2] && is_mapped(r[2])) {
+            new_val.it_interval.tv_sec = rd<s32>(r[2] + 0);
+            new_val.it_interval.tv_nsec = rd<s32>(r[2] + 4);
+            new_val.it_value.tv_sec = rd<s32>(r[2] + 8);
+            new_val.it_value.tv_nsec = rd<s32>(r[2] + 12);
+        }
+        int res = timerfd_settime(fd, flags, r[2] ? &new_val : nullptr, r[3] ? &old_val : nullptr);
+        if (res < 0) {
+            r[0] = -errno;
+        } else {
+            if (r[3] && is_mapped(r[3])) {
+                wr<s32>(r[3] + 0, s32(old_val.it_interval.tv_sec));
+                wr<s32>(r[3] + 4, s32(old_val.it_interval.tv_nsec));
+                wr<s32>(r[3] + 8, s32(old_val.it_value.tv_sec));
+                wr<s32>(r[3] + 12, s32(old_val.it_value.tv_nsec));
+            }
+            r[0] = 0;
+        }
+        return;
+    }
+    case 354: {  // timerfd_gettime
+        int fd = r[0];
+        struct itimerspec curr_val{};
+        int res = timerfd_gettime(fd, &curr_val);
+        if (res < 0) {
+            r[0] = -errno;
+        } else {
+            if (r[1] && is_mapped(r[1])) {
+                wr<s32>(r[1] + 0, s32(curr_val.it_interval.tv_sec));
+                wr<s32>(r[1] + 4, s32(curr_val.it_interval.tv_nsec));
+                wr<s32>(r[1] + 8, s32(curr_val.it_value.tv_sec));
+                wr<s32>(r[1] + 12, s32(curr_val.it_value.tv_nsec));
+            }
+            r[0] = 0;
+        }
+        return;
+    }
+
+    // Identity & system information
+    case 20:   // getpid
+        r[0] = u32(getpid());
+        return;
+    case 64:   // getppid
+        r[0] = u32(getppid());
+        return;
+    case 116: {  // sysinfo
+        int res = sysinfo(reinterpret_cast<struct sysinfo*>(h(r[0])));
+        r[0] = res < 0 ? -errno : res;
+        return;
+    }
+    case 122: {  // uname
+        int res = uname(reinterpret_cast<struct utsname*>(h(r[0])));
+        if (res < 0) {
+            r[0] = -errno;
+        } else {
+            struct utsname* u = reinterpret_cast<struct utsname*>(h(r[0]));
+            strncpy(u->machine, "armv7l", sizeof(u->machine));
+            r[0] = 0;
+        }
+        return;
+    }
+    case 172: {  // prctl
+        int opt = r[0];
+        if (opt == PR_SET_NAME) {
+            r[0] = prctl(PR_SET_NAME, hs(r[1]));
+        } else if (opt == PR_GET_NAME) {
+            r[0] = prctl(PR_GET_NAME, h(r[1]));
+        } else {
+            int res = prctl(r[0], r[1], r[2], r[3], r[4]);
+            r[0] = res < 0 ? -errno : res;
+        }
+        return;
+    }
+    case 191: {  // ugetrlimit / getrlimit
+        struct rlimit rl;
+        int res = getrlimit(r[0], &rl);
+        if (res < 0) {
+            r[0] = -errno;
+        } else {
+            wr<u32>(r[1], u32(rl.rlim_cur));
+            wr<u32>(r[1] + 4, u32(rl.rlim_max));
+            r[0] = 0;
+        }
+        return;
+    }
+    case 199:  // getuid
+        r[0] = getuid();
+        return;
+    case 200:  // getgid
+        r[0] = getgid();
+        return;
+    case 201:  // geteuid
+        r[0] = geteuid();
+        return;
+    case 202:  // getegid
+        r[0] = getegid();
+        return;
+    case 224:  // gettid
+        r[0] = cpu.thread->tid;
+        return;
+    case 369: {  // prlimit64
+        int res = prlimit(r[0], r[1], r[2] ? reinterpret_cast<const struct rlimit*>(h(r[2])) : nullptr,
+                          r[3] ? reinterpret_cast<struct rlimit*>(h(r[3])) : nullptr);
+        r[0] = res < 0 ? -errno : res;
+        return;
+    }
+    case 77: {  // getrusage
+        struct rusage ru;
+        int res = getrusage(r[0], &ru);
+        if (res < 0) {
+            r[0] = -errno;
+        } else {
+            memset(h(r[1]), 0, 72);
+            wr<s32>(r[1] + 0, s32(ru.ru_utime.tv_sec));
+            wr<s32>(r[1] + 4, s32(ru.ru_utime.tv_usec));
+            wr<s32>(r[1] + 8, s32(ru.ru_stime.tv_sec));
+            wr<s32>(r[1] + 12, s32(ru.ru_stime.tv_usec));
+            wr<s32>(r[1] + 16, s32(ru.ru_maxrss));
+            r[0] = 0;
+        }
+        return;
+    }
+
+    // Signals
+    case 37:   // kill
+    case 67:   // sigaction
+    case 126:  // sigprocmask
+    case 174:  // rt_sigaction
+    case 175:  // rt_sigprocmask
+    case 186:  // sigaltstack
+        r[0] = 0;
+        return;
+
+    // Filesystem stats
+    case 266: {  // statfs64(path, sz, buf)
+        struct statfs st;
+        int res = statfs(hs(r[0]), &st);
+        if (res < 0) {
+            r[0] = -errno;
+        } else {
+            gaddr buf = r[2];
+            u32 sz = r[1];
+            if (buf && sz >= 84) {
+                memset(h(buf), 0, sz);
+                wr<u32>(buf + 0, (u32)st.f_type);
+                wr<u32>(buf + 4, (u32)st.f_bsize);
+                wr<u64>(buf + 8, (u64)st.f_blocks);
+                wr<u64>(buf + 16, (u64)st.f_bfree);
+                wr<u64>(buf + 24, (u64)st.f_bavail);
+                wr<u64>(buf + 32, (u64)st.f_files);
+                wr<u64>(buf + 40, (u64)st.f_ffree);
+                memcpy(h(buf + 48), &st.f_fsid, 8);
+                wr<u32>(buf + 56, (u32)st.f_namelen);
+                wr<u32>(buf + 60, (u32)st.f_frsize);
+                wr<u32>(buf + 64, (u32)st.f_flags);
+            }
+            r[0] = 0;
+        }
+        return;
+    }
+    case 267: {  // fstatfs64(fd, sz, buf)
+        struct statfs st;
+        int res = fstatfs(r[0], &st);
+        if (res < 0) {
+            r[0] = -errno;
+        } else {
+            gaddr buf = r[2];
+            u32 sz = r[1];
+            if (buf && sz >= 84) {
+                memset(h(buf), 0, sz);
+                wr<u32>(buf + 0, (u32)st.f_type);
+                wr<u32>(buf + 4, (u32)st.f_bsize);
+                wr<u64>(buf + 8, (u64)st.f_blocks);
+                wr<u64>(buf + 16, (u64)st.f_bfree);
+                wr<u64>(buf + 24, (u64)st.f_bavail);
+                wr<u64>(buf + 32, (u64)st.f_files);
+                wr<u64>(buf + 40, (u64)st.f_ffree);
+                memcpy(h(buf + 48), &st.f_fsid, 8);
+                wr<u32>(buf + 56, (u32)st.f_namelen);
+                wr<u32>(buf + 60, (u32)st.f_frsize);
+                wr<u32>(buf + 64, (u32)st.f_flags);
+            }
+            r[0] = 0;
+        }
+        return;
+    }
+
+    // Sockets & IPC
+    case 251: {  // epoll_ctl
+        int res = epoll_ctl(r[0], r[1], r[2], reinterpret_cast<epoll_event*>(h(r[3])));
+        r[0] = res < 0 ? -errno : res;
+        return;
+    }
+    case 281: {  // socket
+        int res = socket(r[0], r[1], r[2]);
+        r[0] = res < 0 ? -errno : res;
+        return;
+    }
+    case 282: {  // bind
+        int res = bind(r[0], reinterpret_cast<const sockaddr*>(h(r[1])), r[2]);
+        r[0] = res < 0 ? -errno : res;
+        return;
+    }
+    case 283: {  // connect
+        int res = connect(r[0], reinterpret_cast<const sockaddr*>(h(r[1])), r[2]);
+        r[0] = res < 0 ? -errno : res;
+        return;
+    }
+    case 284: {  // listen
+        int res = listen(r[0], r[1]);
+        r[0] = res < 0 ? -errno : res;
+        return;
+    }
+    case 286: {  // getsockname
+        int res = getsockname(r[0], reinterpret_cast<sockaddr*>(h(r[1])), reinterpret_cast<socklen_t*>(h(r[2])));
+        r[0] = res < 0 ? -errno : res;
+        return;
+    }
+    case 287: {  // getpeername
+        int res = getpeername(r[0], reinterpret_cast<sockaddr*>(h(r[1])), reinterpret_cast<socklen_t*>(h(r[2])));
+        r[0] = res < 0 ? -errno : res;
+        return;
+    }
+    case 288: {  // socketpair
+        int res = socketpair(r[0], r[1], r[2], reinterpret_cast<int*>(h(r[3])));
+        r[0] = res < 0 ? -errno : res;
+        return;
+    }
+    case 290: {  // sendto
+        ssize_t res = sendto(r[0], h(r[1]), r[2], r[3],
+                             r[4] ? reinterpret_cast<const sockaddr*>(h(r[4])) : nullptr, r[5]);
+        r[0] = res < 0 ? -errno : res;
+        return;
+    }
+    case 292: {  // recvfrom
+        ssize_t res = recvfrom(r[0], h(r[1]), r[2], r[3],
+                              r[4] ? reinterpret_cast<sockaddr*>(h(r[4])) : nullptr,
+                              reinterpret_cast<socklen_t*>(h(r[5])));
+        r[0] = res < 0 ? -errno : res;
+        return;
+    }
+    case 294: {  // setsockopt
+        int res = setsockopt(r[0], r[1], r[2], h(r[3]), r[4]);
+        r[0] = res < 0 ? -errno : res;
+        return;
+    }
+    case 295: {  // getsockopt
+        int res = getsockopt(r[0], r[1], r[2], h(r[3]), reinterpret_cast<socklen_t*>(h(r[4])));
+        r[0] = res < 0 ? -errno : res;
+        return;
+    }
+    case 336: {  // ppoll
+        struct timespec host_ts;
+        struct timespec* to_ptr = nullptr;
+        if (r[2]) {
+            struct guest_ts { s32 sec; s32 nsec; };
+            guest_ts* gts = reinterpret_cast<guest_ts*>(h(r[2]));
+            host_ts.tv_sec = gts->sec;
+            host_ts.tv_nsec = gts->nsec;
+            to_ptr = &host_ts;
+        }
+        int res = ppoll(reinterpret_cast<pollfd*>(h(r[0])), r[1], to_ptr,
+                        r[3] ? reinterpret_cast<const sigset_t*>(h(r[3])) : nullptr);
+        r[0] = res < 0 ? -errno : res;
+        return;
+    }
+    case 356: {  // eventfd2
+        int res = eventfd(r[0], r[1]);
+        r[0] = res < 0 ? -errno : res;
+        return;
+    }
+    case 357: {  // epoll_create1
+        int res = epoll_create1(r[0]);
+        r[0] = res < 0 ? -errno : res;
+        return;
+    }
+    case 366: {  // accept4
+        int res = accept4(r[0], reinterpret_cast<sockaddr*>(h(r[1])),
+                          reinterpret_cast<socklen_t*>(h(r[2])), r[3]);
+        r[0] = res < 0 ? -errno : res;
+        return;
+    }
+
+    default:
+        if (get_log_level() >= LOG_LEVEL_ADVANCED) {
+            cpu.dump("raw syscall");
+        }
+        NB_LOGW("unsupported raw syscall %u", nr);
+        r[0] = u32(-ENOSYS);
+    }
+}
+
+void Cpu::CallSVC(u32 swi) {
+    auto& r = jit->Regs();
+    if (swi >= kSvcThunkBase) {
+        u32 idx = swi - kSvcThunkBase;
+        if (idx >= g_handler_count.load(std::memory_order_acquire)) fatal("bad thunk svc %#x", swi);
+        const Import* imp = &g_handlers[idx];
+        Ctx c(*this, imp->name.c_str());
+        imp->fn(c);
+        return;
+    }
+    switch (swi) {
+    case kSvcReturn:
+        returned = true;
+        jit->HaltExecution();
+        return;
+    case kSvcKuserCmpxchg: {
+        bool ok = cas<u32>(r[2], r[1], r[0]);
+        r[0] = ok ? 0 : 1;
+        u32 cpsr = jit->Cpsr();
+        jit->SetCpsr(ok ? (cpsr | (1u << 29)) : (cpsr & ~(1u << 29)));
+        return;
+    }
+    case kSvcKuserCmpxchg64: {
+        u64 oldv = rd<u64>(r[0]), newv = rd<u64>(r[1]);
+        bool ok = cas<u64>(r[2], newv, oldv);
+        r[0] = ok ? 0 : 1;
+        u32 cpsr = jit->Cpsr();
+        jit->SetCpsr(ok ? (cpsr | (1u << 29)) : (cpsr & ~(1u << 29)));
+        return;
+    }
+    case kSvcKuserGetTls:
+        r[0] = tls_word ? tls_word : thread->tls;
+        return;
+    case 0:
+        do_syscall(*this);
+        return;
+    default:
+        dump("unknown svc");
+        fatal("unknown svc #%#x", swi);
+    }
+}
+
+Ctx::Ctx(Cpu& c, const char* nm) : cpu(c), r(c.jit->Regs()), name(nm), nsaa(c.jit->Regs()[13]) {}
+GuestThread& Ctx::thread() { return *cpu.thread; }
 
 // ---------------------------------------------------------------- calls
 
@@ -489,7 +1689,12 @@ u64 call_guest(gaddr fn, const GArg* args, size_t n) {
     c.jit->SetFpscr(0);
     c.jit->ClearExclusiveState();
     c.returned = false;
-    while (!c.returned && !t.exiting) c.jit->Run();
+    while (!c.returned && !t.exiting) {
+        auto hr = c.jit->Run();
+        if (bool(hr & Dynarmic::HaltReason::UserDefined1)) {
+            c.jit->ClearHalt(Dynarmic::HaltReason::UserDefined1);
+        }
+    }
     u64 res = R[0] | (u64(R[1]) << 32);
     --t.depth;
     return res;

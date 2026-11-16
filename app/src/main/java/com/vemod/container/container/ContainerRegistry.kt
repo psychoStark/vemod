@@ -5,6 +5,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.BitmapFactory
+import android.os.Environment
 import android.util.Log
 import androidx.core.content.pm.ShortcutInfoCompat
 import androidx.core.content.pm.ShortcutManagerCompat
@@ -15,8 +16,6 @@ import java.io.File
 
 object ContainerRegistry {
     private const val TAG = "ContainerRegistry"
-    private const val PREFS_NAME = "vemod_slots"
-    const val MAX_SLOTS = 10
 
     private fun getContainersDir(context: Context): File {
         return File(context.filesDir, "containers").apply { mkdirs() }
@@ -27,7 +26,6 @@ object ContainerRegistry {
         val root = getContainersDir(context)
         val dirs = root.listFiles { f -> f.isDirectory && File(f, "base.apk").exists() } ?: return emptyList()
 
-        val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         val apps = mutableListOf<ContainerApp>()
 
         for (dir in dirs) {
@@ -43,20 +41,6 @@ object ContainerRegistry {
                     continue
                 }
             }
-
-            // Sync slot assignment from preferences
-            var assignedSlot = -1
-            for (i in 1..MAX_SLOTS) {
-                if (prefs.getString("slot_$i", null) == app.packageName) {
-                    assignedSlot = i
-                    break
-                }
-            }
-            if (app.slotIndex != assignedSlot) {
-                app.slotIndex = assignedSlot
-                ApkExtractor.saveMetadata(dir, app)
-            }
-
             apps.add(app)
         }
 
@@ -69,108 +53,95 @@ object ContainerRegistry {
         return ApkExtractor.readMetadata(dir)
     }
 
-    fun getAppForSlot(context: Context, slotClassName: String): ContainerApp? {
-        // e.g. "com.vemod.container.slot.AppSlot1" -> 1
-        val match = Regex("""AppSlot(\d+)""").find(slotClassName) ?: return null
-        val slotIndex = match.groupValues[1].toIntOrNull() ?: return null
-
-        val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-        val pkg = prefs.getString("slot_$slotIndex", null) ?: return null
-        return getApp(context, pkg)
+    fun isAppInAppDrawer(context: Context, packageName: String): Boolean {
+        return StubApkGenerator.isStubInstalled(context, packageName)
     }
 
-    @Synchronized
-    fun toggleAppDrawerSlot(context: Context, packageName: String): Int {
-        val app = getApp(context, packageName) ?: return -1
-        if (app.slotIndex > 0) {
-            releaseSlot(context, packageName)
-            return -1
+    fun installToAppDrawer(context: Context, packageName: String) {
+        val app = getApp(context, packageName) ?: return
+        StubApkGenerator.installStub(context, app)
+    }
+
+    fun getExposedFolderRelativePath(context: Context, app: ContainerApp): String {
+        val allApps = getInstalledApps(context)
+        val sameNameCount = allApps.count { it.appName.equals(app.appName, ignoreCase = true) }
+        val rawName = if (sameNameCount > 1) {
+            "${app.appName} (${app.packageName})"
         } else {
-            return assignSlot(context, packageName)
+            app.appName
         }
+        return rawName.replace(Regex("[\\\\/:*?\"<>|]"), "_").trim()
+    }
+
+    fun getExposedDir(context: Context, app: ContainerApp): File {
+        val sub = getExposedFolderRelativePath(context, app)
+        val vemodBase = File(Environment.getExternalStorageDirectory(), "vemod")
+        return File(vemodBase, sub)
     }
 
     @Synchronized
-    fun assignSlot(context: Context, packageName: String): Int {
-        val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-        val pm = context.packageManager
+    fun setExposeAppData(context: Context, packageName: String, expose: Boolean): Boolean {
+        val app = getApp(context, packageName) ?: return false
+        if (app.isDataExposed == expose) return true
 
-        // Check if already assigned
-        for (i in 1..MAX_SLOTS) {
-            if (prefs.getString("slot_$i", null) == packageName) {
-                return i
-            }
-        }
+        val exposedDir = getExposedDir(context, app)
+        val exposedData = File(exposedDir, "data")
+        val exposedObb = File(exposedDir, "obb")
+        val internalData = File(app.containerDir, "data")
+        val internalObb = File(app.containerDir, "external/obb")
 
-        // Find next free slot
-        var freeSlot = -1
-        for (i in 1..MAX_SLOTS) {
-            if (prefs.getString("slot_$i", null) == null) {
-                freeSlot = i
-                break
-            }
-        }
-
-        if (freeSlot == -1) {
-            Log.w(TAG, "No free App Drawer slots remaining (max $MAX_SLOTS)")
-            return -1
-        }
-
-        // Enable component in PackageManager
-        val componentName = ComponentName(context, "com.vemod.container.slot.AppSlot$freeSlot")
         try {
-            pm.setComponentEnabledSetting(
-                componentName,
-                PackageManager.COMPONENT_ENABLED_STATE_ENABLED,
-                PackageManager.DONT_KILL_APP
-            )
-            prefs.edit().putString("slot_$freeSlot", packageName).apply()
+            if (expose) {
+                exposedData.mkdirs()
+                File(exposedData, "files").mkdirs()
+                File(exposedData, "cache").mkdirs()
+                exposedObb.mkdirs()
 
-            val app = getApp(context, packageName)
-            if (app != null) {
-                app.slotIndex = freeSlot
-                ApkExtractor.saveMetadata(app.containerDir, app)
+                if (internalData.exists()) {
+                    copyDirectoryContents(internalData, exposedData)
+                }
+                if (internalObb.exists()) {
+                    copyDirectoryContents(internalObb, exposedObb)
+                }
+            } else {
+                internalData.mkdirs()
+                internalObb.mkdirs()
+                if (exposedData.exists()) {
+                    copyDirectoryContents(exposedData, internalData)
+                }
+                if (exposedObb.exists()) {
+                    copyDirectoryContents(exposedObb, internalObb)
+                }
             }
-            Log.i(TAG, "Assigned slot $freeSlot to $packageName and enabled $componentName")
-        } catch (e: Throwable) {
-            Log.e(TAG, "Failed to enable component $componentName", e)
-            return -1
-        }
 
-        updateShortcuts(context)
-        return freeSlot
+            app.isDataExposed = expose
+            ApkExtractor.saveMetadata(app.containerDir, app)
+            updateShortcuts(context)
+            Log.i(TAG, "setExposeAppData for ${app.packageName}: expose=$expose, dir=${exposedDir.absolutePath}")
+            return true
+        } catch (e: Throwable) {
+            Log.e(TAG, "Failed to setExposeAppData for ${app.packageName}", e)
+            return false
+        }
     }
 
-    @Synchronized
-    fun releaseSlot(context: Context, packageName: String) {
-        val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-        val pm = context.packageManager
-
-        for (i in 1..MAX_SLOTS) {
-            if (prefs.getString("slot_$i", null) == packageName) {
-                val componentName = ComponentName(context, "com.vemod.container.slot.AppSlot$i")
+    private fun copyDirectoryContents(source: File, target: File) {
+        if (!source.exists() || !source.isDirectory) return
+        target.mkdirs()
+        source.listFiles()?.forEach { file ->
+            val dest = File(target, file.name)
+            if (file.isDirectory) {
+                copyDirectoryContents(file, dest)
+            } else {
                 try {
-                    pm.setComponentEnabledSetting(
-                        componentName,
-                        PackageManager.COMPONENT_ENABLED_STATE_DISABLED,
-                        PackageManager.DONT_KILL_APP
-                    )
+                    if (!dest.exists() || file.lastModified() > dest.lastModified()) {
+                        file.copyTo(dest, overwrite = true)
+                    }
                 } catch (e: Throwable) {
-                    Log.w(TAG, "Failed to disable component $componentName", e)
+                    Log.w(TAG, "Failed to copy file ${file.absolutePath} to ${dest.absolutePath}", e)
                 }
-                prefs.edit().remove("slot_$i").apply()
-
-                val app = getApp(context, packageName)
-                if (app != null) {
-                    app.slotIndex = -1
-                    ApkExtractor.saveMetadata(app.containerDir, app)
-                }
-                Log.i(TAG, "Released slot $i for $packageName")
-                break
             }
         }
-
-        updateShortcuts(context)
     }
 
     fun pinShortcut(context: Context, app: ContainerApp): Boolean {
@@ -186,6 +157,11 @@ object ContainerRegistry {
             putExtra(GuestProxyActivity.EXTRA_PACKAGE_NAME, app.packageName)
             putExtra(GuestProxyActivity.EXTRA_LAUNCH_ACTIVITY, app.launchActivity)
             putExtra(GuestProxyActivity.EXTRA_SCREEN_ORIENTATION, app.screenOrientation)
+            putExtra(GuestProxyActivity.EXTRA_IS_DATA_EXPOSED, app.isDataExposed)
+            if (app.isDataExposed) {
+                val exp = getExposedDir(context, app)
+                putExtra(GuestProxyActivity.EXTRA_EXPOSED_DIR, exp.absolutePath)
+            }
             flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
         }
 
@@ -221,6 +197,11 @@ object ContainerRegistry {
                     putExtra(GuestProxyActivity.EXTRA_PACKAGE_NAME, app.packageName)
                     putExtra(GuestProxyActivity.EXTRA_LAUNCH_ACTIVITY, app.launchActivity)
                     putExtra(GuestProxyActivity.EXTRA_SCREEN_ORIENTATION, app.screenOrientation)
+                    putExtra(GuestProxyActivity.EXTRA_IS_DATA_EXPOSED, app.isDataExposed)
+                    if (app.isDataExposed) {
+                        val exp = getExposedDir(context, app)
+                        putExtra(GuestProxyActivity.EXTRA_EXPOSED_DIR, exp.absolutePath)
+                    }
                     flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
                 }
 
@@ -247,7 +228,7 @@ object ContainerRegistry {
 
     @Synchronized
     fun uninstallApp(context: Context, packageName: String): Boolean {
-        releaseSlot(context, packageName)
+        StubApkGenerator.uninstallStub(context, packageName)
         try {
             ShortcutManagerCompat.removeDynamicShortcuts(context, listOf("dynamic_$packageName", "shortcut_$packageName"))
         } catch (_: Throwable) {}

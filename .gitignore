@@ -72,5 +72,13 @@ Thumbs.db
 # Kotlin
 .kotlin/
 
-# Reference APKs directory (large binaries)
+# Test folders and reference files
+to test/
 refference/
+armeabi-v7a/
+bionic_aosp/
+custom_bionic/
+extracted_bionic/
+assetbuild/
+/*.zip
+/*.so

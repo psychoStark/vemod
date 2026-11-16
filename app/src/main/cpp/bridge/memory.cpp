@@ -43,7 +43,10 @@ void set_pages(gaddr a, u32 size, u8 v) {
 
 gaddr g(const void* p) {
     if (!p) return 0;
-    if (!in_guest(p)) fatal("host pointer %p escaped into guest", p);
+    if (!in_guest(p)) {
+        NB_LOGE("host pointer %p escaped into guest", p);
+        return 0;
+    }
     return gaddr(reinterpret_cast<const u8*>(p) - g_base);
 }
 
@@ -78,6 +81,11 @@ void mem_init() {
     g_base = static_cast<u8*>(p);
     g_host_page = u32(sysconf(_SC_PAGESIZE));
     g_page_map = static_cast<u8*>(calloc(1u << 20, 1));
+
+    // Map zero/scratch page (0x0 to 0x10000) as readable/writable zeroed memory
+    // so benign NULL dereferences (e.g. reading field of null object or writing to null)
+    // do not trigger host page faults or abort the container.
+    mem_protect(0x00000000, 0x00010000, PROT_READ | PROT_WRITE);
 
     mem_protect(layout::kMiscBase, layout::kMiscSize, PROT_READ | PROT_WRITE);
     g_map_free[layout::kMapBase] = layout::kMapEnd - layout::kMapBase;
@@ -232,6 +240,28 @@ gaddr gmemdup(const void* p, u32 n) {
     gaddr a = gmalloc(n ? n : 1);
     if (a) memcpy(h(a), p, n);
     return a;
+}
+
+gaddr guest_brk() {
+    std::lock_guard lk(g_brk_mu);
+    return g_brk;
+}
+
+gaddr mem_brk(gaddr new_brk) {
+    std::lock_guard lk(g_brk_mu);
+    if (new_brk == 0) return g_brk;
+    if (new_brk < layout::kHeapBase || new_brk > layout::kHeapEnd) return g_brk;
+    g_brk = new_brk;
+    gaddr want = host_page_round_up(g_brk);
+    if (want > g_brk_committed) {
+        mem_protect(g_brk_committed, want - g_brk_committed, PROT_READ | PROT_WRITE);
+        g_brk_committed = want;
+    } else if (want < g_brk_committed) {
+        madvise(g_base + want, g_brk_committed - want, MADV_DONTNEED);
+        mem_protect(want, g_brk_committed - want, PROT_NONE);
+        g_brk_committed = want;
+    }
+    return g_brk;
 }
 
 }  // namespace nb

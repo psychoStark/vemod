@@ -595,6 +595,40 @@ int x_setvbuf(u32 gf, u32, int mode, u32 size) {
     if (!f || !f->f || f->log_prio) return 0;
     return setvbuf(f->f, nullptr, mode, size);  // let the host own the buffer
 }
+int x_feof(u32 gf) {
+    GFile* f = lookup(gf);
+    return (f && f->f) ? feof(f->f) : 0;
+}
+int x_ferror(u32 gf) {
+    GFile* f = lookup(gf);
+    return (f && f->f) ? ferror(f->f) : 0;
+}
+int x_fputwc(u32 wc, u32 gf) {
+    GFile* f = lookup(gf);
+    return (f && f->f) ? fputwc(wchar_t(wc), f->f) : -1;
+}
+u32 x_tmpfile() {
+    FILE* f = tmpfile();
+    if (!f) {
+        errno_from_host();
+        return 0;
+    }
+    return wrap_file(f);
+}
+void x_vasprintf(Ctx& c) {
+    gaddr ptr_addr = c.a32();
+    const char* fmt = hs(c.a32());
+    VaArgs a(c.a32());
+    std::string s = gformat(fmt, a);
+    gaddr mem = gmalloc(u32(s.size() + 1));
+    if (mem) {
+        memcpy(h(mem), s.c_str(), s.size() + 1);
+        wr<u32>(ptr_addr, mem);
+        c.ret(u32(s.size()));
+    } else {
+        c.ret(~0u);
+    }
+}
 u32 x_getwc(u32 gf) {
     GFile* f = lookup(gf);
     if (!f || !f->f) return u32(WEOF);
@@ -702,6 +736,13 @@ void x_sscanf(Ctx& c) {
     CtxArgs a(c);
     c.ret(u32(gsscanf(in, fmt, a)));
 }
+void x_vsscanf(Ctx& c) {
+    const char* in = hs(c.a32());
+    const char* fmt = hs(c.a32());
+    gaddr ap = c.a32();
+    VaArgs a(ap);
+    c.ret(u32(gsscanf(in, fmt, a)));
+}
 
 }  // namespace
 
@@ -731,7 +772,14 @@ void register_stdio() {
     NB_REG("fread", x_fread);
     NB_REG("fwrite", x_fwrite);
     NB_REG("fseek", x_fseek);
+    NB_REG("fseeko", x_fseek);
     NB_REG("ftell", x_ftell);
+    NB_REG("ftello", x_ftell);
+    NB_REG("feof", x_feof);
+    NB_REG("ferror", x_ferror);
+    NB_REG("fputwc", x_fputwc);
+    NB_REG("tmpfile", x_tmpfile);
+    reg("vasprintf", x_vasprintf);
     NB_REG("setvbuf", x_setvbuf);
     NB_REG("setbuf", x_setbuf);
     NB_REG("puts", x_puts);
@@ -748,6 +796,7 @@ void register_stdio() {
     reg("vprintf", x_vprintf);
     reg("vfprintf", x_vfprintf);
     reg("sscanf", x_sscanf);
+    reg("vsscanf", x_vsscanf);
 }
 
 }  // namespace nb

@@ -3,3 +3,8 @@ plugins {
     id("org.jetbrains.kotlin.android") version "2.0.21" apply false
     id("org.jetbrains.kotlin.plugin.compose") version "2.0.21" apply false
 }
+
+allprojects {
+    layout.buildDirectory.set(file("/Users/psychostark/.cache/vemod-build/${project.name}"))
+}
+

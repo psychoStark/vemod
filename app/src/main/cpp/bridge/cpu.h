@@ -50,7 +50,7 @@ public:
     u64 GetTicksRemaining() override { return ~0ull >> 1; }
 
 private:
-    void check(gaddr a, u32 n, const char* what);
+    bool check(gaddr a, u32 n, const char* what);
 };
 
 void cpu_init();

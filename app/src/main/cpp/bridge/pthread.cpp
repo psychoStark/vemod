@@ -3,6 +3,7 @@
 // use swaps the static initializer for a handle to a host object.
 #include <pthread.h>
 #include <semaphore.h>
+#include <sys/prctl.h>
 
 #include <cerrno>
 #include <atomic>
@@ -54,9 +55,9 @@ Pool<pthread_cond_t> g_conds;
 Pool<sem_t> g_sems;
 
 pthread_mutex_t* new_mutex_handle(gaddr gm, u32 type_word, bool force) {
-    int type = type_word == kMutexRecursiveInit   ? PTHREAD_MUTEX_RECURSIVE
-               : type_word == kMutexErrorcheckInit ? PTHREAD_MUTEX_ERRORCHECK
-                                                   : PTHREAD_MUTEX_NORMAL;
+    // Treat ALL mutexes as RECURSIVE on Android host to avoid EDEADLK crashes
+    // when guest threads re-enter locks in callbacks/nested calls (e.g. Rovio games, Orange Roulette).
+    int type = PTHREAD_MUTEX_RECURSIVE;
     u32 idx = g_mutexes.add([type](pthread_mutex_t& m) {
         pthread_mutexattr_t at;
         pthread_mutexattr_init(&at);
@@ -126,9 +127,44 @@ int x_mutex_destroy(u32 m) {
     wr<u32>(m, 0xdead0000u);  // neither a handle nor an initializer
     return 0;
 }
-int x_mutex_lock(u32 m) { return pthread_mutex_lock(mutex_of(m)); }
-int x_mutex_trylock(u32 m) { return pthread_mutex_trylock(mutex_of(m)); }
-int x_mutex_unlock(u32 m) { return pthread_mutex_unlock(mutex_of(m)); }
+int x_mutex_lock(u32 m) {
+    if (!m) return EINVAL;
+    pthread_mutex_t* mtx = mutex_of(m);
+    if (!mtx) return EINVAL;
+    int rc = pthread_mutex_lock(mtx);
+    if (rc == EDEADLK) return 0;
+    return rc;
+}
+int x_mutex_trylock(u32 m) {
+    if (!m) return EINVAL;
+    pthread_mutex_t* mtx = mutex_of(m);
+    if (!mtx) return EINVAL;
+    int rc = pthread_mutex_trylock(mtx);
+    if (rc == EDEADLK) return 0;
+    return rc;
+}
+int x_mutex_unlock(u32 m) {
+    if (!m) return EINVAL;
+    pthread_mutex_t* mtx = mutex_of(m);
+    if (!mtx) return EINVAL;
+    int rc = pthread_mutex_unlock(mtx);
+    if (rc == EPERM) return 0;
+    return rc;
+}
+int x_mutex_timedlock(u32 m, gaddr abs_timeout) {
+    if (!m) return EINVAL;
+    pthread_mutex_t* mtx = mutex_of(m);
+    if (!mtx) return EINVAL;
+    if (!abs_timeout) return x_mutex_lock(m);
+    struct guest_timespec { s32 tv_sec; s32 tv_nsec; };
+    guest_timespec* gts = reinterpret_cast<guest_timespec*>(h(abs_timeout));
+    struct timespec ts;
+    ts.tv_sec = gts->tv_sec;
+    ts.tv_nsec = gts->tv_nsec;
+    int rc = pthread_mutex_timedlock(mtx, &ts);
+    if (rc == EDEADLK) return 0;
+    return rc;
+}
 
 int x_condattr_init(u32 a) {
     if (a) wr<u32>(a, 0);
@@ -212,6 +248,12 @@ void* thread_main(void* p) {
     delete static_cast<std::shared_ptr<ThreadRec>*>(p);
     GuestThread& t = cur_thread();
     t.tid = rec->tid;
+    if (t.tls && is_mapped(t.tls + tlsoff::kPthreadInternal)) {
+        wr<u32>(t.tls + tlsoff::kPthreadInternal + 8, rec->tid);
+    }
+    char name[32] = "?";
+    prctl(PR_GET_NAME, name);
+    NB_LOGI("thread_main: host thread '%s', guest tid=%u calling fn=%#x arg=%#x", name, rec->tid, rec->fn, rec->arg);
     u32 r = u32(call_guest(rec->fn, {ga(rec->arg)}));
     rec->retval = t.exiting ? t.exit_value : r;
     rec->done = true;
@@ -226,6 +268,7 @@ int x_pthread_create(u32 out, u32 attr, u32 fn, u32 arg) {
     rec->tid = g_guest_tids++;
     rec->fn = fn;
     rec->arg = arg;
+    if (out) wr<u32>(out, rec->tid);
     {
         std::lock_guard lk(g_threads_mu);
         g_threads[rec->tid] = rec;
@@ -240,8 +283,7 @@ int x_pthread_create(u32 out, u32 attr, u32 fn, u32 arg) {
         g_threads.erase(rec->tid);
         return r;
     }
-    if (out) wr<u32>(out, rec->tid);
-    NB_LOGI("guest thread %u started at %s", rec->tid, symbolize(fn).c_str());
+    NB_LOGI("pthread_create: spawned guest tid %u at %s (arg=%#x)", rec->tid, symbolize(fn).c_str(), arg);
     return 0;
 }
 
@@ -330,6 +372,52 @@ int x_pthread_once(u32 once, u32 fn) {
     return 0;
 }
 
+int x_pthread_equal(u32 t1, u32 t2) {
+    return t1 == t2 ? 1 : 0;
+}
+
+int x_pthread_setname_np(u32, const char*) {
+    return 0;
+}
+
+int x_pthread_getschedparam(u32, gaddr, gaddr) {
+    return 0;
+}
+
+int x_pthread_setschedparam(u32, int, gaddr) {
+    return 0;
+}
+
+int x_pthread_rwlock_init(gaddr, gaddr) {
+    return 0;
+}
+
+int x_pthread_rwlock_destroy(gaddr) {
+    return 0;
+}
+
+int x_pthread_rwlock_rdlock(gaddr) {
+    return 0;
+}
+
+int x_pthread_rwlock_wrlock(gaddr) {
+    return 0;
+}
+
+int x_pthread_rwlock_unlock(gaddr) {
+    return 0;
+}
+
+int x_pthread_getattr_np(u32, gaddr) {
+    return 0;
+}
+
+int x_pthread_attr_getstack(gaddr, gaddr stackaddr, gaddr stacksize) {
+    if (stackaddr) wr<u32>(stackaddr, cur_thread().stack_base);
+    if (stacksize) wr<u32>(stacksize, cur_thread().stack_size);
+    return 0;
+}
+
 }  // namespace
 
 void register_pthread() {
@@ -341,6 +429,8 @@ void register_pthread() {
     NB_REG("pthread_mutex_lock", x_mutex_lock);
     NB_REG("pthread_mutex_trylock", x_mutex_trylock);
     NB_REG("pthread_mutex_unlock", x_mutex_unlock);
+    NB_REG("pthread_mutex_timedlock", x_mutex_timedlock);
+    NB_REG("pthread_mutex_timedlock_monotonic_np", x_mutex_timedlock);
     NB_REG("pthread_condattr_init", x_condattr_init);
     NB_REG("pthread_condattr_destroy", x_condattr_destroy);
     NB_REG("pthread_cond_init", x_cond_init);
@@ -348,6 +438,7 @@ void register_pthread() {
     NB_REG("pthread_cond_signal", x_cond_signal);
     NB_REG("pthread_cond_wait", x_cond_wait);
     NB_REG("pthread_cond_timedwait", x_cond_timedwait);
+    NB_REG("pthread_cond_timedwait_monotonic", x_cond_timedwait);
     NB_REG("pthread_cond_broadcast", x_cond_broadcast);
     NB_REG("pthread_detach", x_pthread_detach);
     NB_REG("sem_init", x_sem_init);
@@ -359,6 +450,17 @@ void register_pthread() {
     reg("pthread_exit", x_pthread_exit);
     NB_REG("pthread_self", x_pthread_self);
     NB_REG("pthread_kill", x_pthread_kill);
+    NB_REG("pthread_equal", x_pthread_equal);
+    NB_REG("pthread_setname_np", x_pthread_setname_np);
+    NB_REG("pthread_getschedparam", x_pthread_getschedparam);
+    NB_REG("pthread_setschedparam", x_pthread_setschedparam);
+    NB_REG("pthread_rwlock_init", x_pthread_rwlock_init);
+    NB_REG("pthread_rwlock_destroy", x_pthread_rwlock_destroy);
+    NB_REG("pthread_rwlock_rdlock", x_pthread_rwlock_rdlock);
+    NB_REG("pthread_rwlock_wrlock", x_pthread_rwlock_wrlock);
+    NB_REG("pthread_rwlock_unlock", x_pthread_rwlock_unlock);
+    NB_REG("pthread_getattr_np", x_pthread_getattr_np);
+    NB_REG("pthread_attr_getstack", x_pthread_attr_getstack);
     NB_REG("pthread_key_create", x_key_create);
     NB_REG("pthread_key_delete", x_key_delete);
     NB_REG("pthread_getspecific", x_getspecific);

@@ -24,6 +24,12 @@
 #include <unistd.h>
 #include <wchar.h>
 #include <wctype.h>
+#include <fnmatch.h>
+#include <utime.h>
+#include <sys/statvfs.h>
+#if defined(__ANDROID__)
+#include <sys/system_properties.h>
+#endif
 
 #include <cerrno>
 #include <climits>
@@ -133,6 +139,11 @@ void x_longjmp(Ctx& c) {
 
 // ------------------------------------------------------------------ memory & strings
 
+void x_aeabi_memclr(Ctx& c) {
+    gaddr d = c.a32();
+    u32 n = c.a32();
+    if (n) memset(h(d), 0, n);
+}
 void x_aeabi_memcpy(Ctx& c) {
     gaddr d = c.a32(), s = c.a32();
     u32 n = c.a32();
@@ -796,18 +807,80 @@ struct tm tm_from_guest(gaddr a) {
     return t;
 }
 
-#ifdef NB_HEADLESS
-// Deterministic clock driven by the headless test harness.
-extern "C" int64_t nb_fake_time_us;
-void host_gettimeofday(struct timeval* t) {
-    t->tv_sec = nb_fake_time_us / 1000000;
-    t->tv_usec = nb_fake_time_us % 1000000;
-}
-time_t host_time() { return time_t(nb_fake_time_us / 1000000); }
-clock_t host_clock() { return clock_t(nb_fake_time_us); }
 }  // namespace
 const char* headless_path(const char* p) {
-    if (p && strcmp(p, "/proc/self/stat") == 0) {
+    if (!p) return p;
+    if (strcmp(p, "/proc/cpuinfo") == 0) {
+        static std::string cpuinfo_path = [] {
+            std::vector<std::string> dirs;
+            std::string sdir = get_sysroot_dir();
+            if (!sdir.empty()) {
+                mkdir(sdir.c_str(), 0755);
+                dirs.push_back(sdir);
+                auto slash = sdir.rfind('/');
+                if (slash != std::string::npos) {
+                    dirs.push_back(sdir.substr(0, slash));
+                }
+            }
+            std::string gdir = get_guest_lib_dir();
+            if (!gdir.empty()) dirs.push_back(gdir);
+            dirs.push_back("/data/local/tmp");
+            dirs.push_back("/tmp");
+
+            for (const auto& dir : dirs) {
+                std::string path = dir + "/vemod_proc_cpuinfo";
+                FILE* f = fopen(path.c_str(), "w");
+                if (f) {
+                    for (int i = 0; i < 8; ++i) {
+                        fprintf(f,
+                            "processor\t: %d\n"
+                            "model name\t: ARMv7 Processor rev 0 (v7l)\n"
+                            "BogoMIPS\t: 38.40\n"
+                            "Features\t: half thumb fastmult vfp edsp neon vfpv3 tls vfpv4 idiva idivt vfpd32\n"
+                            "CPU implementer\t: 0x41\n"
+                            "CPU architecture: 7\n"
+                            "CPU variant\t: 0x0\n"
+                            "CPU part\t: 0xc0f\n"
+                            "CPU revision\t: 2\n\n", i);
+                    }
+                    fprintf(f,
+                        "Hardware\t: Qualcomm Technologies, Inc\n"
+                        "Revision\t: 0000\n"
+                        "Serial\t\t: 0000000000000000\n");
+                    fclose(f);
+                    NB_LOGI("Created vemod_proc_cpuinfo at %s", path.c_str());
+                    return path;
+                }
+            }
+            NB_LOGE("Failed to create vemod_proc_cpuinfo in any candidate directory!");
+            return std::string("/proc/cpuinfo");
+        }();
+        return cpuinfo_path.c_str();
+    }
+    // Virtualize /system/lib/ and /vendor/lib/ using sysroot
+    if (strncmp(p, "/system/lib/", 12) == 0 || strncmp(p, "/vendor/lib/", 12) == 0) {
+        const std::string& sdir = get_sysroot_dir();
+        if (!sdir.empty()) {
+            static thread_local std::string s_sysroot_resolved;
+            const char* fname = p + 12;
+            s_sysroot_resolved = sdir + "/" + fname;
+            if (access(s_sysroot_resolved.c_str(), R_OK) == 0) {
+                return s_sysroot_resolved.c_str();
+            }
+        }
+    }
+    if (strcmp(p, "lib/libandroid.so") == 0 || strcmp(p, "libandroid.so") == 0) {
+        const std::string& sdir = get_sysroot_dir();
+        if (!sdir.empty()) {
+            static thread_local std::string s_android_resolved;
+            s_android_resolved = sdir + "/libandroid.so";
+            if (access(s_android_resolved.c_str(), R_OK) == 0) {
+                return s_android_resolved.c_str();
+            }
+        }
+    }
+#ifdef NB_HEADLESS
+    if (strcmp(p, "/proc/self/stat") == 0) {
         static std::string fixed = [] {
             std::string f = std::string(getenv("TMPDIR") ? getenv("TMPDIR") : "/tmp") + "/nb_headless_stat";
             FILE* out = fopen(f.c_str(), "w");
@@ -818,9 +891,19 @@ const char* headless_path(const char* p) {
         }();
         return fixed.c_str();
     }
+#endif
     return p;
 }
 namespace {
+#ifdef NB_HEADLESS
+// Deterministic clock driven by the headless test harness.
+extern "C" int64_t nb_fake_time_us;
+void host_gettimeofday(struct timeval* t) {
+    t->tv_sec = nb_fake_time_us / 1000000;
+    t->tv_usec = nb_fake_time_us % 1000000;
+}
+time_t host_time() { return time_t(nb_fake_time_us / 1000000); }
+clock_t host_clock() { return clock_t(nb_fake_time_us); }
 #else
 void host_gettimeofday(struct timeval* t) { gettimeofday(t, nullptr); }
 time_t host_time() { return time(nullptr); }
@@ -927,6 +1010,8 @@ char* x_strptime(const char* buf, const char* fmt, u32 gtm) {
     return r;
 }
 
+}  // namespace
+
 // ------------------------------------------------------------------ files
 
 // ARM32 and arm64 share O_* values; x86_64 hosts differ for these four.
@@ -954,13 +1039,24 @@ int oflags_to_guest(int f) {
     return r;
 }
 
+namespace {
 void x_open(Ctx& c) {
     const char* path = headless_path(hs(c.a32()));
     int flags = int(c.a32());
     int mode = int(c.a32());
-    c.ret(u32(sysret(open(path, oflags_from_guest(flags) | O_CLOEXEC, mode))));
+    if (path && strcmp(path, "/dev/alarm") == 0) {
+        NB_LOGI("open('/dev/alarm') -> virtual kAlarmFd");
+        c.ret(kAlarmFd);
+        return;
+    }
+    int fd = open(path, oflags_from_guest(flags) | O_CLOEXEC, mode);
+    NB_LOGI("open('%s', flags=%#x) -> fd=%d (errno=%d)", path ? path : "null", flags, fd, fd < 0 ? errno : 0);
+    c.ret(u32(sysret(fd)));
 }
+}  // namespace
+
 int x_close(int fd) {
+    if (fd == kAlarmFd) return 0;
     if (vfd_is(fd)) return vfd_close(fd);
     return sysret(close(fd));
 }
@@ -982,6 +1078,8 @@ s32 x_lseek(int fd, s32 off, int whence) {
     }
     return s32(r);
 }
+
+namespace {
 int x_fsync(int fd) { return sysret(fsync(fd)); }
 int x_fdatasync(int fd) { return sysret(fdatasync(fd)); }
 int x_ftruncate(int fd, s32 len) { return sysret(ftruncate(fd, len)); }
@@ -990,7 +1088,7 @@ int x_remove(const char* p) { return sysret(remove(p)); }
 int x_rename(const char* a, const char* b) { return sysret(rename(a, b)); }
 int x_mkdir(const char* p, u32 mode) { return sysret(mkdir(p, mode)); }
 int x_rmdir(const char* p) { return sysret(rmdir(p)); }
-int x_access(const char* p, int mode) { return sysret(access(p, mode)); }
+int x_access(const char* p, int mode) { return sysret(access(headless_path(p), mode)); }
 int x_chdir(const char* p) { return sysret(chdir(p)); }
 int x_fchmod(int fd, u32 mode) { return sysret(fchmod(fd, mode)); }
 int x_fchown(int fd, u32 uid, u32 gid) { return sysret(fchown(fd, uid, gid)); }
@@ -1024,6 +1122,8 @@ int x_utimes(const char* p, u32 tv) {
     return sysret(utimes(p, t));
 }
 
+}  // namespace
+
 // bionic arm32 struct stat (104 bytes)
 void stat_to_guest(gaddr a, const struct stat& s) {
     memset(h(a), 0, 104);
@@ -1045,15 +1145,17 @@ void stat_to_guest(gaddr a, const struct stat& s) {
     wr<s32>(a + 92, s32(s.st_ctim.tv_nsec));
     wr<u64>(a + 96, s.st_ino);
 }
+
+namespace {
 int x_stat(const char* p, u32 out) {
     struct stat s;
-    if (stat(p, &s)) return sysret(-1);
+    if (stat(headless_path(p), &s)) return sysret(-1);
     stat_to_guest(out, s);
     return 0;
 }
 int x_lstat(const char* p, u32 out) {
     struct stat s;
-    if (lstat(p, &s)) return sysret(-1);
+    if (lstat(headless_path(p), &s)) return sysret(-1);
     stat_to_guest(out, s);
     return 0;
 }
@@ -1068,6 +1170,12 @@ int x_fstat(int fd, u32 out) {
         return 0;
     }
     if (fstat(fd, &s)) return sysret(-1);
+    stat_to_guest(out, s);
+    return 0;
+}
+int x_fstatat(int dirfd, const char* p, u32 out, int flags) {
+    struct stat s;
+    if (fstatat(dirfd, p, &s, flags)) return sysret(-1);
     stat_to_guest(out, s);
     return 0;
 }
@@ -1125,6 +1233,31 @@ int x_closedir(u32 dir) {
     }
     gfree(dir);
     return sysret(closedir(d));
+}
+
+s32 x_readdir_r(u32 dir, gaddr entry, gaddr result) {
+    if (!dir || !entry || !result) return EINVAL;
+    DIR* d;
+    {
+        std::lock_guard lk(g_dir_mu);
+        auto it = g_dirs.find(dir);
+        if (it == g_dirs.end()) return EBADF;
+        d = it->second;
+    }
+    errno = 0;
+    struct dirent* e = readdir(d);
+    if (!e) {
+        if (errno) errno_from_host();
+        wr<u32>(result, 0);
+        return 0;
+    }
+    wr<u64>(entry, e->d_ino);
+    wr<s64>(entry + 8, s64(e->d_off));
+    wr<u16>(entry + 16, kDirentSize);
+    wr<u8>(entry + 18, e->d_type);
+    snprintf(hp<char>(entry + 19), 256, "%s", e->d_name);
+    wr<u32>(result, entry);
+    return 0;
 }
 
 void x_fcntl(Ctx& c) {
@@ -1210,16 +1343,49 @@ void x_ioctl(Ctx& c) {
         }
         return;
     }
+    if (fd == kAlarmFd || ((req >> 8) & 0xFF) == 'a') {
+        u8 nr = req & 0xFF;
+        u8 cmd = nr & 0x0F;
+        u8 type = nr >> 4;
+        if (cmd == 4) {  // ANDROID_ALARM_GET_TIME
+            clockid_t cid = CLOCK_BOOTTIME;
+            if (type == 0 || type == 1) cid = CLOCK_REALTIME;
+            else if (type == 4) cid = CLOCK_MONOTONIC;
+            struct timespec ts;
+            clock_gettime(cid, &ts);
+            if (arg) {
+                wr<s32>(arg, s32(ts.tv_sec));
+                wr<s32>(arg + 4, s32(ts.tv_nsec));
+            }
+            c.ret(0);
+            return;
+        }
+        // SET / WAIT / etc.
+        c.ret(0);
+        return;
+    }
+    char fd_path[128] = "";
+    char proc_path[64];
+    snprintf(proc_path, sizeof(proc_path), "/proc/self/fd/%d", fd);
+    ssize_t len = readlink(proc_path, fd_path, sizeof(fd_path) - 1);
+    if (len > 0) fd_path[len] = '\0';
+    NB_LOGI("ioctl: fd=%d (%s), req=%#x, arg=%#x", fd, fd_path, req, arg);
     switch (req) {
     case 0x541B:  // FIONREAD
     case 0x5421:  // FIONBIO
-    case 0x5413:  // TIOCGWINSZ
+    case 0x5413:  // TIOCGWINSZ:
         c.ret(u32(sysret(ioctl(fd, req, h(arg)))));
         return;
     default:
-        NB_LOGW("ioctl %#x unsupported", req);
-        set_guest_errno(EINVAL);
-        c.ret(u32(-1));
+        // Try passing through to host ioctl if valid pointer or value
+        int r = ioctl(fd, req, arg ? h(arg) : nullptr);
+        if (r == 0) {
+            NB_LOGI("ioctl %#x succeeded via host passthrough", req);
+            c.ret(0);
+            return;
+        }
+        NB_LOGW("ioctl %#x failed (host errno=%d)", req, errno);
+        c.ret(u32(sysret(r)));
     }
 }
 
@@ -1239,21 +1405,26 @@ void x_mmap(Ctx& c) {
         return;
     }
     u32 size = host_page_round_up(len);
-    gaddr a;
+    gaddr a = 0;
     if (flags & MAP_FIXED) {
-        if (!map_claim(addr, size)) {
-            NB_LOGW("mmap MAP_FIXED at %#x outside free map area", addr);
+        if (addr < layout::kMapBase || u64(addr) + size > layout::kMapEnd) {
+            NB_LOGW("mmap MAP_FIXED at %#x outside map area", addr);
             set_guest_errno(EINVAL);
             c.ret(kMapFailed);
             return;
         }
+        map_claim(addr, size);
         a = addr;
     } else {
-        a = map_alloc(size, PROT_NONE);
-        if (!a) {
-            set_guest_errno(ENOMEM);
-            c.ret(kMapFailed);
-            return;
+        if (addr && (addr & (kPageSize - 1)) == 0 && addr >= layout::kMapBase && u64(addr) + size <= layout::kMapEnd && map_claim(addr, size)) {
+            a = addr;
+        } else {
+            a = map_alloc(size, PROT_NONE);
+            if (!a) {
+                set_guest_errno(ENOMEM);
+                c.ret(kMapFailed);
+                return;
+            }
         }
     }
     int hflags = (flags & (MAP_SHARED | MAP_PRIVATE | MAP_ANONYMOUS)) | MAP_FIXED;
@@ -1267,6 +1438,8 @@ void x_mmap(Ctx& c) {
     mem_protect(a, size, prot == PROT_NONE ? PROT_NONE : prot | PROT_READ);
     c.ret(a);
 }
+}  // namespace
+
 int x_munmap(u32 a, u32 len) {
     if (a & (kPageSize - 1)) {
         set_guest_errno(EINVAL);
@@ -1275,6 +1448,8 @@ int x_munmap(u32 a, u32 len) {
     map_free(a, host_page_round_up(len));
     return 0;
 }
+
+namespace {
 void x_mremap(Ctx& c) {
     gaddr old = c.a32();
     u32 olen = host_page_round_up(c.a32());
@@ -1540,6 +1715,97 @@ u32 x_gethostbyname(const char* name) {
     return base;
 }
 
+s32 x_getaddrinfo(u32 g_node, u32 g_serv, u32 g_hints, u32 g_res) {
+    if (!g_res) return EAI_NONAME;
+    const char* node_str = g_node ? reinterpret_cast<const char*>(h(g_node)) : nullptr;
+    const char* serv_str = g_serv ? reinterpret_cast<const char*>(h(g_serv)) : nullptr;
+
+    struct addrinfo host_hints;
+    memset(&host_hints, 0, sizeof(host_hints));
+    if (g_hints) {
+        host_hints.ai_flags = rd<s32>(g_hints + 0);
+        host_hints.ai_family = rd<s32>(g_hints + 4);
+        host_hints.ai_socktype = rd<s32>(g_hints + 8);
+        host_hints.ai_protocol = rd<s32>(g_hints + 12);
+    }
+
+    struct addrinfo* host_res = nullptr;
+    int rc = getaddrinfo(node_str, serv_str, g_hints ? &host_hints : nullptr, &host_res);
+    if (rc != 0) {
+        wr<u32>(g_res, 0);
+        NB_LOGW("getaddrinfo('%s', '%s') returned %d (%s)", node_str ? node_str : "null", serv_str ? serv_str : "null", rc, gai_strerror(rc));
+        return rc;
+    }
+
+    gaddr head = 0;
+    gaddr last_node = 0;
+
+    for (struct addrinfo* curr = host_res; curr != nullptr; curr = curr->ai_next) {
+        gaddr g_ai = gmalloc(32);
+        if (!g_ai) break;
+        memset(h(g_ai), 0, 32);
+
+        wr<s32>(g_ai + 0, curr->ai_flags);
+        wr<s32>(g_ai + 4, curr->ai_family);
+        wr<s32>(g_ai + 8, curr->ai_socktype);
+        wr<s32>(g_ai + 12, curr->ai_protocol);
+        wr<u32>(g_ai + 16, curr->ai_addrlen);
+
+        if (curr->ai_canonname) {
+            wr<u32>(g_ai + 20, gstrdup(curr->ai_canonname));
+        } else {
+            wr<u32>(g_ai + 20, 0);
+        }
+
+        if (curr->ai_addr && curr->ai_addrlen > 0) {
+            gaddr g_sa = gmalloc(curr->ai_addrlen);
+            if (g_sa) {
+                memcpy(h(g_sa), curr->ai_addr, curr->ai_addrlen);
+                wr<u32>(g_ai + 24, g_sa);
+            } else {
+                wr<u32>(g_ai + 24, 0);
+            }
+        } else {
+            wr<u32>(g_ai + 24, 0);
+        }
+
+        wr<u32>(g_ai + 28, 0);
+
+        if (head == 0) {
+            head = g_ai;
+        } else {
+            wr<u32>(last_node + 28, g_ai);
+        }
+        last_node = g_ai;
+    }
+
+    freeaddrinfo(host_res);
+    wr<u32>(g_res, head);
+    NB_LOGI("getaddrinfo('%s', '%s') succeeded -> guest addrinfo %#x", node_str ? node_str : "null", serv_str ? serv_str : "null", head);
+    return 0;
+}
+
+void x_freeaddrinfo(u32 g_res) {
+    gaddr curr = g_res;
+    while (curr) {
+        gaddr next = rd<u32>(curr + 28);
+        gaddr canon = rd<u32>(curr + 20);
+        gaddr addr = rd<u32>(curr + 24);
+        if (canon) gfree(canon);
+        if (addr) gfree(addr);
+        gfree(curr);
+        curr = next;
+    }
+}
+
+s32 x_android_getaddrinfofornet(u32 g_node, u32 g_serv, u32 g_hints, u32 /*netid*/, u32 /*mark*/, u32 g_res) {
+    return x_getaddrinfo(g_node, g_serv, g_hints, g_res);
+}
+
+s32 x_android_getaddrinfofornetcontext(u32 g_node, u32 g_serv, u32 g_hints, u32 /*netcontext*/, u32 g_res) {
+    return x_getaddrinfo(g_node, g_serv, g_hints, g_res);
+}
+
 // ------------------------------------------------------------------ libdl
 
 u32 x_dlopen(const char* name, int flags) {
@@ -1547,6 +1813,14 @@ u32 x_dlopen(const char* name, int flags) {
 }
 
 u32 x_dlsym(u32 handle, const char* name) {
+    return guest_dlsym(handle, name);
+}
+
+u32 x_android_dlopen_ext(const char* name, int flags, u32 /*extinfo*/) {
+    return guest_dlopen(name, flags);
+}
+
+u32 x_dlvsym(u32 handle, const char* name, const char* /*version*/) {
     return guest_dlsym(handle, name);
 }
 
@@ -1571,13 +1845,21 @@ double x_atan2(double a, double b) { return atan2(a, b); }
 double x_modf(double x, double* iptr) { return modf(x, iptr); }
 float x_modff(float x, float* iptr) { return modff(x, iptr); }
 
-u32 x_gmtime_r(const time_t* timep, void* result) {
-    struct tm* r = gmtime_r(timep, static_cast<struct tm*>(result));
-    return r ? g(r) : 0;
+u32 x_gmtime_r(gaddr timep, gaddr result) {
+    if (!timep || !result) return 0;
+    time_t t = rd<s32>(timep);
+    struct tm r;
+    if (!gmtime_r(&t, &r)) return 0;
+    tm_to_guest(result, r);
+    return result;
 }
-u32 x_localtime_r(const time_t* timep, void* result) {
-    struct tm* r = localtime_r(timep, static_cast<struct tm*>(result));
-    return r ? g(r) : 0;
+u32 x_localtime_r(gaddr timep, gaddr result) {
+    if (!timep || !result) return 0;
+    time_t t = rd<s32>(timep);
+    struct tm r;
+    if (!localtime_r(&t, &r)) return 0;
+    tm_to_guest(result, r);
+    return result;
 }
 
 int x_strerror_r(int errnum, char* buf, size_t buflen) {
@@ -1596,6 +1878,200 @@ u32 x_wcschr(const wchar_t* ws, wchar_t wc) {
 int x_wcscmp(const wchar_t* s1, const wchar_t* s2) { return wcscmp(s1, s2); }
 int x_wcsncmp(const wchar_t* s1, const wchar_t* s2, size_t n) { return wcsncmp(s1, s2, n); }
 
+// Math helpers
+double x_difftime(u32 t1, u32 t0) { return difftime((time_t)t1, (time_t)t0); }
+s32 x_lrint(double x) { return (s32)lrint(x); }
+s64 x_llrint(double x) { return (s64)llrint(x); }
+double x_remquo(double x, double y, gaddr quo_addr) {
+    int quo = 0;
+    double r = remquo(x, y, &quo);
+    if (quo_addr) wr<s32>(quo_addr, quo);
+    return r;
+}
+s32 x_fpclassifyd(double x) { return std::fpclassify(x); }
+s32 x_isfinite(double x) { return std::isfinite(x) ? 1 : 0; }
+s32 x_signbit(double x) { return std::signbit(x) ? 1 : 0; }
+
+// Memory & String helpers
+gaddr x_bsearch(gaddr key, gaddr base, u32 nmemb, u32 size, gaddr compar) {
+    if (!base || !size || !nmemb || !compar) return 0;
+    u32 l = 0, r = nmemb;
+    while (l < r) {
+        u32 m = l + (r - l) / 2;
+        gaddr item = base + m * size;
+        s32 res = (s32)call_guest(compar, {ga(key), ga(item)});
+        if (res == 0) return item;
+        if (res < 0) r = m;
+        else l = m + 1;
+    }
+    return 0;
+}
+gaddr x_basename(gaddr path) {
+    if (!path) return 0;
+    const char* p = hs(path);
+    const char* slash = strrchr(p, '/');
+    return slash ? (path + u32(slash - p + 1)) : path;
+}
+gaddr x_memmem(gaddr haystack, u32 hlen, gaddr needle, u32 nlen) {
+    if (!haystack || !needle) return 0;
+    if (nlen == 0) return haystack;
+    if (hlen < nlen) return 0;
+    const void* res = ::memmem(h(haystack), hlen, h(needle), nlen);
+    return res ? g(res) : 0;
+}
+gaddr x_memrchr(gaddr s, int c, u32 n) {
+    if (!s || !n) return 0;
+    const void* res = ::memrchr(h(s), c, n);
+    return res ? g(res) : 0;
+}
+u32 x_strcspn(gaddr s, gaddr reject) {
+    if (!s || !reject) return 0;
+    return (u32)::strcspn(hs(s), hs(reject));
+}
+gaddr x_strpbrk(gaddr s, gaddr accept) {
+    if (!s || !accept) return 0;
+    const char* res = ::strpbrk(hs(s), hs(accept));
+    return res ? g(res) : 0;
+}
+gaddr x_strncat(gaddr dest, gaddr src, u32 n) {
+    if (!dest || !src) return dest;
+    ::strncat(hp<char>(dest), hs(src), n);
+    return dest;
+}
+gaddr x_strtok_r(gaddr str, gaddr delim, gaddr saveptr) {
+    if (!delim || !saveptr) return 0;
+    char* s = str ? hp<char>(str) : nullptr;
+    gaddr sp_g = rd<u32>(saveptr);
+    char* sp = sp_g ? hp<char>(sp_g) : nullptr;
+    char* res = ::strtok_r(s, hs(delim), &sp);
+    wr<u32>(saveptr, sp ? g(sp) : 0);
+    return res ? g(res) : 0;
+}
+u64 x_strtoull(gaddr nptr, gaddr endptr, int base) {
+    if (!nptr) return 0;
+    char* end = nullptr;
+    unsigned long long val = ::strtoull(hs(nptr), &end, base);
+    if (endptr) wr<u32>(endptr, end ? g(end) : 0);
+    return val;
+}
+
+// System, File & Network helpers
+s32 x_dup(int oldfd) { return sysret(::dup(oldfd)); }
+s32 x_chmod(gaddr path, u32 mode) {
+    if (!path) return -1;
+    return sysret(::chmod(hs(path), (mode_t)mode));
+}
+s32 x_utime(gaddr path, gaddr) {
+    if (!path) return -1;
+    return sysret(::utime(hs(path), nullptr));
+}
+s32 x_fnmatch(gaddr pattern, gaddr string, int flags) {
+    if (!pattern || !string) return -1;
+    return ::fnmatch(hs(pattern), hs(string), flags);
+}
+s32 x_pathconf(gaddr, int) { return 4096; }
+s32 x_statfs(gaddr, gaddr buf) {
+    if (buf) memset(h(buf), 0, 64);
+    return 0;
+}
+gaddr x_getpwuid(u32 uid) {
+    static gaddr s_pw = 0;
+    if (!s_pw) {
+        s_pw = misc_alloc(64);
+        gaddr name = gstrdup("app");
+        gaddr dir = gstrdup("/data");
+        wr<u32>(s_pw + 0, name);
+        wr<u32>(s_pw + 4, name);
+        wr<u32>(s_pw + 8, uid);
+        wr<u32>(s_pw + 12, uid);
+        wr<u32>(s_pw + 16, dir);
+        wr<u32>(s_pw + 20, dir);
+    }
+    return s_pw;
+}
+u32 x_getauxval(u32 type) {
+    if (type == 6) return 4096; // AT_PAGESZ
+    if (type == 16) {
+        // AT_HWCAP: VFP, EDSP, NEON, VFPv3, VFPv3D16, TLS, VFPv4, IDIVA, IDIVT, VFPD32
+        return (1 << 6) | (1 << 7) | (1 << 12) | (1 << 13) | (1 << 14) |
+               (1 << 15) | (1 << 16) | (1 << 17) | (1 << 18) | (1 << 19);
+    }
+    if (type == 26) return 0; // AT_HWCAP2: ARMv7 has no ARMv8 crypto extensions (prevents illegal sha1/aes opcodes)
+    return 0;
+}
+u32 x_android_getCpuFamily() {
+    return 1; // ANDROID_CPU_FAMILY_ARM
+}
+u64 x_android_getCpuFeatures() {
+    return 0x000003ffull; // ARMv7, VFPv3, NEON, VFP_D32, VFP_FP16, etc.
+}
+s32 x_android_getCpuCount() {
+    return 8;
+}
+u32 x_gettid() {
+    return cur_thread().tid;
+}
+s32 x_dladdr(gaddr, gaddr info) {
+    if (info) memset(h(info), 0, 16);
+    return 0;
+}
+s32 x_system_property_get(gaddr name, gaddr value) {
+    if (!name || !value) return 0;
+#if defined(__ANDROID__)
+    return ::__system_property_get(hs(name), hp<char>(value));
+#else
+    return 0;
+#endif
+}
+s32 x_getsockname(int fd, gaddr addr, gaddr addrlen) {
+    if (!addr || !addrlen) return -1;
+    socklen_t len = rd<u32>(addrlen);
+    int r = ::getsockname(fd, hp<struct sockaddr>(addr), &len);
+    wr<u32>(addrlen, len);
+    return sysret(r);
+}
+s32 x_getsockopt(int fd, int level, int optname, gaddr optval, gaddr optlen) {
+    if (!optval || !optlen) return -1;
+    socklen_t len = rd<u32>(optlen);
+    int r = ::getsockopt(fd, level, optname, h(optval), &len);
+    wr<u32>(optlen, len);
+    return sysret(r);
+}
+gaddr x_inet_ntop(int af, gaddr src, gaddr dst, u32 size) {
+    if (!src || !dst) return 0;
+    const char* r = ::inet_ntop(af, h(src), hp<char>(dst), size);
+    return r ? dst : 0;
+}
+s32 x_inet_pton(int af, gaddr src, gaddr dst) {
+    if (!src || !dst) return -1;
+    return ::inet_pton(af, hs(src), h(dst));
+}
+s32 x_recvfrom(int fd, gaddr buf, u32 len, int flags, gaddr src_addr, gaddr addrlen) {
+    if (!buf) return -1;
+    socklen_t slen = addrlen ? rd<u32>(addrlen) : 0;
+    ssize_t r = ::recvfrom(fd, h(buf), len, flags, src_addr ? hp<struct sockaddr>(src_addr) : nullptr, addrlen ? &slen : nullptr);
+    if (addrlen) wr<u32>(addrlen, slen);
+    return (s32)sysret(r);
+}
+s32 x_sigaction(int, gaddr, gaddr oldact) {
+    // 32-bit ARM Bionic sizeof(struct sigaction) is 16 bytes:
+    // sa_handler (4) + sa_mask (4) + sa_flags (4) + sa_restorer (4).
+    // Writing 32 bytes overflows stack allocations and corrupts saved lr/r4.
+    if (oldact) memset(h(oldact), 0, 16);
+    return 0;
+}
+s32 x_sigprocmask(int, gaddr, gaddr oldset) {
+    // 32-bit ARM Bionic sizeof(sigset_t) is 4 bytes (unsigned long).
+    if (oldset) memset(h(oldset), 0, 4);
+    return 0;
+}
+void x_mono_thread_suspend_all_other_threads() {
+    NB_LOGI("mono_thread_suspend_all_other_threads called - bypassing signal suspension in JIT");
+}
+void x_mono_gc_collect(int gen) {
+    NB_LOGI("mono_gc_collect(%d) called - bypassing GC stop-the-world in JIT", gen);
+}
+
 }  // namespace
 
 void register_libc() {
@@ -1604,6 +2080,16 @@ void register_libc() {
     gaddr guard = misc_alloc(4);
     wr<u32>(guard, 0x9e3779b9u ^ u32(time(nullptr)));
     reg_data("__stack_chk_guard", guard);
+
+    gaddr page_size_addr = misc_alloc(4);
+    wr<u32>(page_size_addr, 4096);
+    reg_data("__page_size", page_size_addr);
+
+    gaddr siglist_addr = misc_alloc(32 * 4);
+    gaddr unknown_sig = gstrdup("Unknown signal");
+    for (int i = 0; i < 32; ++i) wr<u32>(siglist_addr + i * 4, unknown_sig);
+    reg_data("sys_siglist", siglist_addr);
+
     reg("__assert2", x_assert2);
     reg("abort", x_abort);
     reg("exit", x_exit);
@@ -1612,12 +2098,25 @@ void register_libc() {
     reg("__cxa_atexit", x_ret0);
     reg("__cxa_finalize", x_ret0);
     reg("__gnu_Unwind_Find_exidx", x_find_exidx);
+    reg("dl_unwind_find_exidx", x_find_exidx);
+    reg("android_get_application_target_sdk_version", [](Ctx& c) { c.ret(24); });
     reg("setjmp", x_setjmp);
     reg("longjmp", x_longjmp);
+    reg("sigsetjmp", x_setjmp);
+    reg("siglongjmp", x_longjmp);
 
+    reg("__aeabi_memclr", x_aeabi_memclr);
+    reg("__aeabi_memclr4", x_aeabi_memclr);
+    reg("__aeabi_memclr8", x_aeabi_memclr);
     reg("__aeabi_memcpy", x_aeabi_memcpy);
+    reg("__aeabi_memcpy4", x_aeabi_memcpy);
+    reg("__aeabi_memcpy8", x_aeabi_memcpy);
     reg("__aeabi_memmove", x_aeabi_memmove);
+    reg("__aeabi_memmove4", x_aeabi_memmove);
+    reg("__aeabi_memmove8", x_aeabi_memmove);
     reg("__aeabi_memset", x_aeabi_memset);
+    reg("__aeabi_memset4", x_aeabi_memset);
+    reg("__aeabi_memset8", x_aeabi_memset);
 
     reg("__aeabi_l2d", x_aeabi_l2d);
     reg("__aeabi_ul2d", x_aeabi_ul2d);
@@ -1795,14 +2294,21 @@ void register_libc() {
     NB_REG("getcwd", x_getcwd);
     NB_REG("utimes", x_utimes);
     NB_REG("stat", x_stat);
+    NB_REG("stat64", x_stat);
     NB_REG("lstat", x_lstat);
+    NB_REG("lstat64", x_lstat);
     NB_REG("fstat", x_fstat);
+    NB_REG("fstat64", x_fstat);
+    NB_REG("fstatat", x_fstatat);
+    NB_REG("fstatat64", x_fstatat);
     NB_REG("opendir", x_opendir);
     NB_REG("readdir", x_readdir);
     NB_REG("closedir", x_closedir);
     reg("fcntl", x_fcntl);
     reg("ioctl", x_ioctl);
     reg("mmap", x_mmap);
+    reg("mmap64", x_mmap);
+    reg("__mmap2", x_mmap);
     NB_REG("munmap", x_munmap);
     reg("mremap", x_mremap);
     NB_REG("msync", x_msync);
@@ -1841,11 +2347,17 @@ void register_libc() {
     NB_REG("hstrerror", x_hstrerror);
     NB_REG("__get_h_errno", x_get_h_errno);
     NB_REG("gethostbyname", x_gethostbyname);
+    NB_REG("getaddrinfo", x_getaddrinfo);
+    NB_REG("freeaddrinfo", x_freeaddrinfo);
+    NB_REG("android_getaddrinfofornet", x_android_getaddrinfofornet);
+    NB_REG("android_getaddrinfofornetcontext", x_android_getaddrinfofornetcontext);
 
     NB_REG("dlopen", x_dlopen);
     NB_REG("dlsym", x_dlsym);
     NB_REG("dlerror", x_dlerror);
     NB_REG("dlclose", x_dlclose);
+    NB_REG("dlvsym", x_dlvsym);
+    NB_REG("android_dlopen_ext", x_android_dlopen_ext);
 
     MATH1(acos);
     MATH1F(acosf);
@@ -1898,6 +2410,71 @@ void register_libc() {
     NB_REG("wcschr", x_wcschr);
     NB_REG("wcscmp", x_wcscmp);
     NB_REG("wcsncmp", x_wcsncmp);
+
+    MATH1(cbrt);
+    MATH1(erf);
+    MATH1(erfc);
+    MATH1(expm1);
+    MATH1(lgamma);
+    MATH1(log1p);
+    MATH1(logb);
+    MATH1(nearbyint);
+    MATH1(tgamma);
+    MATH1F(asinf);
+    MATH1F(coshf);
+    MATH1F(expf);
+    MATH1F(log10f);
+    MATH1F(sinhf);
+    MATH1F(tanhf);
+    NB_REG("hypot", static_cast<double (*)(double, double)>(&::hypot));
+    NB_REG("remainder", static_cast<double (*)(double, double)>(&::remainder));
+    NB_REG("nextafter", static_cast<double (*)(double, double)>(&::nextafter));
+    NB_REG("nextafterf", static_cast<float (*)(float, float)>(&::nextafterf));
+    NB_REG("ldexpf", static_cast<float (*)(float, int)>(&::ldexpf));
+    NB_REG("scalbn", static_cast<double (*)(double, int)>(&::scalbn));
+    NB_REG("scalbnl", static_cast<double (*)(double, int)>(&::scalbn));
+    NB_REG("difftime", x_difftime);
+    NB_REG("lrint", x_lrint);
+    NB_REG("llrint", x_llrint);
+    NB_REG("remquo", x_remquo);
+    NB_REG("__fpclassifyd", x_fpclassifyd);
+    NB_REG("__isfinite", x_isfinite);
+    NB_REG("__signbit", x_signbit);
+
+    NB_REG("bsearch", x_bsearch);
+    NB_REG("basename", x_basename);
+    NB_REG("memmem", x_memmem);
+    NB_REG("memrchr", x_memrchr);
+    NB_REG("strcspn", x_strcspn);
+    NB_REG("strpbrk", x_strpbrk);
+    NB_REG("strncat", x_strncat);
+    NB_REG("strtok_r", x_strtok_r);
+    NB_REG("strtoull", x_strtoull);
+
+    NB_REG("dup", x_dup);
+    NB_REG("chmod", x_chmod);
+    NB_REG("utime", x_utime);
+    NB_REG("fnmatch", x_fnmatch);
+    NB_REG("pathconf", x_pathconf);
+    NB_REG("statfs", x_statfs);
+    NB_REG("readdir_r", x_readdir_r);
+    NB_REG("getpwuid", x_getpwuid);
+    NB_REG("getauxval", x_getauxval);
+    NB_REG("android_getCpuFamily", x_android_getCpuFamily);
+    NB_REG("android_getCpuFeatures", x_android_getCpuFeatures);
+    NB_REG("android_getCpuCount", x_android_getCpuCount);
+    NB_REG("gettid", x_gettid);
+    NB_REG("dladdr", x_dladdr);
+    NB_REG("__system_property_get", x_system_property_get);
+    NB_REG("getsockname", x_getsockname);
+    NB_REG("getsockopt", x_getsockopt);
+    NB_REG("inet_ntop", x_inet_ntop);
+    NB_REG("inet_pton", x_inet_pton);
+    NB_REG("recvfrom", x_recvfrom);
+    NB_REG("sigaction", x_sigaction);
+    NB_REG("sigprocmask", x_sigprocmask);
+    NB_REG("mono_thread_suspend_all_other_threads", x_mono_thread_suspend_all_other_threads);
+    NB_REG("mono_gc_collect", x_mono_gc_collect);
 }
 
 }  // namespace nb

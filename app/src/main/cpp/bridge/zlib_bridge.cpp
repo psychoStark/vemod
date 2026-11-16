@@ -82,6 +82,7 @@ int x_inflateInit_(gaddr strm_ptr, const char* version, int stream_size) {
     s->opaque = Z_NULL;
     int ret = inflateInit_(s, version ? version : ZLIB_VERSION, sizeof(z_stream));
     sync_to_guest(s, strm_ptr);
+    NB_LOGI("zlib_bridge x_inflateInit_: strm=%#x ret=%d", strm_ptr, ret);
     return ret;
 }
 
@@ -94,17 +95,23 @@ int x_inflateInit2_(gaddr strm_ptr, int windowBits, const char* version, int str
     s->opaque = Z_NULL;
     int ret = inflateInit2_(s, windowBits, version ? version : ZLIB_VERSION, sizeof(z_stream));
     sync_to_guest(s, strm_ptr);
+    NB_LOGI("zlib_bridge x_inflateInit2_: strm=%#x wbits=%d ret=%d", strm_ptr, windowBits, ret);
     return ret;
 }
 
 int x_inflate(gaddr strm_ptr, int flush) {
     std::lock_guard lk(g_zlib_mu);
     auto it = g_zstreams.find(strm_ptr);
-    if (it == g_zstreams.end()) return Z_STREAM_ERROR;
+    if (it == g_zstreams.end()) {
+        NB_LOGW("zlib_bridge x_inflate: unknown strm=%#x", strm_ptr);
+        return Z_STREAM_ERROR;
+    }
     z_stream* s = it->second;
     sync_to_host(strm_ptr, s);
     int ret = inflate(s, flush);
     sync_to_guest(s, strm_ptr);
+    NB_LOGI("zlib_bridge x_inflate: strm=%#x in=%u out=%u ret=%d msg=%s",
+            strm_ptr, s->avail_in, s->avail_out, ret, s->msg ? s->msg : "none");
     return ret;
 }
 

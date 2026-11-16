@@ -2,10 +2,15 @@ package com.vemod.container.container
 
 import android.content.Context
 import android.content.pm.PackageManager
+import android.content.res.AssetManager
+import android.content.res.Resources
 import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.graphics.Canvas
 import android.graphics.drawable.BitmapDrawable
+import android.graphics.drawable.Drawable
 import android.net.Uri
+import android.util.DisplayMetrics
 import android.util.Log
 import com.vemod.container.model.ContainerApp
 import org.json.JSONArray
@@ -40,11 +45,43 @@ object ApkExtractor {
             PackageManager.GET_ACTIVITIES
         ) ?: error("Failed to parse APK archive: ${apkFile.absolutePath}")
 
-        val packageName = pkgInfo.packageName
-        val launchActivityInfo = pkgInfo.activities?.firstOrNull()
-        val launchActivity = launchActivityInfo?.name
-            ?: error("No launch activity found in APK: $packageName")
-        val screenOrientation = launchActivityInfo.screenOrientation
+        val manifestInfo = getManifestInfo(apkFile)
+        val packageName = if (manifestInfo.packageName.isNotEmpty()) manifestInfo.packageName else pkgInfo.packageName
+        val activities = pkgInfo.activities
+        val manifestLauncher = manifestInfo.launcherActivity
+        var launchActivityInfo = if (manifestLauncher != null) {
+            activities?.find { it.name == manifestLauncher }
+        } else null
+
+        if (launchActivityInfo == null) {
+            launchActivityInfo = activities?.find { it.name.contains("MainActivity") }
+                ?: activities?.firstOrNull()
+        }
+
+        // If UnityPlayerActivity is present in the APK, prefer it over UnityPlayerProxyActivity or UnityPlayerNativeActivity
+        val unityPlayerActivity = activities?.find { it.name == "com.unity3d.player.UnityPlayerActivity" }
+            ?: if (manifestInfo.activities.containsKey("com.unity3d.player.UnityPlayerActivity")) {
+                activities?.firstOrNull()
+            } else null
+        if (unityPlayerActivity != null &&
+            (launchActivityInfo?.name?.endsWith("UnityPlayerProxyActivity") == true ||
+             launchActivityInfo?.name?.endsWith("UnityPlayerNativeActivity") == true ||
+             manifestLauncher?.endsWith("UnityPlayerProxyActivity") == true ||
+             manifestLauncher?.endsWith("UnityPlayerNativeActivity") == true)) {
+            Log.i(TAG, "extractFromFile: preferring UnityPlayerActivity over ${launchActivityInfo?.name ?: manifestLauncher}")
+            launchActivityInfo = unityPlayerActivity
+        }
+        val launchActivity = if (unityPlayerActivity != null &&
+            (manifestLauncher?.endsWith("UnityPlayerProxyActivity") == true ||
+             manifestLauncher?.endsWith("UnityPlayerNativeActivity") == true)) {
+            "com.unity3d.player.UnityPlayerActivity"
+        } else {
+            launchActivityInfo?.name ?: manifestLauncher
+                ?: error("No launch activity found in APK: $packageName")
+        }
+        val screenOrientation = launchActivityInfo?.screenOrientation
+            ?: manifestInfo.activities[launchActivity]?.screenOrientation
+            ?: android.content.pm.ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
 
         val appInfo = pkgInfo.applicationInfo
         val appName = try {
@@ -86,25 +123,70 @@ object ApkExtractor {
         // Extract high-resolution app icon
         val iconFile = File(containerDir, "icon.png")
         try {
-            if (appInfo != null) {
+            var iconDrawable: Drawable? = null
+            // Method 1: Load via AssetManager with baseApk asset path
+            try {
+                val am = AssetManager::class.java.newInstance()
+                val addAssetPath = AssetManager::class.java.getMethod("addAssetPath", String::class.java)
+                addAssetPath.invoke(am, baseApk.absolutePath)
+                val res = Resources(am, context.resources.displayMetrics, context.resources.configuration)
+                if (appInfo != null && appInfo.icon != 0) {
+                    iconDrawable = res.getDrawableForDensity(appInfo.icon, DisplayMetrics.DENSITY_XXXHIGH, null)
+                        ?: res.getDrawable(appInfo.icon, null)
+                }
+            } catch (e: Throwable) {
+                Log.w(TAG, "AssetManager icon extraction fallback", e)
+            }
+
+            // Method 2: Fallback to appInfo.loadIcon(pm)
+            if (iconDrawable == null && appInfo != null) {
                 appInfo.sourceDir = baseApk.absolutePath
                 appInfo.publicSourceDir = baseApk.absolutePath
-                val drawable = appInfo.loadIcon(pm)
-                if (drawable != null) {
-                    val bitmap = if (drawable is BitmapDrawable && drawable.bitmap != null) {
-                        drawable.bitmap
-                    } else {
-                        val w = if (drawable.intrinsicWidth > 0) drawable.intrinsicWidth else 192
-                        val h = if (drawable.intrinsicHeight > 0) drawable.intrinsicHeight else 192
-                        val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
-                        val canvas = Canvas(bmp)
-                        drawable.setBounds(0, 0, canvas.width, canvas.height)
-                        drawable.draw(canvas)
-                        bmp
+                iconDrawable = appInfo.loadIcon(pm)
+            }
+
+            // Method 3: Fallback by searching common icon entries directly in APK zip
+            if (iconDrawable == null) {
+                ZipFile(baseApk).use { zf ->
+                    val candidates = listOf(
+                        "res/drawable-xxxhdpi/ic_launcher.png",
+                        "res/drawable-xxhdpi/ic_launcher.png",
+                        "res/drawable-xhdpi/ic_launcher.png",
+                        "res/drawable-hdpi/ic_launcher.png",
+                        "res/drawable/ic_launcher.png",
+                        "res/drawable-xxxhdpi-v4/icon.png",
+                        "res/drawable-xxhdpi-v4/icon.png",
+                        "res/drawable-xhdpi-v4/icon.png",
+                        "res/drawable-hdpi-v4/icon.png",
+                        "res/drawable/icon.png"
+                    )
+                    for (c in candidates) {
+                        val entry = zf.getEntry(c)
+                        if (entry != null) {
+                            val bmp = BitmapFactory.decodeStream(zf.getInputStream(entry))
+                            if (bmp != null) {
+                                iconDrawable = BitmapDrawable(context.resources, bmp)
+                                break
+                            }
+                        }
                     }
-                    FileOutputStream(iconFile).use { fos ->
-                        bitmap.compress(Bitmap.CompressFormat.PNG, 100, fos)
-                    }
+                }
+            }
+
+            if (iconDrawable != null) {
+                val bitmap = if (iconDrawable is BitmapDrawable && iconDrawable.bitmap != null) {
+                    iconDrawable.bitmap
+                } else {
+                    val w = if (iconDrawable.intrinsicWidth > 0) iconDrawable.intrinsicWidth else 192
+                    val h = if (iconDrawable.intrinsicHeight > 0) iconDrawable.intrinsicHeight else 192
+                    val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+                    val canvas = Canvas(bmp)
+                    iconDrawable.setBounds(0, 0, canvas.width, canvas.height)
+                    iconDrawable.draw(canvas)
+                    bmp
+                }
+                FileOutputStream(iconFile).use { fos ->
+                    bitmap.compress(Bitmap.CompressFormat.PNG, 100, fos)
                 }
             }
         } catch (e: Throwable) {
@@ -180,7 +262,8 @@ object ApkExtractor {
             iconFile = if (iconFile.exists()) iconFile else null,
             nativeLibraries = extractedLibs,
             installedAt = System.currentTimeMillis(),
-            screenOrientation = screenOrientation
+            screenOrientation = screenOrientation,
+            applicationClass = manifestInfo.applicationClass
         )
 
         // Save metadata JSON
@@ -201,6 +284,8 @@ object ApkExtractor {
                 put("installedAt", app.installedAt)
                 put("nativeLibraries", JSONArray(app.nativeLibraries))
                 put("screenOrientation", app.screenOrientation)
+                put("isDataExposed", app.isDataExposed)
+                put("applicationClass", app.applicationClass ?: "")
             }
             File(containerDir, "meta.json").writeText(json.toString(2))
         } catch (e: Throwable) {
@@ -234,18 +319,36 @@ object ApkExtractor {
                     json.getInt("screenOrientation")
                 } else {
                     try {
-                        val pm = com.vemod.container.VemodApp.instance?.packageManager
-                        val archiveInfo = pm?.getPackageArchiveInfo(baseApk.absolutePath, PackageManager.GET_ACTIVITIES)
-                        archiveInfo?.activities?.firstOrNull()?.screenOrientation ?: android.content.pm.ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+                        val manifestInfo = getManifestInfo(baseApk)
+                        manifestInfo.activities.values.firstOrNull()?.screenOrientation
+                            ?: android.content.pm.ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
                     } catch (_: Throwable) {
                         android.content.pm.ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
                     }
                 }
 
+                var launchActivity = json.getString("launchActivity")
+                if (launchActivity.endsWith("UnityPlayerProxyActivity") ||
+                    launchActivity.endsWith("UnityPlayerNativeActivity")) {
+                    try {
+                        val manifestInfo = getManifestInfo(baseApk)
+                        if (manifestInfo.activities.containsKey("com.unity3d.player.UnityPlayerActivity")) {
+                            Log.i(TAG, "readMetadata: auto-aliasing legacy launchActivity $launchActivity -> com.unity3d.player.UnityPlayerActivity")
+                            launchActivity = "com.unity3d.player.UnityPlayerActivity"
+                        }
+                    } catch (_: Throwable) {}
+                }
+
+                val appClass = if (json.has("applicationClass") && json.optString("applicationClass").isNotEmpty()) {
+                    json.getString("applicationClass")
+                } else {
+                    getManifestInfo(baseApk).applicationClass
+                }
+
                 return ContainerApp(
                     packageName = json.getString("packageName"),
                     appName = json.optString("appName", json.getString("packageName")),
-                    launchActivity = json.getString("launchActivity"),
+                    launchActivity = launchActivity,
                     versionName = json.optString("versionName", "1.0"),
                     versionCode = json.optLong("versionCode", 1L),
                     containerDir = containerDir,
@@ -256,7 +359,9 @@ object ApkExtractor {
                     nativeLibraries = nativeLibs,
                     slotIndex = json.optInt("slotIndex", -1),
                     installedAt = json.optLong("installedAt", System.currentTimeMillis()),
-                    screenOrientation = screenOrientation
+                    screenOrientation = screenOrientation,
+                    isDataExposed = json.optBoolean("isDataExposed", false),
+                    applicationClass = appClass
                 )
             } catch (e: Throwable) {
                 Log.w(TAG, "Failed to parse meta.json in ${containerDir.name}", e)
@@ -265,5 +370,333 @@ object ApkExtractor {
 
         // Fallback: derive from base.apk
         return null
+    }
+
+    data class ActivityMeta(
+        val name: String,
+        val screenOrientation: Int = android.content.pm.ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED,
+        val theme: Int = 0
+    )
+
+    data class ComponentMeta(
+        val name: String,
+        val processName: String? = null,
+        val authority: String? = null,
+        val exported: Boolean = false
+    )
+
+    data class ApkManifestInfo(
+        val packageName: String,
+        val versionName: String? = "1.0",
+        val versionCode: Int? = 1,
+        val applicationClass: String? = null,
+        val applicationTheme: Int = 0,
+        val targetSdkVersion: Int = 28,
+        val launcherActivity: String? = null,
+        val activities: Map<String, ActivityMeta> = emptyMap(),
+        val providers: List<ComponentMeta> = emptyList(),
+        val services: List<ComponentMeta> = emptyList(),
+        val receivers: List<ComponentMeta> = emptyList(),
+        val metaData: android.os.Bundle = android.os.Bundle()
+    )
+
+    private val manifestCache = java.util.concurrent.ConcurrentHashMap<String, ApkManifestInfo>()
+
+    fun getManifestInfo(apkFile: File): ApkManifestInfo {
+        val cacheKey = "${apkFile.absolutePath}:${apkFile.lastModified()}"
+        return manifestCache.getOrPut(cacheKey) {
+            parseManifest(apkFile)
+        }
+    }
+
+    fun parseManifest(apkFile: File): ApkManifestInfo {
+        var pkg = ""
+        var verName: String? = "1.0"
+        var verCode: Int? = 1
+        var appClass: String? = null
+        var appTheme = 0
+        var targetSdk = 28
+        var launcherActivity: String? = null
+        val activities = mutableMapOf<String, ActivityMeta>()
+        val providers = mutableListOf<ComponentMeta>()
+        val services = mutableListOf<ComponentMeta>()
+        val receivers = mutableListOf<ComponentMeta>()
+        val metaData = android.os.Bundle()
+
+        try {
+            val assetManagerClass = Class.forName("android.content.res.AssetManager")
+            val assetManager = assetManagerClass.newInstance() as android.content.res.AssetManager
+            val addAssetPath = assetManagerClass.getMethod("addAssetPath", String::class.java)
+            val cookie = addAssetPath.invoke(assetManager, apkFile.absolutePath) as Int
+            if (cookie != 0) {
+                val res = Resources(assetManager, DisplayMetrics().apply { setToDefaults() }, null)
+                val parser = assetManager.openXmlResourceParser(cookie, "AndroidManifest.xml")
+                var eventType = parser.eventType
+                var curActivityName: String? = null
+                var curOrientation = android.content.pm.ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+                var curTheme = 0
+                var hasMain = false
+                var hasLauncher = false
+
+                while (eventType != org.xmlpull.v1.XmlPullParser.END_DOCUMENT) {
+                    if (eventType == org.xmlpull.v1.XmlPullParser.START_TAG) {
+                        when (parser.name) {
+                            "manifest" -> {
+                                for (i in 0 until parser.attributeCount) {
+                                    val attrName = parser.getAttributeName(i)
+                                    if (attrName == "package") {
+                                        pkg = parser.getAttributeValue(i)
+                                    } else if (attrName == "versionName") {
+                                        verName = parser.getAttributeValue(i)
+                                    } else if (attrName == "versionCode") {
+                                        verCode = parser.getAttributeIntValue(i, 1)
+                                    }
+                                }
+                            }
+                            "uses-sdk" -> {
+                                for (i in 0 until parser.attributeCount) {
+                                    if (parser.getAttributeName(i) == "targetSdkVersion") {
+                                        val v = parser.getAttributeIntValue(i, 28)
+                                        if (v > 0) targetSdk = v
+                                    }
+                                }
+                            }
+                            "application" -> {
+                                for (i in 0 until parser.attributeCount) {
+                                    val attrName = parser.getAttributeName(i)
+                                    if (attrName == "name") {
+                                        appClass = parser.getAttributeValue(i)
+                                    } else if (attrName == "theme") {
+                                        appTheme = parser.getAttributeResourceValue(i, 0)
+                                    }
+                                }
+                            }
+                            "activity" -> {
+                                curActivityName = null
+                                curOrientation = android.content.pm.ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+                                curTheme = 0
+                                hasMain = false
+                                hasLauncher = false
+                                for (i in 0 until parser.attributeCount) {
+                                    val attrName = parser.getAttributeName(i)
+                                    if (attrName == "name") {
+                                        curActivityName = parser.getAttributeValue(i)
+                                    } else if (attrName == "screenOrientation") {
+                                        curOrientation = parser.getAttributeIntValue(i, android.content.pm.ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED)
+                                    } else if (attrName == "theme") {
+                                        curTheme = parser.getAttributeResourceValue(i, 0)
+                                    }
+                                }
+                            }
+                            "provider" -> {
+                                var pName: String? = null
+                                var pAuth: String? = null
+                                var pProc: String? = null
+                                var pExp = false
+                                for (i in 0 until parser.attributeCount) {
+                                    val attrName = parser.getAttributeName(i)
+                                    if (attrName == "name") {
+                                        pName = parser.getAttributeValue(i)
+                                    } else if (attrName == "authorities") {
+                                        pAuth = parser.getAttributeValue(i)
+                                    } else if (attrName == "process") {
+                                        pProc = parser.getAttributeValue(i)
+                                    } else if (attrName == "exported") {
+                                        pExp = parser.getAttributeBooleanValue(i, false)
+                                    }
+                                }
+                                if (pName != null) {
+                                    val full = if (pName.startsWith(".")) pkg + pName
+                                        else if (!pName.contains(".")) "$pkg.$pName"
+                                        else pName
+                                    providers.add(ComponentMeta(full, pProc, pAuth, pExp))
+                                }
+                            }
+                            "service" -> {
+                                var sName: String? = null
+                                var sProc: String? = null
+                                for (i in 0 until parser.attributeCount) {
+                                    val attrName = parser.getAttributeName(i)
+                                    if (attrName == "name") {
+                                        sName = parser.getAttributeValue(i)
+                                    } else if (attrName == "process") {
+                                        sProc = parser.getAttributeValue(i)
+                                    }
+                                }
+                                if (sName != null) {
+                                    val full = if (sName.startsWith(".")) pkg + sName
+                                        else if (!sName.contains(".")) "$pkg.$sName"
+                                        else sName
+                                    services.add(ComponentMeta(full, sProc))
+                                }
+                            }
+                            "receiver" -> {
+                                var rName: String? = null
+                                var rProc: String? = null
+                                for (i in 0 until parser.attributeCount) {
+                                    val attrName = parser.getAttributeName(i)
+                                    if (attrName == "name") {
+                                        rName = parser.getAttributeValue(i)
+                                    } else if (attrName == "process") {
+                                        rProc = parser.getAttributeValue(i)
+                                    }
+                                }
+                                if (rName != null) {
+                                    val full = if (rName.startsWith(".")) pkg + rName
+                                        else if (!rName.contains(".")) "$pkg.$rName"
+                                        else rName
+                                    receivers.add(ComponentMeta(full, rProc))
+                                }
+                            }
+                            "action" -> {
+                                for (i in 0 until parser.attributeCount) {
+                                    if (parser.getAttributeName(i) == "name" &&
+                                        parser.getAttributeValue(i) == "android.intent.action.MAIN") {
+                                        hasMain = true
+                                    }
+                                }
+                            }
+                            "category" -> {
+                                for (i in 0 until parser.attributeCount) {
+                                    val attrVal = parser.getAttributeValue(i)
+                                    if (parser.getAttributeName(i) == "name" &&
+                                        (attrVal == "android.intent.category.LAUNCHER" ||
+                                         attrVal == "android.intent.category.INFO" ||
+                                         attrVal == "android.intent.category.LEANBACK_LAUNCHER")) {
+                                        hasLauncher = true
+                                    }
+                                }
+                            }
+                            "meta-data" -> {
+                                var mdName: String? = null
+                                var mdVal: String? = null
+                                var mdRes = 0
+                                for (i in 0 until parser.attributeCount) {
+                                    val attrName = parser.getAttributeName(i)
+                                    if (attrName == "name") {
+                                        mdName = parser.getAttributeValue(i)
+                                    } else if (attrName == "value") {
+                                        mdVal = parser.getAttributeValue(i)
+                                    } else if (attrName == "resource") {
+                                        mdRes = parser.getAttributeResourceValue(i, 0)
+                                    }
+                                }
+                                if (!mdName.isNullOrEmpty()) {
+                                    var resolved = false
+                                    if (mdRes != 0) {
+                                        try {
+                                            val intVal = res.getInteger(mdRes)
+                                            metaData.putInt(mdName, intVal)
+                                            resolved = true
+                                        } catch (_: Throwable) {}
+                                        if (!resolved) {
+                                            try {
+                                                val strVal = res.getString(mdRes)
+                                                val intVal = strVal.toIntOrNull()
+                                                if (intVal != null) metaData.putInt(mdName, intVal)
+                                                else metaData.putString(mdName, strVal)
+                                                resolved = true
+                                            } catch (_: Throwable) {}
+                                        }
+                                        if (!resolved) {
+                                            metaData.putInt(mdName, mdRes)
+                                        }
+                                    } else if (mdVal != null) {
+                                        if (mdVal.startsWith("@")) {
+                                            val resId = mdVal.substring(1).toIntOrNull()
+                                            if (resId != null) {
+                                                try {
+                                                    val intVal = res.getInteger(resId)
+                                                    metaData.putInt(mdName, intVal)
+                                                    resolved = true
+                                                } catch (_: Throwable) {}
+                                                if (!resolved) {
+                                                    try {
+                                                        val strVal = res.getString(resId)
+                                                        val intVal = strVal.toIntOrNull()
+                                                        if (intVal != null) metaData.putInt(mdName, intVal)
+                                                        else metaData.putString(mdName, strVal)
+                                                        resolved = true
+                                                    } catch (_: Throwable) {}
+                                                }
+                                                if (!resolved) {
+                                                    metaData.putInt(mdName, resId)
+                                                }
+                                            } else {
+                                                metaData.putString(mdName, mdVal)
+                                            }
+                                        } else if (mdVal == "true" || mdVal == "false") {
+                                            metaData.putBoolean(mdName, mdVal.toBoolean())
+                                        } else {
+                                            val intVal = mdVal.toIntOrNull()
+                                            if (intVal != null) {
+                                                metaData.putInt(mdName, intVal)
+                                            } else {
+                                                val floatVal = mdVal.toFloatOrNull()
+                                                if (floatVal != null && mdVal.contains(".")) {
+                                                    metaData.putFloat(mdName, floatVal)
+                                                } else {
+                                                    metaData.putString(mdName, mdVal)
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    } else if (eventType == org.xmlpull.v1.XmlPullParser.END_TAG) {
+                        if (parser.name == "activity") {
+                            if (curActivityName != null) {
+                                val full = if (curActivityName.startsWith(".")) {
+                                    pkg + curActivityName
+                                } else if (!curActivityName.contains(".")) {
+                                    "$pkg.$curActivityName"
+                                } else {
+                                    curActivityName
+                                }
+                                activities[full] = ActivityMeta(full, curOrientation, curTheme)
+                                if (hasMain && hasLauncher && launcherActivity == null) {
+                                    launcherActivity = full
+                                }
+                            }
+                            curActivityName = null
+                        }
+                    }
+                    eventType = parser.next()
+                }
+                parser.close()
+            }
+        } catch (e: Throwable) {
+            Log.w(TAG, "Failed to parse AndroidManifest.xml from ${apkFile.name}", e)
+        }
+
+        val fullAppClass = if (appClass != null) {
+            if (appClass.startsWith(".")) pkg + appClass
+            else if (!appClass.contains(".")) "$pkg.$appClass"
+            else appClass
+        } else null
+
+        return ApkManifestInfo(
+            packageName = pkg,
+            versionName = verName,
+            versionCode = verCode,
+            applicationClass = fullAppClass,
+            applicationTheme = appTheme,
+            targetSdkVersion = targetSdk,
+            launcherActivity = launcherActivity,
+            activities = activities,
+            providers = providers,
+            services = services,
+            receivers = receivers,
+            metaData = metaData
+        )
+    }
+
+    fun findLauncherActivity(apkFile: File, packageName: String): String? {
+        return getManifestInfo(apkFile).launcherActivity
+    }
+
+    fun findApplicationClass(apkFile: File, packageName: String): String? {
+        return getManifestInfo(apkFile).applicationClass
     }
 }

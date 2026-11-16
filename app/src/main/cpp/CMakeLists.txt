@@ -33,6 +33,7 @@ add_library(bridge SHARED
     bridge/libc.cpp
     bridge/loader.cpp
     bridge/memory.cpp
+    bridge/opensles_bridge.cpp
     bridge/pthread.cpp
     bridge/stdio.cpp
     bridge/warmup.cpp
@@ -57,7 +58,7 @@ target_compile_options(bridge PRIVATE
 
 if(ANDROID)
     target_compile_definitions(bridge PRIVATE NB_ANDROID_RUNTIME=1)
-    target_link_libraries(bridge PRIVATE GLESv2 android log z)
+    target_link_libraries(bridge PRIVATE EGL GLESv1_CM GLESv2 android log z OpenSLES)
     target_link_options(bridge PRIVATE "-Wl,-z,max-page-size=16384" "-Wl,--exclude-libs,ALL")
 else()
     find_package(JNI REQUIRED)

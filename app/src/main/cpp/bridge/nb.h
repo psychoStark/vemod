@@ -17,6 +17,8 @@
 #include <type_traits>
 #include <vector>
 #include <unordered_map>
+#include <sys/stat.h>
+#include <jni.h>
 
 namespace nb {
 
@@ -32,7 +34,18 @@ using gaddr = uint32_t;  // a pointer in guest address space
 
 // ---------------------------------------------------------------- logging
 
+enum LogLevel {
+    LOG_LEVEL_NONE = 0,
+    LOG_LEVEL_BASIC = 1,
+    LOG_LEVEL_ADVANCED = 2,
+    LOG_LEVEL_FULL = 3
+};
+
 enum { LOG_DEBUG = 3, LOG_INFO = 4, LOG_WARN = 5, LOG_ERROR = 6 };
+
+int get_log_level();
+void set_log_level(int level);
+
 void logf(int prio, const char* fmt, ...) __attribute__((format(printf, 2, 3)));
 [[noreturn]] void fatal(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
 void log_write(int prio, const char* tag, const char* msg);
@@ -47,8 +60,8 @@ constexpr gaddr kMiscBase = 0x00100000;  // stubs, import data, JNI tables
 constexpr u32 kMiscSize = 0x00400000;
 constexpr gaddr kLibBase = 0x01000000;  // the guest .so
 constexpr gaddr kHeapBase = 0x08000000;  // dlmalloc sbrk arena
-constexpr gaddr kHeapEnd = 0x90000000;
-constexpr gaddr kMapBase = 0x90000000;  // mmap(), thread stacks, TLS blocks
+constexpr gaddr kHeapEnd = 0x40000000;
+constexpr gaddr kMapBase = 0x40000000;  // mmap(), thread stacks, TLS blocks, LIBBASE (0x80000000)
 constexpr gaddr kMapEnd = 0xfe000000;
 constexpr gaddr kKuserPage = 0xffff0000;  // ARM Linux kernel user helpers
 }  // namespace layout
@@ -213,6 +226,9 @@ struct GuestThread {
     gaddr stack_base = 0;
     u32 stack_size = 0;
     gaddr tls = 0;  // per-thread guest block (errno, static result buffers)
+    gaddr clear_child_tid = 0;
+    bool own_tls = true;
+    bool own_stack = true;
     std::vector<std::unique_ptr<Cpu>> cpus;
     int depth = -1;
     std::vector<gaddr> specific;  // pthread_getspecific values
@@ -230,19 +246,46 @@ void release_current_guest_thread();  // hand this thread's guest state (warm JI
 void warmup_precompile();       // precompile blocks recorded by a previous run
 void warmup_note_frame();       // called per frame; saves the profile now and then
 
-// Offsets inside GuestThread::tls
+// Offsets inside GuestThread::tls matching Android Bionic ARM layout
 namespace tlsoff {
-constexpr u32 kErrno = 0;
-constexpr u32 kStrerror = 0x10;   // 256
-constexpr u32 kTm = 0x110;        // 64
-constexpr u32 kNtoa = 0x150;      // 32
-constexpr u32 kHostent = 0x200;   // 1536
-constexpr u32 kH_errno = 0x800;   // 4
-constexpr u32 kMisc = 0x900;      // 1024
+constexpr u32 kSlotSelf = 0 * 4;       // 0x00: TLS_SLOT_SELF
+constexpr u32 kSlotThreadId = 1 * 4;   // 0x04: TLS_SLOT_THREAD_ID (pthread_internal_t*)
+constexpr u32 kSlotErrno = 2 * 4;      // 0x08: TLS_SLOT_ERRNO
+constexpr u32 kSlotOpenGLApi = 3 * 4;  // 0x0c: TLS_SLOT_OPENGL_API (or temp KernelArgumentBlock)
+constexpr u32 kSlotOpenGL = 4 * 4;     // 0x10: TLS_SLOT_OPENGL
+constexpr u32 kSlotStackGuard = 5 * 4; // 0x14: TLS_SLOT_STACK_GUARD
+constexpr u32 kSlotSanitizer = 6 * 4;  // 0x18
+constexpr u32 kSlotArt = 7 * 4;        // 0x1c
+constexpr u32 kBionicSlots = 8 * 4;    // 0x20
+constexpr u32 kErrno = 0x08;           // matches TLS_SLOT_ERRNO
+constexpr u32 kStrerror = 0x20;        // 256
+constexpr u32 kTm = 0x120;             // 64
+constexpr u32 kNtoa = 0x160;           // 32
+constexpr u32 kH_errno = 0x180;        // 4
+constexpr u32 kHostent = 0x200;        // 512
+constexpr u32 kPthreadInternal = 0x400;// 1024 bytes reserved for pthread_internal_t
+constexpr u32 kMisc = 0x900;           // 1024
 constexpr u32 kSize = 0x1000;
 }  // namespace tlsoff
 
 void set_guest_errno(int e);
+gaddr guest_brk();
+gaddr mem_brk(gaddr new_brk);
+void stat_to_guest(gaddr a, const struct stat& s);
+void set_sysroot_dir(const char* dir);
+const std::string& get_sysroot_dir();
+const std::string& get_guest_lib_dir();
+void preload_sysroot(const char* dir);
+bool is_sysroot_loaded();
+
+constexpr int kAlarmFd = 0x7fff0001;
+int oflags_from_guest(int f);
+int oflags_to_guest(int f);
+int x_close(int fd);
+s32 x_read(int fd, void* buf, u32 n);
+s32 x_write(int fd, const void* buf, u32 n);
+s32 x_lseek(int fd, s32 off, int whence);
+int x_munmap(u32 a, u32 len);
 
 // Virtual file descriptors: in-memory files with fd numbers the kernel never handed out.
 constexpr int kVfdBase = 32000, kVfdCount = 256;
@@ -253,12 +296,8 @@ s64 vfd_lseek(int fd, s64 off, int whence);
 u32 vfd_size(int fd);
 int vfd_close(int fd);
 
-// Headless test builds substitute host-dependent files (e.g. /proc/self/stat) with fixed ones.
-#ifdef NB_HEADLESS
+// Path substitution for host-dependent files (e.g. /proc/cpuinfo, /proc/self/stat).
 const char* headless_path(const char* p);
-#else
-inline const char* headless_path(const char* p) { return p; }
-#endif
 inline void errno_from_host() { set_guest_errno(errno); }
 
 // ---------------------------------------------------------------- loaded image & modules
@@ -269,6 +308,7 @@ gaddr guest_sym(const char* name);
 gaddr guest_last_jni_onload();
 gaddr resolve_import(const char* name);
 u32 guest_image_id();
+const char* guest_main_lib_name();
 bool guest_is_code(gaddr pc);  // exported symbol of the guest library (0 if missing)
 std::string symbolize(gaddr pc);
 void guest_exidx(gaddr pc, gaddr* start, u32* count);
@@ -353,7 +393,14 @@ void register_pthread();
 void register_gles();
 void register_zlib();
 bool gles_take_frame_changed();  // did the frame just rendered differ from the previous one?
+u32 to_guest_egl(void* host_ptr);
+void* to_host_egl(u32 guest_h);
+void start_host_input_pump(void* queue);
+void stop_host_input_pump();
 void register_android();
+void register_opensles();
+void init_opensles_iids();
 void register_jni();
+void set_guest_class_loader(jobject loader);
 
 }  // namespace nb

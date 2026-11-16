@@ -20,7 +20,7 @@ namespace Dynarmic::Backend::Arm64 {
 using namespace oaknut::util;
 
 static void EmitCoprocessorException() {
-    ASSERT_FALSE("Should raise coproc exception here");
+    // Non-aborting: gracefully ignore unhandled coprocessor instructions
 }
 
 static void CallCoprocCallback(oaknut::CodeGenerator& code, EmitContext& ctx, A32::Coprocessor::Callback callback, IR::Inst* inst = nullptr, std::optional<Argument::copyable_reference> arg0 = {}, std::optional<Argument::copyable_reference> arg1 = {}) {
@@ -163,14 +163,18 @@ void EmitIR<IR::Opcode::A32CoprocGetOneWord>(oaknut::CodeGenerator& code, EmitCo
 
     std::shared_ptr<A32::Coprocessor> coproc = ctx.conf.coprocessors[coproc_num];
     if (!coproc) {
-        EmitCoprocessorException();
+        auto Wvalue = ctx.reg_alloc.WriteW(inst);
+        RegAlloc::Realize(Wvalue);
+        code.MOV(Wvalue, 0);
         return;
     }
 
     const auto action = coproc->CompileGetOneWord(two, opc1, CRn, CRm, opc2);
 
     if (std::holds_alternative<std::monostate>(action)) {
-        EmitCoprocessorException();
+        auto Wvalue = ctx.reg_alloc.WriteW(inst);
+        RegAlloc::Realize(Wvalue);
+        code.MOV(Wvalue, 0);
         return;
     }
 
@@ -202,14 +206,18 @@ void EmitIR<IR::Opcode::A32CoprocGetTwoWords>(oaknut::CodeGenerator& code, EmitC
 
     std::shared_ptr<A32::Coprocessor> coproc = ctx.conf.coprocessors[coproc_num];
     if (!coproc) {
-        EmitCoprocessorException();
+        auto Xvalue = ctx.reg_alloc.WriteX(inst);
+        RegAlloc::Realize(Xvalue);
+        code.MOV(Xvalue, 0);
         return;
     }
 
     auto action = coproc->CompileGetTwoWords(two, opc, CRm);
 
     if (std::holds_alternative<std::monostate>(action)) {
-        EmitCoprocessorException();
+        auto Xvalue = ctx.reg_alloc.WriteX(inst);
+        RegAlloc::Realize(Xvalue);
+        code.MOV(Xvalue, 0);
         return;
     }
 

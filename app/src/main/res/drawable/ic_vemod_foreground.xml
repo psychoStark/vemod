@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <group
+        android:scaleX="0.038"
+        android:scaleY="0.038"
+        android:translateX="17.5"
+        android:translateY="17.5">
+
+        <!-- Android Robot Head -->
+        <path
+            android:fillColor="#4125C8"
+            android:pathData="M1106.653,324.594l49.841,-86.339c2.813,-4.84 1.112,-10.989 -3.663,-13.801c-4.775,-2.813 -10.989,-1.177 -13.736,3.663l-50.495,87.451c-38.526,-17.595 -81.891,-27.406 -128.527,-27.406c-46.636,0 -90.002,9.811 -128.527,27.406l-50.495,-87.451c-2.813,-4.84 -8.961,-6.475 -13.801,-3.663c-4.84,2.813 -6.475,8.961 -3.663,13.801l49.841,86.339c-85.946,46.571 -144.16,133.564 -153.775,235.403l600.841,-0c-9.615,-101.841 -67.828,-188.834 -153.84,-235.403l-0.001,0Z" />
+
+        <!-- Outer Deep V-Triangle -->
+        <path
+            android:fillColor="#1F184B"
+            android:pathData="M283.028,628.769l1353.944,3l-676.956,1066.1l-676.988,-1069.1Z" />
+
+        <!-- Inner Bright V-Triangle -->
+        <path
+            android:fillColor="#4C40D4"
+            android:pathData="M659.38,594.45l601.241,1.332l-300.613,473.419l-300.627,-474.751Z" />
+    </group>
+</vector>
