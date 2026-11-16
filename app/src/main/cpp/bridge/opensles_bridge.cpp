@@ -318,47 +318,83 @@ void sl_Engine_CreateAudioPlayer(Ctx& c) {
     u32 samplesPerSec = 44100000;
     u32 bitsPerSample = 16;
 
-    if (pAudioSrc) {
+    if (pAudioSrc && is_mapped(pAudioSrc)) {
         gaddr pFormat = rd<u32>(pAudioSrc + 4);
-        if (pFormat) {
-            numChannels = rd<u32>(pFormat + 4);
-            samplesPerSec = rd<u32>(pFormat + 8);
-            bitsPerSample = rd<u32>(pFormat + 12);
+        if (pFormat && is_mapped(pFormat)) {
+            u32 formatType = rd<u32>(pFormat);
+            if (formatType == SL_DATAFORMAT_PCM /* 2 */) {
+                numChannels = rd<u32>(pFormat + 4);
+                samplesPerSec = rd<u32>(pFormat + 8);
+                bitsPerSample = rd<u32>(pFormat + 12);
+            }
         }
     }
-    if (numChannels == 0) numChannels = 2;
+    if (numChannels == 0 || numChannels > 8) numChannels = 2;
     if (samplesPerSec == 0) samplesPerSec = 44100000;
     if (samplesPerSec < 1000000) samplesPerSec *= 1000;
-    if (bitsPerSample == 0) bitsPerSample = 16;
+    if (bitsPerSample == 0 || (bitsPerSample != 8 && bitsPerSample != 16 && bitsPerSample != 24 && bitsPerSample != 32)) {
+        bitsPerSample = 16;
+    }
 
     std::lock_guard lk(g_sl_mu);
     auto player = std::make_shared<HostAudioPlayer>();
     player->host_id = g_next_host_id++;
 
     if (g_host_engine && g_host_output_mix) {
-        SLDataLocator_AndroidSimpleBufferQueue loc_bq = {
-            SL_DATALOCATOR_ANDROIDSIMPLEBUFFERQUEUE,
-            4
-        };
-        SLDataFormat_PCM pcm = {
-            SL_DATAFORMAT_PCM,
-            numChannels,
-            samplesPerSec,
-            bitsPerSample,
-            bitsPerSample,
-            numChannels == 1 ? SL_SPEAKER_FRONT_CENTER : (SL_SPEAKER_FRONT_LEFT | SL_SPEAKER_FRONT_RIGHT),
-            SL_BYTEORDER_LITTLEENDIAN
-        };
-        SLDataSource audioSrc = { &loc_bq, &pcm };
+        gaddr pLocator = (pAudioSrc && is_mapped(pAudioSrc)) ? rd<u32>(pAudioSrc + 0) : 0;
+        u32 locatorType = (pLocator && is_mapped(pLocator)) ? rd<u32>(pLocator) : 0;
+
         SLDataLocator_OutputMix loc_outmix = { SL_DATALOCATOR_OUTPUTMIX, g_host_output_mix };
         SLDataSink audioSnk = { &loc_outmix, nullptr };
 
-        const SLInterfaceID ids[2] = { SL_IID_ANDROIDSIMPLEBUFFERQUEUE, SL_IID_VOLUME };
-        const SLboolean req[2] = { SL_BOOLEAN_TRUE, SL_BOOLEAN_FALSE };
+        SLresult res = SL_RESULT_UNKNOWN_ERROR;
+        if (locatorType == 1 /* SL_DATALOCATOR_URI */) {
+            gaddr uri_addr = rd<u32>(pLocator + 4);
+            const char* uri_str = uri_addr ? hs(uri_addr) : "";
+            SLDataLocator_URI loc_uri = { SL_DATALOCATOR_URI, (SLchar*)uri_str };
+            SLDataFormat_MIME mime = { SL_DATAFORMAT_MIME, nullptr, SL_CONTAINERTYPE_UNSPECIFIED };
+            SLDataSource audioSrc = { &loc_uri, &mime };
+            const SLInterfaceID ids[2] = { SL_IID_SEEK, SL_IID_VOLUME };
+            const SLboolean req[2] = { SL_BOOLEAN_FALSE, SL_BOOLEAN_FALSE };
+            res = (*g_host_engine)->CreateAudioPlayer(
+                g_host_engine, &player->host_player_obj, &audioSrc, &audioSnk, 2, ids, req
+            );
+        } else if (locatorType == 0x800007BE /* SL_DATALOCATOR_ANDROIDFD */) {
+            SLDataLocator_AndroidFD loc_fd = {
+                SL_DATALOCATOR_ANDROIDFD,
+                rd<s32>(pLocator + 4),
+                static_cast<SLAint64>(rd<u64>(pLocator + 8)),
+                static_cast<SLAint64>(rd<u64>(pLocator + 16))
+            };
+            SLDataFormat_MIME mime = { SL_DATAFORMAT_MIME, nullptr, SL_CONTAINERTYPE_UNSPECIFIED };
+            SLDataSource audioSrc = { &loc_fd, &mime };
+            const SLInterfaceID ids[2] = { SL_IID_SEEK, SL_IID_VOLUME };
+            const SLboolean req[2] = { SL_BOOLEAN_FALSE, SL_BOOLEAN_FALSE };
+            res = (*g_host_engine)->CreateAudioPlayer(
+                g_host_engine, &player->host_player_obj, &audioSrc, &audioSnk, 2, ids, req
+            );
+        } else {
+            SLDataLocator_AndroidSimpleBufferQueue loc_bq = {
+                SL_DATALOCATOR_ANDROIDSIMPLEBUFFERQUEUE,
+                4
+            };
+            SLDataFormat_PCM pcm = {
+                SL_DATAFORMAT_PCM,
+                numChannels,
+                samplesPerSec,
+                bitsPerSample,
+                bitsPerSample,
+                numChannels == 1 ? SL_SPEAKER_FRONT_CENTER : (SL_SPEAKER_FRONT_LEFT | SL_SPEAKER_FRONT_RIGHT),
+                SL_BYTEORDER_LITTLEENDIAN
+            };
+            SLDataSource audioSrc = { &loc_bq, &pcm };
+            const SLInterfaceID ids[2] = { SL_IID_ANDROIDSIMPLEBUFFERQUEUE, SL_IID_VOLUME };
+            const SLboolean req[2] = { SL_BOOLEAN_TRUE, SL_BOOLEAN_FALSE };
+            res = (*g_host_engine)->CreateAudioPlayer(
+                g_host_engine, &player->host_player_obj, &audioSrc, &audioSnk, 2, ids, req
+            );
+        }
 
-        SLresult res = (*g_host_engine)->CreateAudioPlayer(
-            g_host_engine, &player->host_player_obj, &audioSrc, &audioSnk, 2, ids, req
-        );
         if (res == SL_RESULT_SUCCESS && player->host_player_obj) {
             (*player->host_player_obj)->Realize(player->host_player_obj, SL_BOOLEAN_FALSE);
             (*player->host_player_obj)->GetInterface(player->host_player_obj, SL_IID_PLAY, &player->host_play);

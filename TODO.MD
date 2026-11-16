@@ -3,13 +3,13 @@
 *feature*
     - [ ] add option to export into self contained 64bit apk
     - [ ] add support for full screen
-    - [ ] add support to install apks directly from the file manager, ask for open with dialog for venmod along side normal package installer while opening apk files
 
 
 *fix*
     - [ ] make the pip mode optional in settings
     - [ ] show corresponding icon of the app running in the recent page, instead of showing the vemod icon
-    - [ ] mention in readme about in the last section as name is derived from the norweigen word venmod (pronunced vaaymood) meaning nostagia
     - [ ] ask me questions and finalise the license, dont miss out on any thing the app and the whole sourse code should be completly legal. and update the gitignore appropriately
-    - [ ] remove the refference/to test forlder from the project tree (last section) in documentaion, exclude the files mentioned in gitignore
-    - [ ] mention what wont be working in readme, like google services, etc
+    - [ ] restrict vemod container apks to be installed inside vemod, eg.: user selects vemod to install the container instead of the package installer. we can retrict apks from installing if the package name starts with com.vemood.container_
+    - [ ] removing an app from vemod should remove its container from the actual system if theres any
+    - [ ] remove option for add to homescreen as add to app drawer already exists
+    - [ ] make the add to app drawer into add to apps. add make it dynamic, if the app isnt added yet, it should show add to apps, if its added already it should show remove from apps, which if tapped would uninstall the container

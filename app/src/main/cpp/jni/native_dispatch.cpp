@@ -189,9 +189,8 @@ extern "C" void zb_native_dispatch(uint32_t slot, vemod::NativeRegs* regs) noexc
              cnt, target->label.c_str(), target->guest_function, (unsigned long)pthread_self());
     }
 
-    bool is_audio_buffer_fill = (target->label == "fmodProcess" || target->label == "fmodProcessMicData");
     uint64_t ret = nb::call_guest(target->guest_function, args.data(), args.size());
-    if (is_audio_buffer_fill) {
+    if (nb::jni_has_direct_buffers()) {
         nb::jni_sync_direct_buffers_to_host();
     }
 

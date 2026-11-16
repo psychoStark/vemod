@@ -1227,6 +1227,7 @@ struct DirectBufRecord {
 };
 static std::mutex g_direct_buf_mu;
 static std::unordered_map<void*, DirectBufRecord> g_direct_buffers;
+static std::atomic<size_t> g_direct_buf_count{0};
 
 void jni_GetDirectBufferAddress(Ctx& c) {
     c.a32();
@@ -1256,6 +1257,7 @@ void jni_GetDirectBufferAddress(Ctx& c) {
         } else {
             map_free(it->second.guest_addr, it->second.alloc_sz);
             g_direct_buffers.erase(it);
+            g_direct_buf_count.store(g_direct_buffers.size(), std::memory_order_release);
         }
     }
     u32 sz = host_page_round_up(static_cast<u32>(cap));
@@ -1267,6 +1269,7 @@ void jni_GetDirectBufferAddress(Ctx& c) {
     }
     memcpy(h(ga), p, cap);
     g_direct_buffers[p] = {ga, p, sz, static_cast<size_t>(cap)};
+    g_direct_buf_count.store(g_direct_buffers.size(), std::memory_order_release);
     if (get_log_level() >= LOG_LEVEL_ADVANCED) {
         NB_LOGI("jni_GetDirectBufferAddress: mirrored host buffer %p (%zu bytes) -> guest %#x", p, (size_t)cap, ga);
     }
@@ -1335,7 +1338,12 @@ JNIEnv* jni_env() { return env(); }
 u32 jni_local(jobject o) { return local(o); }
 jobject jni_obj(u32 hnd) { return obj(hnd); }
 
+bool jni_has_direct_buffers() {
+    return g_direct_buf_count.load(std::memory_order_relaxed) > 0;
+}
+
 void jni_sync_direct_buffers_to_host() {
+    if (!jni_has_direct_buffers()) return;
     std::lock_guard lk(g_direct_buf_mu);
     for (const auto& pair : g_direct_buffers) {
         const auto& rec = pair.second;

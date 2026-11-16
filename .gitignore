@@ -80,5 +80,8 @@ bionic_aosp/
 custom_bionic/
 extracted_bionic/
 assetbuild/
+mango-ref/
+tango32-module/
 /*.zip
 /*.so
+armeabi-v7a-24_r07.zip

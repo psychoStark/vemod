@@ -810,6 +810,12 @@ struct tm tm_from_guest(gaddr a) {
 }  // namespace
 const char* headless_path(const char* p) {
     if (!p) return p;
+    if (is_proc_self_exe(p)) {
+        const std::string& apk = get_guest_apk_path();
+        if (!apk.empty() && access(apk.c_str(), R_OK) == 0) {
+            return apk.c_str();
+        }
+    }
     if (strcmp(p, "/proc/cpuinfo") == 0) {
         static std::string cpuinfo_path = [] {
             std::vector<std::string> dirs;
@@ -1093,7 +1099,17 @@ int x_chdir(const char* p) { return sysret(chdir(p)); }
 int x_fchmod(int fd, u32 mode) { return sysret(fchmod(fd, mode)); }
 int x_fchown(int fd, u32 uid, u32 gid) { return sysret(fchown(fd, uid, gid)); }
 int x_symlink(const char* a, const char* b) { return sysret(symlink(a, b)); }
-s32 x_readlink(const char* p, char* buf, u32 n) { return s32(sysret(readlink(p, buf, n))); }
+s32 x_readlink(const char* p, char* buf, u32 n) {
+    if (is_proc_self_exe(p)) {
+        const std::string& apk = get_guest_apk_path();
+        if (!apk.empty()) {
+            size_t copy_len = std::min((size_t)n, apk.size());
+            memcpy(buf, apk.data(), copy_len);
+            return s32(copy_len);
+        }
+    }
+    return s32(sysret(readlink(p, buf, n)));
+}
 int x_isatty(int fd) { return isatty(fd); }
 int x_dup2(int a, int b) { return sysret(dup2(a, b)); }
 int x_pipe(int* fds) { return sysret(pipe(fds)); }

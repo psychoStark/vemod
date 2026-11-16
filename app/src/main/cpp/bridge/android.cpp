@@ -21,6 +21,7 @@
 #include <android/looper.h>
 #include <android/sensor.h>
 #include <android/input.h>
+#include <dlfcn.h>
 #include <thread>
 #else
 #include <fstream>
@@ -346,6 +347,7 @@ int x_ALooper_pollOnce(int timeoutMillis, u32 outFd, u32 outEvents, u32 outData)
     int res = ALooper_pollOnce(timeoutMillis, outFd ? &fd : nullptr, outEvents ? &events : nullptr, outData ? &data : nullptr);
     if (outFd && is_mapped(outFd)) wr<s32>(outFd, fd);
     if (outEvents && is_mapped(outEvents)) wr<s32>(outEvents, events);
+    if (outData && is_mapped(outData)) wr<u32>(outData, to_guest_egl(data));
     return res;
 #else
     return kALooperPollTimeout;
@@ -356,9 +358,13 @@ int x_ALooper_pollAll(int timeoutMillis, u32 outFd, u32 outEvents, u32 outData) 
 #ifdef NB_ANDROID_RUNTIME
     int fd = 0, events = 0;
     void* data = nullptr;
-    int res = ALooper_pollOnce(timeoutMillis, outFd ? &fd : nullptr, outEvents ? &events : nullptr, outData ? &data : nullptr);
+    typedef int (*PollAllFn)(int, int*, int*, void**);
+    static auto pollAll = reinterpret_cast<PollAllFn>(dlsym(RTLD_DEFAULT, "ALooper_pollAll"));
+    int res = pollAll ? pollAll(timeoutMillis, outFd ? &fd : nullptr, outEvents ? &events : nullptr, outData ? &data : nullptr)
+                      : ALooper_pollOnce(timeoutMillis, outFd ? &fd : nullptr, outEvents ? &events : nullptr, outData ? &data : nullptr);
     if (outFd && is_mapped(outFd)) wr<s32>(outFd, fd);
     if (outEvents && is_mapped(outEvents)) wr<s32>(outEvents, events);
+    if (outData && is_mapped(outData)) wr<u32>(outData, to_guest_egl(data));
     return res;
 #else
     return kALooperPollTimeout;

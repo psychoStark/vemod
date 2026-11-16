@@ -10,11 +10,13 @@ Got a newer phone running Android 14, 15, or 16 (like the Pixel 8/9, Galaxy S24,
 
 ## ✨ Features
 
-- 🕹️ **Revive Classic Games & Apps:** Play legendary classics like original *Flappy Bird*, classic *Angry Birds*, early *Temple Run*, and vintage Android apps that modern phones dropped support for.
-- 🚀 **No Root Needed:** Just install Vemod like any normal app.
-- 📱 **Home Screen Shortcuts:** Pin your installed games directly to your home screen with their original icons.
-- ⚡ **Smooth & Fast:** Native graphics, sound, and touch response.
-- 📦 **Simple APK Installer:** Pick any `.apk` file from your phone's storage and Vemod sets it up in seconds.
+- 🕹️ **Revive Classic Games & Apps:** Play legendary classics like original *Flappy Bird*, classic *Angry Birds* games, early *Temple Run*, *Reckless Racing*, *Spider-Man Unlimited*, and vintage Android apps that modern phones dropped support for.
+- 🚀 **No Root Needed:** Runs 100% in user space on stock Android 14, 15, and 16.
+- 📱 **Home Screen Shortcuts & App Drawer Slots:** Pin installed games directly to your launcher or assign them to native system app drawer launcher shortcuts.
+- ⚡ **Smooth & Fast:** AOT precompiled code cache, direct GPU passthrough (GLES 1.1 / 2.0 / 3.0), OpenSL ES low-latency audio, and 60 FPS pacing.
+- 📦 **One-Click APK / XAPK / APKS Installer:** Pick `.apk`, `.xapk`, or `.apks` files with automatic `.obb` expansion extraction.
+- 🔗 **System "Open With" Integration:** Tap APKs or XAPKs directly from Files by Google, ZArchiver, Telegram, or your browser to install instantly.
+- 📂 **Expose App Data & Public Storage:** Directly access save games and drag-and-drop OBB files via `/sdcard/vemod/<App_Name>/`.
 
 ---
 
@@ -47,6 +49,21 @@ Each app is isolated safely inside Vemod. You can remove any installed app at an
 
 ---
 
+## ⚠️ Unsupported Systems & Limitations
+
+Because Vemod runs as a 100% userspace container without device root, kernel modules, or low-level OS modifications:
+- **Play Integrity & SafetyNet:** Hardware attestation cannot be passed for apps requiring certified OEM keybox signatures.
+- **Live Google Play Games Cloud Sync & Multiplayer:** Online multiplayer frameworks requiring signed Google Play Services IPC may run in offline guest mode or show mock sign-in.
+- **Custom Hardware Drivers:** External accessories requiring proprietary kernel USB/Bluetooth drivers are not supported.
+
+---
+
+## 📖 Etymology
+
+**Vemod** is a Norwegian word (*pronounced "vay-mood"*). It describes a wistful, tender longing or quiet nostalgia for a past that cannot be recovered—a sentiment that perfectly embodies the spirit of preserving and playing the golden generation of mobile gaming classics that modern hardware left behind.
+
+---
+
 ## 🛠️ For Developers & Technical Deep-Dive
 
-Looking for the technical internals, JIT compilation engine (Dynarmic), JNI bridging, and architecture? See the full [Technical Documentation](documentation.md).
+Looking for the technical internals, JIT compilation engine (Dynarmic), JNI bridging, syscall router, and architecture? See the full [Technical Documentation](documentation.md).

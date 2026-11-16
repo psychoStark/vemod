@@ -227,6 +227,8 @@ struct GuestThread {
     u32 stack_size = 0;
     gaddr tls = 0;  // per-thread guest block (errno, static result buffers)
     gaddr clear_child_tid = 0;
+    gaddr robust_list_head = 0;
+    u32 robust_list_len = 0;
     bool own_tls = true;
     bool own_stack = true;
     std::vector<std::unique_ptr<Cpu>> cpus;
@@ -277,6 +279,10 @@ const std::string& get_sysroot_dir();
 const std::string& get_guest_lib_dir();
 void preload_sysroot(const char* dir);
 bool is_sysroot_loaded();
+void set_container_dir(const char* dir);
+const std::string& get_container_dir();
+const std::string& get_guest_apk_path();
+bool is_proc_self_exe(const char* path);
 
 constexpr int kAlarmFd = 0x7fff0001;
 int oflags_from_guest(int f);

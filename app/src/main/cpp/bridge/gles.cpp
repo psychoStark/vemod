@@ -3,9 +3,12 @@
 #include <GLES/glext.h>
 #include <GLES2/gl2.h>
 #include <GLES2/gl2ext.h>
+#include <GLES3/gl3.h>
+#include <GLES3/gl3ext.h>
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
 #include <android/native_window.h>
+#include <sys/mman.h>
 
 #include <mutex>
 #include <unordered_map>
@@ -591,6 +594,7 @@ static u32 x_eglSwapBuffers(u32 dpy_h, u32 surf_h) {
     if (!dpy || dpy == (EGLDisplay)(uintptr_t)1) dpy = g_host_display;
     if (dpy == EGL_NO_DISPLAY) dpy = eglGetDisplay(EGL_DEFAULT_DISPLAY);
     EGLSurface surf = (EGLSurface)to_host_egl(surf_h);
+    warmup_note_frame();
     return eglSwapBuffers(dpy, surf) ? EGL_TRUE : EGL_FALSE;
 }
 
@@ -688,6 +692,15 @@ static gaddr x_eglGetProcAddress(gaddr procname_addr) {
         NB_LOGI("eglGetProcAddress(\"%s\") -> handler found", name);
         return resolve_import(name);
     }
+    void* host_ptr = (void*)eglGetProcAddress(name);
+    if (host_ptr) {
+        NB_LOGI("eglGetProcAddress(\"%s\") -> host GPU symbol found", name);
+        return resolve_import(name);
+    }
+    if (strncmp(name, "gl", 2) == 0 || strncmp(name, "egl", 3) == 0) {
+        NB_LOGW("eglGetProcAddress(\"%s\") -> fallback stub created", name);
+        return resolve_import(name);
+    }
     NB_LOGW("eglGetProcAddress(\"%s\") -> not found", name);
     return 0;
 }
@@ -730,18 +743,337 @@ static GLboolean x_glIsVertexArrayOES(GLuint array) {
     if (!p_glIsVertexArrayOES) p_glIsVertexArrayOES = (PFNGLISVERTEXARRAYOESPROC)eglGetProcAddress("glIsVertexArrayOES");
     return p_glIsVertexArrayOES ? p_glIsVertexArrayOES(array) : GL_FALSE;
 }
-static void x_glDiscardFramebufferEXT(GLenum, GLsizei, gaddr) {}
+
+// Fixed-point texture parameters (Reckless Racing / Polarbit fuseGL)
+static void x_glTexParameterx(GLenum target, GLenum pname, GLfixed param) {
+    switch (pname) {
+        case GL_TEXTURE_MIN_FILTER:
+        case GL_TEXTURE_MAG_FILTER:
+        case GL_TEXTURE_WRAP_S:
+        case GL_TEXTURE_WRAP_T:
+        case 0x8191: /* GL_GENERATE_MIPMAP */
+            glTexParameteri(target, pname, param);
+            break;
+        default:
+            glTexParameterf(target, pname, static_cast<GLfloat>(param) / 65536.0f);
+            break;
+    }
+}
+
+static void x_glTexParameterxv(GLenum target, GLenum pname, gaddr params_addr) {
+    if (!params_addr || !is_mapped(params_addr)) return;
+    GLfixed val = rd<GLfixed>(params_addr);
+    x_glTexParameterx(target, pname, val);
+}
+
+static void x_glGetTexParameterxv(GLenum target, GLenum pname, gaddr params_addr) {
+    if (!params_addr || !is_mapped(params_addr)) return;
+    switch (pname) {
+        case GL_TEXTURE_MIN_FILTER:
+        case GL_TEXTURE_MAG_FILTER:
+        case GL_TEXTURE_WRAP_S:
+        case GL_TEXTURE_WRAP_T:
+        case 0x8191: /* GL_GENERATE_MIPMAP */ {
+            GLint ival = 0;
+            glGetTexParameteriv(target, pname, &ival);
+            wr<GLfixed>(params_addr, ival);
+            break;
+        }
+        default: {
+            GLfloat fval = 0.0f;
+            glGetTexParameterfv(target, pname, &fval);
+            wr<GLfixed>(params_addr, static_cast<GLfixed>(fval * 65536.0f));
+            break;
+        }
+    }
+}
+
+// Instanced rendering (Gameloft / Spider-Man Unlimited)
+static void x_glDrawArraysInstanced(GLenum mode, GLint first, GLsizei count, GLsizei instancecount) {
+    static auto fn = (PFNGLDRAWARRAYSINSTANCEDPROC)eglGetProcAddress("glDrawArraysInstanced");
+    if (!fn) fn = (PFNGLDRAWARRAYSINSTANCEDPROC)eglGetProcAddress("glDrawArraysInstancedEXT");
+    if (!fn) fn = (PFNGLDRAWARRAYSINSTANCEDPROC)eglGetProcAddress("glDrawArraysInstancedNV");
+    if (fn) {
+        fn(mode, first, count, instancecount);
+    } else {
+        for (GLsizei i = 0; i < instancecount; ++i) {
+            glDrawArrays(mode, first, count);
+        }
+    }
+}
+
+static void x_glDrawElementsInstanced(Ctx& c) {
+    GLenum mode = c.a32();
+    GLsizei count = GLsizei(c.a32());
+    GLenum type = c.a32();
+    u32 indices = c.a32();
+    GLsizei instancecount = GLsizei(c.a32());
+    const void* ptr = t_element_array_buffer ? reinterpret_cast<const void*>(uintptr_t(indices)) : (indices ? h(indices) : nullptr);
+    static auto fn = (PFNGLDRAWELEMENTSINSTANCEDPROC)eglGetProcAddress("glDrawElementsInstanced");
+    if (!fn) fn = (PFNGLDRAWELEMENTSINSTANCEDPROC)eglGetProcAddress("glDrawElementsInstancedEXT");
+    if (!fn) fn = (PFNGLDRAWELEMENTSINSTANCEDPROC)eglGetProcAddress("glDrawElementsInstancedNV");
+    if (fn) {
+        fn(mode, count, type, ptr, instancecount);
+    } else {
+        for (GLsizei i = 0; i < instancecount; ++i) {
+            glDrawElements(mode, count, type, ptr);
+        }
+    }
+}
+
+static void x_glVertexAttribDivisor(GLuint index, GLuint divisor) {
+    static auto fn = (PFNGLVERTEXATTRIBDIVISORPROC)eglGetProcAddress("glVertexAttribDivisor");
+    if (!fn) fn = (PFNGLVERTEXATTRIBDIVISORPROC)eglGetProcAddress("glVertexAttribDivisorEXT");
+    if (!fn) fn = (PFNGLVERTEXATTRIBDIVISORPROC)eglGetProcAddress("glVertexAttribDivisorNV");
+    if (fn) fn(index, divisor);
+}
+
+// 32-bit Buffer Mapping with shadow memory to avoid 64-bit pointer truncation
+struct MappedBufferRecord {
+    GLenum target;
+    GLintptr offset;
+    GLsizeiptr length;
+    GLbitfield access;
+    void* host_ptr;
+    gaddr guest_addr;
+};
+static std::mutex g_map_buf_mu;
+static std::unordered_map<GLenum, MappedBufferRecord> g_mapped_buffers;
+
+static gaddr x_glMapBufferRangeEXT(GLenum target, GLintptr offset, GLsizeiptr length, GLbitfield access) {
+    static auto fn = (PFNGLMAPBUFFERRANGEEXTPROC)eglGetProcAddress("glMapBufferRangeEXT");
+    if (!fn) fn = (PFNGLMAPBUFFERRANGEEXTPROC)eglGetProcAddress("glMapBufferRange");
+    if (!fn || length <= 0) return 0;
+    void* host_ptr = fn(target, offset, length, access);
+    if (!host_ptr) return 0;
+
+    std::lock_guard lk(g_map_buf_mu);
+    u32 alloc_sz = host_page_round_up(static_cast<u32>(length));
+    gaddr ga = map_alloc(alloc_sz, PROT_READ | PROT_WRITE);
+    if (!ga) {
+        NB_LOGE("glMapBufferRange: failed to allocate guest shadow buffer (%u bytes)", alloc_sz);
+        static auto unmap_fn = (PFNGLUNMAPBUFFEROESPROC)eglGetProcAddress("glUnmapBufferOES");
+        if (!unmap_fn) unmap_fn = (PFNGLUNMAPBUFFEROESPROC)eglGetProcAddress("glUnmapBuffer");
+        if (unmap_fn) unmap_fn(target);
+        return 0;
+    }
+    if (access & 0x0001 /* GL_MAP_READ_BIT */) {
+        memcpy(h(ga), host_ptr, length);
+    }
+    g_mapped_buffers[target] = {target, offset, length, access, host_ptr, ga};
+    return ga;
+}
+
+static gaddr x_glMapBufferOES(GLenum target, GLenum access) {
+    GLint size = 0;
+    glGetBufferParameteriv(target, GL_BUFFER_SIZE, &size);
+    if (size <= 0) return 0;
+    GLbitfield flags = 0;
+    if (access == 0x88B8 /* GL_READ_ONLY */) flags = 0x0001;
+    else if (access == 0x88B9 /* GL_WRITE_ONLY */) flags = 0x0002;
+    else flags = 0x0001 | 0x0002;
+    return x_glMapBufferRangeEXT(target, 0, size, flags);
+}
+
+static GLboolean x_glUnmapBufferOES(GLenum target) {
+    std::lock_guard lk(g_map_buf_mu);
+    auto it = g_mapped_buffers.find(target);
+    if (it == g_mapped_buffers.end()) return GL_TRUE;
+    auto& rec = it->second;
+    if ((rec.access & 0x0002 /* GL_MAP_WRITE_BIT */) && rec.host_ptr && rec.guest_addr) {
+        memcpy(rec.host_ptr, h(rec.guest_addr), rec.length);
+    }
+    static auto unmap_fn = (PFNGLUNMAPBUFFEROESPROC)eglGetProcAddress("glUnmapBufferOES");
+    if (!unmap_fn) unmap_fn = (PFNGLUNMAPBUFFEROESPROC)eglGetProcAddress("glUnmapBuffer");
+    GLboolean res = unmap_fn ? unmap_fn(target) : GL_TRUE;
+    u32 alloc_sz = host_page_round_up(static_cast<u32>(rec.length));
+    map_free(rec.guest_addr, alloc_sz);
+    g_mapped_buffers.erase(it);
+    return res;
+}
+
+static void x_glFlushMappedBufferRangeEXT(GLenum target, GLintptr offset, GLsizeiptr length) {
+    std::lock_guard lk(g_map_buf_mu);
+    auto it = g_mapped_buffers.find(target);
+    if (it != g_mapped_buffers.end() && it->second.host_ptr && it->second.guest_addr) {
+        if (offset + length <= it->second.length) {
+            memcpy(reinterpret_cast<u8*>(it->second.host_ptr) + offset,
+                   reinterpret_cast<const u8*>(h(it->second.guest_addr)) + offset, length);
+        }
+    }
+    static auto fn = (PFNGLFLUSHMAPPEDBUFFERRANGEEXTPROC)eglGetProcAddress("glFlushMappedBufferRangeEXT");
+    if (!fn) fn = (PFNGLFLUSHMAPPEDBUFFERRANGEEXTPROC)eglGetProcAddress("glFlushMappedBufferRange");
+    if (fn) fn(target, offset, length);
+}
+
+// Framebuffer blit & discard
+static void x_glBlitFramebufferNV(GLint srcX0, GLint srcY0, GLint srcX1, GLint srcY1,
+                                  GLint dstX0, GLint dstY0, GLint dstX1, GLint dstY1,
+                                  GLbitfield mask, GLenum filter) {
+    static auto fn = (PFNGLBLITFRAMEBUFFERPROC)eglGetProcAddress("glBlitFramebuffer");
+    if (!fn) fn = (PFNGLBLITFRAMEBUFFERPROC)eglGetProcAddress("glBlitFramebufferNV");
+    if (!fn) fn = (PFNGLBLITFRAMEBUFFERPROC)eglGetProcAddress("glBlitFramebufferEXT");
+    if (!fn) fn = (PFNGLBLITFRAMEBUFFERPROC)eglGetProcAddress("glBlitFramebufferANGLE");
+    if (fn) fn(srcX0, srcY0, srcX1, srcY1, dstX0, dstY0, dstX1, dstY1, mask, filter);
+}
+
+static void x_glDiscardFramebufferEXT(GLenum target, GLsizei numAttachments, gaddr attachments) {
+    if (!attachments || numAttachments <= 0) return;
+    static auto fn = (PFNGLDISCARDFRAMEBUFFEREXTPROC)eglGetProcAddress("glDiscardFramebufferEXT");
+    if (!fn) fn = (PFNGLDISCARDFRAMEBUFFEREXTPROC)eglGetProcAddress("glInvalidateFramebuffer");
+    if (fn) {
+        fn(target, numAttachments, reinterpret_cast<const GLenum*>(h(attachments)));
+    }
+}
+
+// Queries
+static void x_glGenQueriesEXT(GLsizei n, gaddr ids) {
+    if (!ids || n <= 0) return;
+    static auto fn = (PFNGLGENQUERIESEXTPROC)eglGetProcAddress("glGenQueriesEXT");
+    if (!fn) fn = (PFNGLGENQUERIESEXTPROC)eglGetProcAddress("glGenQueries");
+    if (fn) fn(n, reinterpret_cast<GLuint*>(h(ids)));
+}
+
+static void x_glDeleteQueriesEXT(GLsizei n, gaddr ids) {
+    if (!ids || n <= 0) return;
+    static auto fn = (PFNGLDELETEQUERIESEXTPROC)eglGetProcAddress("glDeleteQueriesEXT");
+    if (!fn) fn = (PFNGLDELETEQUERIESEXTPROC)eglGetProcAddress("glDeleteQueries");
+    if (fn) fn(n, reinterpret_cast<const GLuint*>(h(ids)));
+}
+
+static void x_glBeginQueryEXT(GLenum target, GLuint id) {
+    static auto fn = (PFNGLBEGINQUERYEXTPROC)eglGetProcAddress("glBeginQueryEXT");
+    if (!fn) fn = (PFNGLBEGINQUERYEXTPROC)eglGetProcAddress("glBeginQuery");
+    if (fn) fn(target, id);
+}
+
+static void x_glEndQueryEXT(GLenum target) {
+    static auto fn = (PFNGLENDQUERYEXTPROC)eglGetProcAddress("glEndQueryEXT");
+    if (!fn) fn = (PFNGLENDQUERYEXTPROC)eglGetProcAddress("glEndQuery");
+    if (fn) fn(target);
+}
+
+static void x_glGetQueryObjectuivEXT(GLuint id, GLenum pname, gaddr params) {
+    if (!params) return;
+    static auto fn = (PFNGLGETQUERYOBJECTUIVEXTPROC)eglGetProcAddress("glGetQueryObjectuivEXT");
+    if (!fn) fn = (PFNGLGETQUERYOBJECTUIVEXTPROC)eglGetProcAddress("glGetQueryObjectuiv");
+    if (fn) fn(id, pname, reinterpret_cast<GLuint*>(h(params)));
+}
+
+static void x_glGetQueryObjectivEXT(GLuint id, GLenum pname, gaddr params) {
+    if (!params) return;
+    static auto fn = (PFNGLGETQUERYOBJECTIVEXTPROC)eglGetProcAddress("glGetQueryObjectivEXT");
+    if (!fn) fn = (PFNGLGETQUERYOBJECTIVEXTPROC)eglGetProcAddress("glGetQueryObjectiv");
+    if (fn) fn(id, pname, reinterpret_cast<GLint*>(h(params)));
+}
+
+// Fences & Sync
+static void x_glGenFencesNV(GLsizei n, gaddr fences) {
+    if (!fences || n <= 0) return;
+    static auto fn = (void(*)(GLsizei, GLuint*))eglGetProcAddress("glGenFencesNV");
+    if (fn) {
+        fn(n, reinterpret_cast<GLuint*>(h(fences)));
+    } else {
+        static GLuint s_fence_id = 1;
+        GLuint* ptr = reinterpret_cast<GLuint*>(h(fences));
+        for (GLsizei i = 0; i < n; ++i) ptr[i] = s_fence_id++;
+    }
+}
+
+static void x_glDeleteFencesNV(GLsizei n, gaddr fences) {
+    if (!fences || n <= 0) return;
+    static auto fn = (void(*)(GLsizei, const GLuint*))eglGetProcAddress("glDeleteFencesNV");
+    if (fn) fn(n, reinterpret_cast<const GLuint*>(h(fences)));
+}
+
+static void x_glSetFenceNV(GLuint fence, GLenum condition) {
+    static auto fn = (void(*)(GLuint, GLenum))eglGetProcAddress("glSetFenceNV");
+    if (fn) fn(fence, condition);
+}
+
+static GLboolean x_glTestFenceNV(GLuint fence) {
+    static auto fn = (GLboolean(*)(GLuint))eglGetProcAddress("glTestFenceNV");
+    return fn ? fn(fence) : GL_TRUE;
+}
+
+static void x_glFinishFenceNV(GLuint fence) {
+    static auto fn = (void(*)(GLuint))eglGetProcAddress("glFinishFenceNV");
+    if (fn) fn(fence);
+    else glFinish();
+}
+
+static GLboolean x_glIsFenceNV(GLuint fence) {
+    static auto fn = (GLboolean(*)(GLuint))eglGetProcAddress("glIsFenceNV");
+    return fn ? fn(fence) : GL_TRUE;
+}
+
+static void x_glGetFenceivNV(GLuint fence, GLenum pname, gaddr params) {
+    if (!params) return;
+    static auto fn = (void(*)(GLuint, GLenum, GLint*))eglGetProcAddress("glGetFenceivNV");
+    if (fn) {
+        fn(fence, pname, reinterpret_cast<GLint*>(h(params)));
+    } else {
+        wr<GLint>(params, 1);
+    }
+}
+
+// Draw buffers & read buffer
+static void x_glDrawBuffers(GLsizei n, gaddr bufs) {
+    if (!bufs || n <= 0) return;
+    static auto fn = (void(*)(GLsizei, const GLenum*))eglGetProcAddress("glDrawBuffers");
+    if (!fn) fn = (void(*)(GLsizei, const GLenum*))eglGetProcAddress("glDrawBuffersEXT");
+    if (!fn) fn = (void(*)(GLsizei, const GLenum*))eglGetProcAddress("glDrawBuffersNV");
+    if (fn) fn(n, reinterpret_cast<const GLenum*>(h(bufs)));
+}
+
+static void x_glReadBuffer(GLenum mode) {
+    static auto fn = (void(*)(GLenum))eglGetProcAddress("glReadBuffer");
+    if (!fn) fn = (void(*)(GLenum))eglGetProcAddress("glReadBufferNV");
+    if (fn) fn(mode);
+}
+
+// Transform feedback
+static void x_glGenTransformFeedbacks(GLsizei n, gaddr ids) {
+    if (!ids || n <= 0) return;
+    static auto fn = (void(*)(GLsizei, GLuint*))eglGetProcAddress("glGenTransformFeedbacks");
+    if (!fn) fn = (void(*)(GLsizei, GLuint*))eglGetProcAddress("glGenTransformFeedbacksNV");
+    if (fn) fn(n, reinterpret_cast<GLuint*>(h(ids)));
+}
+
+static void x_glBindTransformFeedback(GLenum target, GLuint id) {
+    static auto fn = (void(*)(GLenum, GLuint))eglGetProcAddress("glBindTransformFeedback");
+    if (!fn) fn = (void(*)(GLenum, GLuint))eglGetProcAddress("glBindTransformFeedbackNV");
+    if (fn) fn(target, id);
+}
+
+static void x_glDeleteTransformFeedbacks(GLsizei n, gaddr ids) {
+    if (!ids || n <= 0) return;
+    static auto fn = (void(*)(GLsizei, const GLuint*))eglGetProcAddress("glDeleteTransformFeedbacks");
+    if (!fn) fn = (void(*)(GLsizei, const GLuint*))eglGetProcAddress("glDeleteTransformFeedbacksNV");
+    if (fn) fn(n, reinterpret_cast<const GLuint*>(h(ids)));
+}
+
+static void x_glBeginTransformFeedback(GLenum primitiveMode) {
+    static auto fn = (void(*)(GLenum))eglGetProcAddress("glBeginTransformFeedback");
+    if (!fn) fn = (void(*)(GLenum))eglGetProcAddress("glBeginTransformFeedbackNV");
+    if (fn) fn(primitiveMode);
+}
+
+static void x_glEndTransformFeedback() {
+    static auto fn = (void(*)())eglGetProcAddress("glEndTransformFeedback");
+    if (!fn) fn = (void(*)())eglGetProcAddress("glEndTransformFeedbackNV");
+    if (fn) fn();
+}
+
+// Texture storage
+static void x_glTexStorage2D(GLenum target, GLsizei levels, GLenum internalformat, GLsizei width, GLsizei height) {
+    static auto fn = (void(*)(GLenum, GLsizei, GLenum, GLsizei, GLsizei))eglGetProcAddress("glTexStorage2D");
+    if (!fn) fn = (void(*)(GLenum, GLsizei, GLenum, GLsizei, GLsizei))eglGetProcAddress("glTexStorage2DEXT");
+    if (fn) fn(target, levels, internalformat, width, height);
+}
 
 static void x_glAlphaFuncQCOM(GLenum func, GLclampf ref) {
     glAlphaFunc(func, ref);
-}
-
-static gaddr x_glMapBufferOES(GLenum /*target*/, GLenum /*access*/) {
-    return 0;
-}
-
-static GLboolean x_glUnmapBufferOES(GLenum /*target*/) {
-    return GL_TRUE;
 }
 
 static void x_glEnable(GLenum cap) {
@@ -1074,6 +1406,99 @@ void register_gles() {
     NB_REG("glGenVertexArraysOES", x_glGenVertexArraysOES);
     NB_REG("glIsVertexArrayOES", x_glIsVertexArrayOES);
     NB_REG("glDiscardFramebufferEXT", x_glDiscardFramebufferEXT);
+
+    // Fixed-point texture parameters (Reckless Racing / Polarbit fuseGL)
+    NB_REG("glTexParameterx", x_glTexParameterx);
+    NB_REG("glTexParameterxv", x_glTexParameterxv);
+    NB_REG("glGetTexParameterxv", x_glGetTexParameterxv);
+
+    // Instanced rendering (Gameloft / Spider-Man Unlimited)
+    NB_REG("glDrawArraysInstanced", x_glDrawArraysInstanced);
+    NB_REG("glDrawArraysInstancedEXT", x_glDrawArraysInstanced);
+    NB_REG("glDrawArraysInstancedARB", x_glDrawArraysInstanced);
+    NB_REG("glDrawArraysInstancedNV", x_glDrawArraysInstanced);
+    reg("glDrawElementsInstanced", x_glDrawElementsInstanced);
+    reg("glDrawElementsInstancedEXT", x_glDrawElementsInstanced);
+    reg("glDrawElementsInstancedARB", x_glDrawElementsInstanced);
+    reg("glDrawElementsInstancedNV", x_glDrawElementsInstanced);
+    NB_REG("glVertexAttribDivisor", x_glVertexAttribDivisor);
+    NB_REG("glVertexAttribDivisorEXT", x_glVertexAttribDivisor);
+    NB_REG("glVertexAttribDivisorARB", x_glVertexAttribDivisor);
+    NB_REG("glVertexAttribDivisorNV", x_glVertexAttribDivisor);
+
+    // Buffer mapping
+    NB_REG("glMapBufferRange", x_glMapBufferRangeEXT);
+    NB_REG("glMapBufferRangeEXT", x_glMapBufferRangeEXT);
+    NB_REG("glMapBuffer", x_glMapBufferOES);
+    NB_REG("glMapBufferOES", x_glMapBufferOES);
+    NB_REG("glMapBufferARB", x_glMapBufferOES);
+    NB_REG("glUnmapBuffer", x_glUnmapBufferOES);
+    NB_REG("glUnmapBufferOES", x_glUnmapBufferOES);
+    NB_REG("glUnmapBufferARB", x_glUnmapBufferOES);
+    NB_REG("glFlushMappedBufferRange", x_glFlushMappedBufferRangeEXT);
+    NB_REG("glFlushMappedBufferRangeEXT", x_glFlushMappedBufferRangeEXT);
+
+    // Framebuffer blit & discard
+    NB_REG("glBlitFramebuffer", x_glBlitFramebufferNV);
+    NB_REG("glBlitFramebufferNV", x_glBlitFramebufferNV);
+    NB_REG("glBlitFramebufferEXT", x_glBlitFramebufferNV);
+    NB_REG("glBlitFramebufferANGLE", x_glBlitFramebufferNV);
+    NB_REG("glInvalidateFramebuffer", x_glDiscardFramebufferEXT);
+
+    // Queries
+    NB_REG("glGenQueries", x_glGenQueriesEXT);
+    NB_REG("glGenQueriesEXT", x_glGenQueriesEXT);
+    NB_REG("glDeleteQueries", x_glDeleteQueriesEXT);
+    NB_REG("glDeleteQueriesEXT", x_glDeleteQueriesEXT);
+    NB_REG("glBeginQuery", x_glBeginQueryEXT);
+    NB_REG("glBeginQueryEXT", x_glBeginQueryEXT);
+    NB_REG("glBeginQueryARB", x_glBeginQueryEXT);
+    NB_REG("glEndQuery", x_glEndQueryEXT);
+    NB_REG("glEndQueryEXT", x_glEndQueryEXT);
+    NB_REG("glEndQueryARB", x_glEndQueryEXT);
+    NB_REG("glGetQueryObjectuiv", x_glGetQueryObjectuivEXT);
+    NB_REG("glGetQueryObjectuivEXT", x_glGetQueryObjectuivEXT);
+    NB_REG("glGetQueryObjectuivARB", x_glGetQueryObjectuivEXT);
+    NB_REG("glGetQueryObjectiv", x_glGetQueryObjectivEXT);
+    NB_REG("glGetQueryObjectivEXT", x_glGetQueryObjectivEXT);
+    NB_REG("glGetQueryObjectivARB", x_glGetQueryObjectivEXT);
+
+    // Fences & Sync
+    NB_REG("glGenFencesNV", x_glGenFencesNV);
+    NB_REG("glGenFencesAPPLE", x_glGenFencesNV);
+    NB_REG("glDeleteFencesNV", x_glDeleteFencesNV);
+    NB_REG("glDeleteFencesAPPLE", x_glDeleteFencesNV);
+    NB_REG("glSetFenceNV", x_glSetFenceNV);
+    NB_REG("glSetFenceAPPLE", x_glSetFenceNV);
+    NB_REG("glTestFenceNV", x_glTestFenceNV);
+    NB_REG("glTestFenceAPPLE", x_glTestFenceNV);
+    NB_REG("glFinishFenceNV", x_glFinishFenceNV);
+    NB_REG("glFinishFenceAPPLE", x_glFinishFenceNV);
+    NB_REG("glIsFenceNV", x_glIsFenceNV);
+    NB_REG("glGetFenceivNV", x_glGetFenceivNV);
+
+    // Draw buffers & read buffer
+    NB_REG("glDrawBuffers", x_glDrawBuffers);
+    NB_REG("glDrawBuffersEXT", x_glDrawBuffers);
+    NB_REG("glDrawBuffersNV", x_glDrawBuffers);
+    NB_REG("glReadBuffer", x_glReadBuffer);
+    NB_REG("glReadBufferNV", x_glReadBuffer);
+
+    // Transform feedback
+    NB_REG("glGenTransformFeedbacks", x_glGenTransformFeedbacks);
+    NB_REG("glGenTransformFeedbacksNV", x_glGenTransformFeedbacks);
+    NB_REG("glBindTransformFeedback", x_glBindTransformFeedback);
+    NB_REG("glBindTransformFeedbackNV", x_glBindTransformFeedback);
+    NB_REG("glDeleteTransformFeedbacks", x_glDeleteTransformFeedbacks);
+    NB_REG("glDeleteTransformFeedbacksNV", x_glDeleteTransformFeedbacks);
+    NB_REG("glBeginTransformFeedback", x_glBeginTransformFeedback);
+    NB_REG("glBeginTransformFeedbackNV", x_glBeginTransformFeedback);
+    NB_REG("glEndTransformFeedback", x_glEndTransformFeedback);
+    NB_REG("glEndTransformFeedbackNV", x_glEndTransformFeedback);
+
+    // Texture storage
+    NB_REG("glTexStorage2D", x_glTexStorage2D);
+    NB_REG("glTexStorage2DEXT", x_glTexStorage2D);
 }
 
 }  // namespace nb

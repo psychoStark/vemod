@@ -55,6 +55,7 @@ Java_com_vemod_container_bridge_VemodBridge_nativeInit(JNIEnv* env, jclass, jstr
         if (path) {
             std::string sysrootDir = std::string(path) + "/sysroot";
             nb::set_sysroot_dir(sysrootDir.c_str());
+            nb::set_container_dir(path);
             env->ReleaseStringUTFChars(filesDir, path);
         }
     }

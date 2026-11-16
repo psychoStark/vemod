@@ -26,19 +26,111 @@ object ApkExtractor {
     private const val TAG = "ApkExtractor"
 
     fun extract(context: Context, apkUri: Uri): ContainerApp {
-        val tempApk = File(context.cacheDir, "import_temp_${System.currentTimeMillis()}.apk")
-        context.contentResolver.openInputStream(apkUri).use { input ->
-            requireNotNull(input) { "Cannot open APK URI: $apkUri" }
-            FileOutputStream(tempApk).use { output ->
-                input.copyTo(output)
+        val tempDir = File(context.cacheDir, "import_temp_${System.currentTimeMillis()}").apply { mkdirs() }
+        val tempFile = File(tempDir, "archive.tmp")
+        try {
+            context.contentResolver.openInputStream(apkUri).use { input ->
+                requireNotNull(input) { "Cannot open APK URI: $apkUri" }
+                FileOutputStream(tempFile).use { output ->
+                    input.copyTo(output)
+                }
             }
-        }
-        return extractFromFile(context, tempApk).also {
-            tempApk.delete()
+            return extractArchiveOrApk(context, tempFile, tempDir)
+        } finally {
+            tempDir.deleteRecursively()
         }
     }
 
-    fun extractFromFile(context: Context, apkFile: File): ContainerApp {
+    fun extractFromFile(context: Context, file: File): ContainerApp {
+        val tempDir = File(context.cacheDir, "import_temp_${System.currentTimeMillis()}").apply { mkdirs() }
+        try {
+            return extractArchiveOrApk(context, file, tempDir)
+        } finally {
+            tempDir.deleteRecursively()
+        }
+    }
+
+    private fun extractArchiveOrApk(context: Context, file: File, tempDir: File): ContainerApp {
+        var isDirectApk = false
+        try {
+            ZipFile(file).use { zf ->
+                if (zf.getEntry("AndroidManifest.xml") != null) {
+                    isDirectApk = true
+                }
+            }
+        } catch (_: Throwable) {}
+
+        if (isDirectApk) {
+            return extractFromSingleApk(context, file)
+        }
+
+        // Unpack multi-APK / XAPK / APKS bundle
+        Log.i(TAG, "extractArchiveOrApk: unpacking bundle ${file.name}")
+        val unpackedDir = File(tempDir, "unpacked").apply { mkdirs() }
+        val obbFiles = mutableListOf<File>()
+        val apkCandidates = mutableListOf<File>()
+
+        ZipFile(file).use { zf ->
+            val entries = zf.entries()
+            while (entries.hasMoreElements()) {
+                val entry = entries.nextElement()
+                if (entry.isDirectory) continue
+                val entryName = entry.name
+                val entryLower = entryName.lowercase()
+                if (entryLower.endsWith(".apk")) {
+                    val dest = File(unpackedDir, File(entryName).name)
+                    dest.parentFile?.mkdirs()
+                    zf.getInputStream(entry).use { inStream ->
+                        FileOutputStream(dest).use { outStream ->
+                            inStream.copyTo(outStream)
+                        }
+                    }
+                    apkCandidates.add(dest)
+                } else if (entryLower.endsWith(".obb")) {
+                    val dest = File(unpackedDir, File(entryName).name)
+                    dest.parentFile?.mkdirs()
+                    zf.getInputStream(entry).use { inStream ->
+                        FileOutputStream(dest).use { outStream ->
+                            inStream.copyTo(outStream)
+                        }
+                    }
+                    obbFiles.add(dest)
+                }
+            }
+        }
+
+        require(apkCandidates.isNotEmpty()) { "No .apk files found inside archive: ${file.name}" }
+
+        // Find best APK: prefer base.apk, or the one with launcher activity, or largest
+        val bestApk = apkCandidates.find { it.name.equals("base.apk", ignoreCase = true) }
+            ?: apkCandidates.maxByOrNull { it.length() }!!
+
+        Log.i(TAG, "Selected main APK from bundle: ${bestApk.name} (${bestApk.length()} bytes)")
+        val app = extractFromSingleApk(context, bestApk)
+
+        // Install bundled OBBs
+        if (obbFiles.isNotEmpty()) {
+            val targetObbDir = File(app.containerDir, "external/obb").apply { mkdirs() }
+            for (obb in obbFiles) {
+                val destObb = File(targetObbDir, obb.name)
+                obb.copyTo(destObb, overwrite = true)
+                Log.i(TAG, "Placed bundled OBB: ${destObb.absolutePath} (${destObb.length()} bytes)")
+                if (app.isDataExposed) {
+                    try {
+                        val exposedObb = File(ContainerRegistry.getExposedDir(context, app), "obb/${obb.name}")
+                        exposedObb.parentFile?.mkdirs()
+                        obb.copyTo(exposedObb, overwrite = true)
+                    } catch (e: Throwable) {
+                        Log.w(TAG, "Failed to copy OBB to exposed storage", e)
+                    }
+                }
+            }
+        }
+
+        return app
+    }
+
+    private fun extractFromSingleApk(context: Context, apkFile: File): ContainerApp {
         val pm = context.packageManager
         val pkgInfo = pm.getPackageArchiveInfo(
             apkFile.absolutePath,

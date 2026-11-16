@@ -366,7 +366,6 @@ class VemodInstrumentation(
             Thread.currentThread().contextClassLoader = guestLoader
 
             VemodBridge.setActivePlugin(containerDir, guestLoader)
-            fixCpuAndAbiSpoofing(guestLoader)
 
             if (activePackageName != pkgName || guestAssets == null || guestResources == null) {
                 guestAssets = null
@@ -386,6 +385,7 @@ class VemodInstrumentation(
                     guestResources = pair.second
                 }
             }
+            fixCpuAndAbiSpoofing(guestLoader)
 
             if (launchActivity == "com.unity3d.player.UnityPlayerProxyActivity" ||
                 launchActivity == "com.unity3d.player.UnityPlayerNativeActivity") {
@@ -404,6 +404,7 @@ class VemodInstrumentation(
         return base.newActivity(cl, className, intent)
     }
 
+    @android.annotation.SuppressLint("BlockedPrivateApi")
     private fun prepareGuestActivity(activity: Activity) {
         val intent = activity.intent
         val pkgName = intent?.getStringExtra(GuestProxyActivity.EXTRA_PACKAGE_NAME) ?: activePackageName
@@ -1167,7 +1168,7 @@ class VemodInstrumentation(
             // 2. Patch Unity CPU detection (UnityPlayer.Q / com.unity3d.player.b)
             if (classLoader != null) {
                 try {
-                    val upClass = Class.forName("com.unity3d.player.UnityPlayer", true, classLoader)
+                    val upClass = Class.forName("com.unity3d.player.UnityPlayer", false, classLoader)
                     for (f in upClass.declaredFields) {
                         try {
                             f.isAccessible = true

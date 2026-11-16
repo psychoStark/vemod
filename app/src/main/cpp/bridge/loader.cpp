@@ -856,6 +856,31 @@ const std::string& get_guest_lib_dir() {
     return s_guest_lib_dir;
 }
 
+static std::string s_container_dir;
+static std::string s_guest_apk_path;
+
+void set_container_dir(const char* dir) {
+    if (dir) {
+        s_container_dir = dir;
+        s_guest_apk_path = s_container_dir + "/base.apk";
+    }
+}
+
+const std::string& get_container_dir() {
+    return s_container_dir;
+}
+
+const std::string& get_guest_apk_path() {
+    return s_guest_apk_path;
+}
+
+bool is_proc_self_exe(const char* path) {
+    if (!path) return false;
+    return strcmp(path, "/proc/self/exe") == 0 ||
+           strcmp(path, "/proc/thread-self/exe") == 0 ||
+           strcmp(path, "/proc/self/exe/") == 0;
+}
+
 bool is_sysroot_loaded() {
     return s_sysroot_loaded;
 }

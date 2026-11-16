@@ -74,20 +74,30 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun handleInstallIntent(intent: Intent?) {
-        val apkPath = intent?.getStringExtra("install_apk") ?: return
+        val apkPath = intent?.getStringExtra("install_apk")
+        val viewUri = if (intent?.action == Intent.ACTION_VIEW) intent.data else null
+
+        if (apkPath == null && viewUri == null) return
+
         thread {
             try {
-                val file = File(apkPath)
-                if (file.exists()) {
-                    val app = ApkExtractor.extractFromFile(this@MainActivity, file)
-                    ContainerRegistry.installToAppDrawer(this@MainActivity, app.packageName)
-                    runOnUiThread {
-                        globalRefreshTrigger++
-                        Toast.makeText(this@MainActivity, "Installed ${app.appName}!", Toast.LENGTH_SHORT).show()
-                    }
+                val app = if (viewUri != null) {
+                    ApkExtractor.extract(this@MainActivity, viewUri)
+                } else {
+                    val file = File(apkPath!!)
+                    if (!file.exists()) return@thread
+                    ApkExtractor.extractFromFile(this@MainActivity, file)
+                }
+                ContainerRegistry.installToAppDrawer(this@MainActivity, app.packageName)
+                runOnUiThread {
+                    globalRefreshTrigger++
+                    Toast.makeText(this@MainActivity, "Installed ${app.appName}!", Toast.LENGTH_SHORT).show()
                 }
             } catch (e: Throwable) {
-                Log.e(TAG, "Failed to auto-install APK from $apkPath", e)
+                Log.e(TAG, "Failed to auto-install package: ${e.message}", e)
+                runOnUiThread {
+                    Toast.makeText(this@MainActivity, "Failed to install: ${e.message}", Toast.LENGTH_LONG).show()
+                }
             }
         }
     }

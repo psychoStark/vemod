@@ -18,7 +18,8 @@
 namespace nb {
 namespace {
 
-constexpr u32 kMagic = 0x3150424e;  // "NBP1"
+constexpr u32 kMagicV1 = 0x31434d56;  // "VMC1" (Vemod Persistent Cache Format v1)
+constexpr u32 kMagicOld = 0x3150424e; // "NBP1" (Legacy Profile Magic)
 
 std::string profile_path() {
     u32 img_id = guest_image_id();
@@ -29,7 +30,16 @@ std::string profile_path() {
         if (isalnum(*p) || *p == '.' || *p == '_' || *p == '-') safe_lib += *p;
     }
     char fname[128];
-    snprintf(fname, sizeof(fname), "/ninbridge-blocks-%s-%08x.bin", safe_lib.c_str(), img_id);
+    snprintf(fname, sizeof(fname), "/vemod-vcache-%s-%08x.bin", safe_lib.c_str(), img_id);
+
+    const std::string& cdir = get_container_dir();
+    if (!cdir.empty()) {
+        std::string dir = cdir + "/cache";
+        mkdir(dir.c_str(), 0755);
+        if (access(dir.c_str(), W_OK) == 0) return dir + fname;
+        if (access(cdir.c_str(), W_OK) == 0) return cdir + fname;
+    }
+
     if (const char* d = getenv("NB_PROFILE_DIR")) return std::string(d) + fname;
     // The package name is our process name; its private data directory is writable.
     char cmd[256] = {};
@@ -41,7 +51,10 @@ std::string profile_path() {
     std::string pkg(cmd);
     if (auto colon = pkg.find(':'); colon != std::string::npos) pkg.resize(colon);
     std::string dir = "/data/data/" + pkg + "/files";
-    if (access(dir.c_str(), W_OK) != 0) return {};
+    if (access(dir.c_str(), W_OK) != 0) {
+        dir = "/data/user/0/" + pkg + "/files";
+        if (access(dir.c_str(), W_OK) != 0) return {};
+    }
     return dir + fname;
 }
 
@@ -65,11 +78,11 @@ void save_profile(Cpu& cpu) {
     std::string tmp = path + ".tmp";
     FILE* f = fopen(tmp.c_str(), "wb");
     if (!f) return;
-    u32 header[4] = {kMagic, guest_image_id(), u32(pcs.size()), 0};
+    u32 header[4] = {kMagicV1, guest_image_id(), u32(pcs.size()), 0};
     bool ok = fwrite(header, sizeof header, 1, f) == 1 && fwrite(pcs.data(), 4, pcs.size(), f) == pcs.size();
     ok = fclose(f) == 0 && ok;
     if (ok && rename(tmp.c_str(), path.c_str()) == 0) {
-        NB_LOGI("warmup: saved %zu compiled blocks", pcs.size());
+        NB_LOGI("warmup: saved %zu compiled blocks to %s", pcs.size(), path.c_str());
     } else {
         unlink(tmp.c_str());
     }
@@ -88,7 +101,9 @@ void warmup_precompile() {
     }
     u32 header[4];
     std::vector<u32> pcs;
-    if (fread(header, sizeof header, 1, f) == 1 && header[0] == kMagic && header[1] == guest_image_id() &&
+    if (fread(header, sizeof header, 1, f) == 1 &&
+        (header[0] == kMagicV1 || header[0] == kMagicOld) &&
+        header[1] == guest_image_id() &&
         header[2] < (1u << 22)) {
         pcs.resize(header[2]);
         if (fread(pcs.data(), 4, pcs.size(), f) != pcs.size()) pcs.clear();

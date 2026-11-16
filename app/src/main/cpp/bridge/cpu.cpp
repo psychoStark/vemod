@@ -4,12 +4,14 @@
 #include <linux/futex.h>
 #include <poll.h>
 #include <sched.h>
+#include <signal.h>
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/prctl.h>
 #include <sys/resource.h>
+#include <sys/select.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
@@ -22,6 +24,7 @@
 #include <sys/utsname.h>
 #include <sys/vfs.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 #ifdef __ANDROID__
@@ -58,6 +61,12 @@
 #ifndef SYS_getdents64
 #if defined(__NR_getdents64)
 #define SYS_getdents64 __NR_getdents64
+#endif
+#endif
+
+#ifndef SYS_getrandom
+#if defined(__NR_getrandom)
+#define SYS_getrandom __NR_getrandom
 #endif
 #endif
 
@@ -104,6 +113,10 @@ Import g_handlers[kMaxStubs];
 std::atomic<u32> g_handler_count{0};
 std::unordered_map<std::string, Handler> g_by_name;
 std::unordered_map<std::string, gaddr> g_data;
+
+std::mutex g_timer_mu;
+std::unordered_map<u32, timer_t> g_timer_map;
+std::atomic<u32> g_timer_seq{1};
 
 constexpr u32 kArmBxLr = 0xE12FFF1E;
 constexpr u32 kArmSvc = 0xEF000000;
@@ -666,7 +679,8 @@ static void do_syscall(Cpu& cpu) {
         return;
 
     // Futex & synchronization
-    case 240: {  // futex
+    case 240:
+    case 422: {  // futex / futex_time64
         if (!r[0] || !is_mapped(r[0])) {
             r[0] = u32(-EFAULT);
             return;
@@ -683,10 +697,15 @@ static void do_syscall(Cpu& cpu) {
         struct timespec host_ts;
         if (takes_timespec) {
             if (r[3] && is_mapped(r[3])) {
-                struct guest_ts { s32 sec; s32 nsec; };
-                guest_ts* gts = reinterpret_cast<guest_ts*>(h(r[3]));
-                host_ts.tv_sec = gts->sec;
-                host_ts.tv_nsec = gts->nsec;
+                if (nr == 422) {
+                    host_ts.tv_sec = rd<s64>(r[3] + 0);
+                    host_ts.tv_nsec = rd<s64>(r[3] + 8);
+                } else {
+                    struct guest_ts { s32 sec; s32 nsec; };
+                    guest_ts* gts = reinterpret_cast<guest_ts*>(h(r[3]));
+                    host_ts.tv_sec = gts->sec;
+                    host_ts.tv_nsec = gts->nsec;
+                }
                 arg4 = &host_ts;
             }
         } else if (takes_val2) {
@@ -695,6 +714,9 @@ static void do_syscall(Cpu& cpu) {
 
         void* uaddr2 = (takes_uaddr2 && r[4] && is_mapped(r[4])) ? h(r[4]) : nullptr;
         u32 val3 = r[5];
+        if ((cmd == FUTEX_WAIT_BITSET || cmd == FUTEX_WAKE_BITSET) && val3 == 0) {
+            val3 = 0xffffffff;  // FUTEX_BITSET_MATCH_ANY
+        }
 
         int res = syscall(SYS_futex, h(r[0]), r[1], r[2], arg4, uaddr2, val3);
         r[0] = res < 0 ? -errno : res;
@@ -761,8 +783,25 @@ static void do_syscall(Cpu& cpu) {
         return;
     }
     case 242: {  // sched_getaffinity
-        int res = sched_getaffinity(r[0], r[1], reinterpret_cast<cpu_set_t*>(h(r[2])));
-        r[0] = res < 0 ? -errno : res;
+        gaddr mask = r[2];
+        u32 len = r[1];
+        if (!mask || !is_mapped(mask) || len == 0) {
+            r[0] = u32(-EINVAL);
+            return;
+        }
+        int res = sched_getaffinity(r[0], len, reinterpret_cast<cpu_set_t*>(h(mask)));
+        if (res < 0) {
+            // Fallback for restricted sandboxes / OEM permission errors: populate with online cores
+            memset(h(mask), 0, len);
+            int ncpus = sysconf(_SC_NPROCESSORS_ONLN);
+            if (ncpus <= 0) ncpus = 4;
+            for (int i = 0; i < std::min<int>(ncpus, (int)len * 8); ++i) {
+                reinterpret_cast<u8*>(h(mask))[i / 8] |= (1u << (i % 8));
+            }
+            r[0] = std::min<u32>(len, 4);
+        } else {
+            r[0] = res;
+        }
         return;
     }
     case 238: {  // tkill(tid, sig)
@@ -941,7 +980,17 @@ static void do_syscall(Cpu& cpu) {
         return;
     }
     case 85: {  // readlink
-        ssize_t res = readlink(hs(r[0]), reinterpret_cast<char*>(h(r[1])), r[2]);
+        const char* p = hs(r[0]);
+        if (is_proc_self_exe(p)) {
+            const std::string& apk = get_guest_apk_path();
+            if (!apk.empty()) {
+                size_t len = std::min((size_t)r[2], apk.length());
+                memcpy(h(r[1]), apk.data(), len);
+                r[0] = len;
+                return;
+            }
+        }
+        ssize_t res = readlink(p, reinterpret_cast<char*>(h(r[1])), r[2]);
         r[0] = res < 0 ? -errno : res;
         return;
     }
@@ -953,6 +1002,56 @@ static void do_syscall(Cpu& cpu) {
     case 94: {  // fchmod
         int res = fchmod(r[0], r[1]);
         r[0] = res < 0 ? -errno : res;
+        return;
+    }
+    case 99: {  // statfs(path, buf)
+        struct statfs st;
+        int res = statfs(hs(r[0]), &st);
+        if (res < 0) {
+            r[0] = -errno;
+        } else {
+            gaddr buf = r[1];
+            if (buf && is_mapped(buf)) {
+                memset(h(buf), 0, 64);
+                wr<u32>(buf + 0, (u32)st.f_type);
+                wr<u32>(buf + 4, (u32)st.f_bsize);
+                wr<u32>(buf + 8, (u32)std::min<u64>(st.f_blocks, 0xffffffffULL));
+                wr<u32>(buf + 12, (u32)std::min<u64>(st.f_bfree, 0xffffffffULL));
+                wr<u32>(buf + 16, (u32)std::min<u64>(st.f_bavail, 0xffffffffULL));
+                wr<u32>(buf + 20, (u32)std::min<u64>(st.f_files, 0xffffffffULL));
+                wr<u32>(buf + 24, (u32)std::min<u64>(st.f_ffree, 0xffffffffULL));
+                memcpy(h(buf + 28), &st.f_fsid, 8);
+                wr<u32>(buf + 36, (u32)st.f_namelen);
+                wr<u32>(buf + 40, (u32)st.f_frsize);
+                wr<u32>(buf + 44, (u32)st.f_flags);
+            }
+            r[0] = 0;
+        }
+        return;
+    }
+    case 100: {  // fstatfs(fd, buf)
+        struct statfs st;
+        int res = fstatfs(r[0], &st);
+        if (res < 0) {
+            r[0] = -errno;
+        } else {
+            gaddr buf = r[1];
+            if (buf && is_mapped(buf)) {
+                memset(h(buf), 0, 64);
+                wr<u32>(buf + 0, (u32)st.f_type);
+                wr<u32>(buf + 4, (u32)st.f_bsize);
+                wr<u32>(buf + 8, (u32)std::min<u64>(st.f_blocks, 0xffffffffULL));
+                wr<u32>(buf + 12, (u32)std::min<u64>(st.f_bfree, 0xffffffffULL));
+                wr<u32>(buf + 16, (u32)std::min<u64>(st.f_bavail, 0xffffffffULL));
+                wr<u32>(buf + 20, (u32)std::min<u64>(st.f_files, 0xffffffffULL));
+                wr<u32>(buf + 24, (u32)std::min<u64>(st.f_ffree, 0xffffffffULL));
+                memcpy(h(buf + 28), &st.f_fsid, 8);
+                wr<u32>(buf + 36, (u32)st.f_namelen);
+                wr<u32>(buf + 40, (u32)st.f_frsize);
+                wr<u32>(buf + 44, (u32)st.f_flags);
+            }
+            r[0] = 0;
+        }
         return;
     }
     case 118: {  // fsync
@@ -977,6 +1076,56 @@ static void do_syscall(Cpu& cpu) {
             wr<s64>(res_ptr, res);
             r[0] = 0;
         }
+        return;
+    }
+    case 142: {  // _newselect
+        int nfds = r[0];
+        gaddr r_fds = r[1];
+        gaddr w_fds = r[2];
+        gaddr e_fds = r[3];
+        gaddr to_addr = r[4];
+
+        fd_set read_set, write_set, except_set;
+        fd_set* p_r = nullptr;
+        fd_set* p_w = nullptr;
+        fd_set* p_e = nullptr;
+
+        size_t fds_bytes = (nfds > 0 && nfds <= 1024) ? ((nfds + 7) / 8) : 128;
+        if (r_fds && is_mapped(r_fds)) {
+            FD_ZERO(&read_set);
+            memcpy(&read_set, h(r_fds), fds_bytes);
+            p_r = &read_set;
+        }
+        if (w_fds && is_mapped(w_fds)) {
+            FD_ZERO(&write_set);
+            memcpy(&write_set, h(w_fds), fds_bytes);
+            p_w = &write_set;
+        }
+        if (e_fds && is_mapped(e_fds)) {
+            FD_ZERO(&except_set);
+            memcpy(&except_set, h(e_fds), fds_bytes);
+            p_e = &except_set;
+        }
+
+        struct timeval host_tv{};
+        struct timeval* p_to = nullptr;
+        if (to_addr && is_mapped(to_addr)) {
+            host_tv.tv_sec = rd<s32>(to_addr + 0);
+            host_tv.tv_usec = rd<s32>(to_addr + 4);
+            p_to = &host_tv;
+        }
+
+        int res = select(nfds, p_r, p_w, p_e, p_to);
+        if (res > 0) {
+            if (p_r && r_fds && is_mapped(r_fds)) memcpy(h(r_fds), &read_set, fds_bytes);
+            if (p_w && w_fds && is_mapped(w_fds)) memcpy(h(w_fds), &write_set, fds_bytes);
+            if (p_e && e_fds && is_mapped(e_fds)) memcpy(h(e_fds), &except_set, fds_bytes);
+        }
+        if (p_to && to_addr && is_mapped(to_addr)) {
+            wr<s32>(to_addr + 0, s32(host_tv.tv_sec));
+            wr<s32>(to_addr + 4, s32(host_tv.tv_usec));
+        }
+        r[0] = res < 0 ? -errno : res;
         return;
     }
     case 145: {  // readv
@@ -1013,6 +1162,18 @@ static void do_syscall(Cpu& cpu) {
     }
     case 148: {  // fdatasync
         int res = fdatasync(r[0]);
+        r[0] = res < 0 ? -errno : res;
+        return;
+    }
+    case 168: {  // poll
+        gaddr fds = r[0];
+        nfds_t nfds = r[1];
+        int timeout = r[2];
+        if (!fds && nfds > 0) {
+            r[0] = u32(-EFAULT);
+            return;
+        }
+        int res = poll(reinterpret_cast<pollfd*>(h(fds)), nfds, timeout);
         r[0] = res < 0 ? -errno : res;
         return;
     }
@@ -1086,8 +1247,84 @@ static void do_syscall(Cpu& cpu) {
         r[0] = 1;
         return;
     }
+    case 141: {  // getdents (legacy 32-bit dirent)
+        int fd = r[0];
+        gaddr buf = r[1];
+        u32 count = r[2];
+        if (!buf || !is_mapped(buf) || count < 16) {
+            r[0] = u32(-EINVAL);
+            return;
+        }
+        std::vector<u8> kbuf(std::max(count * 2, 2048u));
+        int nread = syscall(SYS_getdents64, fd, kbuf.data(), kbuf.size());
+        if (nread <= 0) {
+            r[0] = nread < 0 ? -errno : 0;
+            return;
+        }
+        struct sys_d64 {
+            u64 d_ino;
+            s64 d_off;
+            u16 d_reclen;
+            u8  d_type;
+            char d_name[];
+        };
+        u32 in_pos = 0;
+        u32 out_pos = 0;
+        s64 last_off = 0;
+        while (in_pos < (u32)nread) {
+            auto* d64 = reinterpret_cast<sys_d64*>(kbuf.data() + in_pos);
+            if (d64->d_reclen == 0 || in_pos + d64->d_reclen > (u32)nread) break;
+            size_t namlen = strlen(d64->d_name);
+            u16 reclen = (10 + namlen + 1 + 1 + 3) & ~3;  // 10 bytes prefix (4 ino + 4 off + 2 reclen) + name + null + d_type
+            if (out_pos + reclen > count) {
+                // Buffer full: seek directory back to last consumed entry
+                if (last_off != 0) {
+                    lseek(fd, last_off, SEEK_SET);
+                }
+                break;
+            }
+            gaddr cur = buf + out_pos;
+            wr<u32>(cur + 0, (u32)d64->d_ino);
+            wr<u32>(cur + 4, (u32)(d64->d_off & 0x7fffffff));
+            wr<u16>(cur + 8, reclen);
+            memcpy(h(cur + 10), d64->d_name, namlen + 1);
+            memset(h(cur + 10 + namlen + 1), 0, reclen - (10 + namlen + 1));
+            wr<u8>(cur + reclen - 1, d64->d_type);
+            last_off = d64->d_off;
+            out_pos += reclen;
+            in_pos += d64->d_reclen;
+        }
+        r[0] = out_pos;
+        return;
+    }
     case 217: {  // getdents64
-        int res = syscall(SYS_getdents64, r[0], h(r[1]), r[2]);
+        int fd = r[0];
+        gaddr buf = r[1];
+        u32 count = r[2];
+        if (!buf || !is_mapped(buf)) {
+            r[0] = u32(-EINVAL);
+            return;
+        }
+        int res = syscall(SYS_getdents64, fd, h(buf), count);
+        if (res > 0) {
+            struct sys_d64 {
+                u64 d_ino;
+                s64 d_off;
+                u16 d_reclen;
+                u8  d_type;
+                char d_name[];
+            };
+            u32 pos = 0;
+            while (pos < (u32)res) {
+                auto* d = reinterpret_cast<sys_d64*>(static_cast<char*>(h(buf)) + pos);
+                if (d->d_reclen == 0 || pos + d->d_reclen > (u32)res) break;
+                // Clamp 64-bit ext4 directory cookie to avoid 32-bit signed overflow (-EOVERFLOW / 75)
+                if (d->d_off > 0x7fffffffLL) {
+                    d->d_off = d->d_off & 0x7fffffffLL;
+                }
+                pos += d->d_reclen;
+            }
+        }
         r[0] = res < 0 ? -errno : res;
         return;
     }
@@ -1135,7 +1372,17 @@ static void do_syscall(Cpu& cpu) {
         return;
     }
     case 332: {  // readlinkat
-        ssize_t res = readlinkat(r[0], hs(r[1]), reinterpret_cast<char*>(h(r[2])), r[3]);
+        const char* p = hs(r[1]);
+        if (is_proc_self_exe(p)) {
+            const std::string& apk = get_guest_apk_path();
+            if (!apk.empty()) {
+                size_t len = std::min((size_t)r[3], apk.length());
+                memcpy(h(r[2]), apk.data(), len);
+                r[0] = len;
+                return;
+            }
+        }
+        ssize_t res = readlinkat(r[0], p, reinterpret_cast<char*>(h(r[2])), r[3]);
         r[0] = res < 0 ? -errno : res;
         return;
     }
@@ -1144,8 +1391,61 @@ static void do_syscall(Cpu& cpu) {
         r[0] = res < 0 ? -errno : res;
         return;
     }
-    case 334: {  // faccessat
+    case 334:   // faccessat
+    case 439: { // faccessat2
         int res = faccessat(r[0], hs(r[1]), r[2], r[3]);
+        r[0] = res < 0 ? -errno : res;
+        return;
+    }
+    case 335:
+    case 413: {  // pselect6 / pselect6_time64
+        int nfds = r[0];
+        gaddr r_fds = r[1];
+        gaddr w_fds = r[2];
+        gaddr e_fds = r[3];
+        gaddr to_addr = r[4];
+
+        fd_set read_set, write_set, except_set;
+        fd_set* p_r = nullptr;
+        fd_set* p_w = nullptr;
+        fd_set* p_e = nullptr;
+
+        size_t fds_bytes = (nfds > 0 && nfds <= 1024) ? ((nfds + 7) / 8) : 128;
+        if (r_fds && is_mapped(r_fds)) {
+            FD_ZERO(&read_set);
+            memcpy(&read_set, h(r_fds), fds_bytes);
+            p_r = &read_set;
+        }
+        if (w_fds && is_mapped(w_fds)) {
+            FD_ZERO(&write_set);
+            memcpy(&write_set, h(w_fds), fds_bytes);
+            p_w = &write_set;
+        }
+        if (e_fds && is_mapped(e_fds)) {
+            FD_ZERO(&except_set);
+            memcpy(&except_set, h(e_fds), fds_bytes);
+            p_e = &except_set;
+        }
+
+        struct timespec host_ts{};
+        struct timespec* p_ts = nullptr;
+        if (to_addr && is_mapped(to_addr)) {
+            if (nr == 413) {
+                host_ts.tv_sec = rd<s64>(to_addr + 0);
+                host_ts.tv_nsec = rd<s64>(to_addr + 8);
+            } else {
+                host_ts.tv_sec = rd<s32>(to_addr + 0);
+                host_ts.tv_nsec = rd<s32>(to_addr + 4);
+            }
+            p_ts = &host_ts;
+        }
+
+        int res = pselect(nfds, p_r, p_w, p_e, p_ts, nullptr);
+        if (res > 0) {
+            if (p_r && r_fds && is_mapped(r_fds)) memcpy(h(r_fds), &read_set, fds_bytes);
+            if (p_w && w_fds && is_mapped(w_fds)) memcpy(h(w_fds), &write_set, fds_bytes);
+            if (p_e && e_fds && is_mapped(e_fds)) memcpy(h(e_fds), &except_set, fds_bytes);
+        }
         r[0] = res < 0 ? -errno : res;
         return;
     }
@@ -1213,6 +1513,143 @@ static void do_syscall(Cpu& cpu) {
         }
         return;
     }
+    case 257: {  // timer_create(clockid, evp, timerid)
+        clockid_t clock_id = r[0];
+        gaddr evp = r[1];
+        gaddr id_ptr = r[2];
+        if (!id_ptr || !is_mapped(id_ptr)) {
+            r[0] = u32(-EFAULT);
+            return;
+        }
+        struct sigevent host_sev{};
+        struct sigevent* p_sev = nullptr;
+        if (evp && is_mapped(evp)) {
+            host_sev.sigev_value.sival_int = rd<s32>(evp + 0);
+            host_sev.sigev_signo = rd<s32>(evp + 4);
+            host_sev.sigev_notify = rd<s32>(evp + 8);
+            p_sev = &host_sev;
+        }
+        timer_t host_t = nullptr;
+        int res = timer_create(clock_id, p_sev, &host_t);
+        if (res < 0) {
+            r[0] = -errno;
+        } else {
+            u32 gid;
+            {
+                std::lock_guard lk(g_timer_mu);
+                gid = g_timer_seq.fetch_add(1);
+                g_timer_map[gid] = host_t;
+            }
+            wr<u32>(id_ptr, gid);
+            r[0] = 0;
+        }
+        return;
+    }
+    case 258: {  // timer_settime(timerid, flags, new_value, old_value)
+        u32 gid = r[0];
+        int flags = r[1];
+        gaddr new_addr = r[2];
+        gaddr old_addr = r[3];
+        timer_t host_t = nullptr;
+        {
+            std::lock_guard lk(g_timer_mu);
+            auto it = g_timer_map.find(gid);
+            if (it == g_timer_map.end()) {
+                r[0] = u32(-EINVAL);
+                return;
+            }
+            host_t = it->second;
+        }
+        struct itimerspec new_ts{}, old_ts{};
+        if (new_addr && is_mapped(new_addr)) {
+            new_ts.it_interval.tv_sec = rd<s32>(new_addr + 0);
+            new_ts.it_interval.tv_nsec = rd<s32>(new_addr + 4);
+            new_ts.it_value.tv_sec = rd<s32>(new_addr + 8);
+            new_ts.it_value.tv_nsec = rd<s32>(new_addr + 12);
+        }
+        int res = timer_settime(host_t, flags, new_addr ? &new_ts : nullptr, old_addr ? &old_ts : nullptr);
+        if (res < 0) {
+            r[0] = -errno;
+        } else {
+            if (old_addr && is_mapped(old_addr)) {
+                wr<s32>(old_addr + 0, s32(old_ts.it_interval.tv_sec));
+                wr<s32>(old_addr + 4, s32(old_ts.it_interval.tv_nsec));
+                wr<s32>(old_addr + 8, s32(old_ts.it_value.tv_sec));
+                wr<s32>(old_addr + 12, s32(old_ts.it_value.tv_nsec));
+            }
+            r[0] = 0;
+        }
+        return;
+    }
+    case 259: {  // timer_gettime(timerid, curr_value)
+        u32 gid = r[0];
+        gaddr cur_addr = r[1];
+        if (!cur_addr || !is_mapped(cur_addr)) {
+            r[0] = u32(-EFAULT);
+            return;
+        }
+        timer_t host_t = nullptr;
+        {
+            std::lock_guard lk(g_timer_mu);
+            auto it = g_timer_map.find(gid);
+            if (it == g_timer_map.end()) {
+                r[0] = u32(-EINVAL);
+                return;
+            }
+            host_t = it->second;
+        }
+        struct itimerspec cur_ts{};
+        int res = timer_gettime(host_t, &cur_ts);
+        if (res < 0) {
+            r[0] = -errno;
+        } else {
+            wr<s32>(cur_addr + 0, s32(cur_ts.it_interval.tv_sec));
+            wr<s32>(cur_addr + 4, s32(cur_ts.it_interval.tv_nsec));
+            wr<s32>(cur_addr + 8, s32(cur_ts.it_value.tv_sec));
+            wr<s32>(cur_addr + 12, s32(cur_ts.it_value.tv_nsec));
+            r[0] = 0;
+        }
+        return;
+    }
+    case 260: {  // timer_getoverrun(timerid)
+        u32 gid = r[0];
+        timer_t host_t = nullptr;
+        {
+            std::lock_guard lk(g_timer_mu);
+            auto it = g_timer_map.find(gid);
+            if (it == g_timer_map.end()) {
+                r[0] = u32(-EINVAL);
+                return;
+            }
+            host_t = it->second;
+        }
+        int res = timer_getoverrun(host_t);
+        r[0] = res < 0 ? -errno : res;
+        return;
+    }
+    case 261: {  // timer_delete(timerid)
+        u32 gid = r[0];
+        timer_t host_t = nullptr;
+        {
+            std::lock_guard lk(g_timer_mu);
+            auto it = g_timer_map.find(gid);
+            if (it == g_timer_map.end()) {
+                r[0] = u32(-EINVAL);
+                return;
+            }
+            host_t = it->second;
+            g_timer_map.erase(it);
+        }
+        int res = timer_delete(host_t);
+        r[0] = res < 0 ? -errno : res;
+        return;
+    }
+    case 262: {  // clock_settime
+        struct timespec ts = {rd<s32>(r[1]), rd<s32>(r[1] + 4)};
+        int res = clock_settime(r[0], &ts);
+        r[0] = res < 0 ? -errno : res;
+        return;
+    }
     case 263: {  // clock_gettime
         struct timespec ts;
         int res = clock_gettime(r[0], &ts);
@@ -1249,6 +1686,53 @@ static void do_syscall(Cpu& cpu) {
             if (r[3] && !r[1]) {
                 wr<s32>(r[3], s32(rem.tv_sec));
                 wr<s32>(r[3] + 4, s32(rem.tv_nsec));
+            }
+            r[0] = 0;
+        }
+        return;
+    }
+    case 403: {  // clock_gettime64
+        struct timespec ts;
+        int res = clock_gettime(r[0], &ts);
+        if (res < 0) {
+            r[0] = -errno;
+        } else {
+            wr<s64>(r[1] + 0, s64(ts.tv_sec));
+            wr<s64>(r[1] + 8, s64(ts.tv_nsec));
+            r[0] = 0;
+        }
+        return;
+    }
+    case 404: {  // clock_settime64
+        struct timespec ts = {time_t(rd<s64>(r[1])), long(rd<s64>(r[1] + 8))};
+        int res = clock_settime(r[0], &ts);
+        r[0] = res < 0 ? -errno : res;
+        return;
+    }
+    case 406: {  // clock_getres_time64
+        struct timespec ts;
+        int res = clock_getres(r[0], &ts);
+        if (res < 0) {
+            r[0] = -errno;
+        } else {
+            if (r[1]) {
+                wr<s64>(r[1] + 0, s64(ts.tv_sec));
+                wr<s64>(r[1] + 8, s64(ts.tv_nsec));
+            }
+            r[0] = 0;
+        }
+        return;
+    }
+    case 407: {  // clock_nanosleep_time64
+        struct timespec req = {time_t(rd<s64>(r[2])), long(rd<s64>(r[2] + 8))};
+        struct timespec rem = {};
+        int res = clock_nanosleep(r[0], r[1], &req, r[3] ? &rem : nullptr);
+        if (res != 0) {
+            r[0] = -res;
+        } else {
+            if (r[3] && !r[1]) {
+                wr<s64>(r[3] + 0, s64(rem.tv_sec));
+                wr<s64>(r[3] + 8, s64(rem.tv_nsec));
             }
             r[0] = 0;
         }
@@ -1489,8 +1973,79 @@ static void do_syscall(Cpu& cpu) {
     }
 
     // Sockets & IPC
+    case 250: {  // epoll_create
+        int res = epoll_create(r[0]);
+        r[0] = res < 0 ? -errno : res;
+        return;
+    }
     case 251: {  // epoll_ctl
-        int res = epoll_ctl(r[0], r[1], r[2], reinterpret_cast<epoll_event*>(h(r[3])));
+        int epfd = r[0];
+        int op = r[1];
+        int fd = r[2];
+        gaddr ev_addr = r[3];
+        struct epoll_event host_ev{};
+        struct epoll_event* p_ev = nullptr;
+        if (ev_addr && is_mapped(ev_addr)) {
+            host_ev.events = rd<u32>(ev_addr);
+            host_ev.data.u64 = rd<u64>(ev_addr + 4);
+            p_ev = &host_ev;
+        }
+        int res = epoll_ctl(epfd, op, fd, p_ev);
+        r[0] = res < 0 ? -errno : res;
+        return;
+    }
+    case 252: {  // epoll_wait
+        int epfd = r[0];
+        gaddr ev_addr = r[1];
+        int maxevents = r[2];
+        int timeout = r[3];
+        if (maxevents <= 0 || !ev_addr || !is_mapped(ev_addr)) {
+            r[0] = u32(-EINVAL);
+            return;
+        }
+        int safe_max = std::min(maxevents, 128);
+        struct epoll_event host_events[128];
+        int res = epoll_wait(epfd, host_events, safe_max, timeout);
+        if (res > 0) {
+            for (int i = 0; i < res; ++i) {
+                gaddr out = ev_addr + i * 12;
+                wr<u32>(out + 0, host_events[i].events);
+                wr<u64>(out + 4, host_events[i].data.u64);
+            }
+        }
+        r[0] = res < 0 ? -errno : res;
+        return;
+    }
+    case 346: {  // epoll_pwait
+        int epfd = r[0];
+        gaddr ev_addr = r[1];
+        int maxevents = r[2];
+        int timeout = r[3];
+        gaddr sigmask_addr = r[4];
+        sigset_t host_sigmask;
+        sigset_t* p_sigmask = nullptr;
+        if (sigmask_addr && is_mapped(sigmask_addr)) {
+            sigemptyset(&host_sigmask);
+            u32 gsig = rd<u32>(sigmask_addr);
+            for (int s = 1; s <= 32; ++s) {
+                if (gsig & (1u << (s - 1))) sigaddset(&host_sigmask, s);
+            }
+            p_sigmask = &host_sigmask;
+        }
+        if (maxevents <= 0 || !ev_addr || !is_mapped(ev_addr)) {
+            r[0] = u32(-EINVAL);
+            return;
+        }
+        int safe_max = std::min(maxevents, 128);
+        struct epoll_event host_events[128];
+        int res = epoll_pwait(epfd, host_events, safe_max, timeout, p_sigmask);
+        if (res > 0) {
+            for (int i = 0; i < res; ++i) {
+                gaddr out = ev_addr + i * 12;
+                wr<u32>(out + 0, host_events[i].events);
+                wr<u64>(out + 4, host_events[i].data.u64);
+            }
+        }
         r[0] = res < 0 ? -errno : res;
         return;
     }
@@ -1511,6 +2066,12 @@ static void do_syscall(Cpu& cpu) {
     }
     case 284: {  // listen
         int res = listen(r[0], r[1]);
+        r[0] = res < 0 ? -errno : res;
+        return;
+    }
+    case 285: {  // accept
+        int res = accept(r[0], reinterpret_cast<sockaddr*>(h(r[1])),
+                         reinterpret_cast<socklen_t*>(h(r[2])));
         r[0] = res < 0 ? -errno : res;
         return;
     }
@@ -1542,6 +2103,11 @@ static void do_syscall(Cpu& cpu) {
         r[0] = res < 0 ? -errno : res;
         return;
     }
+    case 293: {  // shutdown
+        int res = shutdown(r[0], r[1]);
+        r[0] = res < 0 ? -errno : res;
+        return;
+    }
     case 294: {  // setsockopt
         int res = setsockopt(r[0], r[1], r[2], h(r[3]), r[4]);
         r[0] = res < 0 ? -errno : res;
@@ -1549,6 +2115,73 @@ static void do_syscall(Cpu& cpu) {
     }
     case 295: {  // getsockopt
         int res = getsockopt(r[0], r[1], r[2], h(r[3]), reinterpret_cast<socklen_t*>(h(r[4])));
+        r[0] = res < 0 ? -errno : res;
+        return;
+    }
+    case 296: {  // sendmsg
+        int fd = r[0];
+        gaddr g_msg = r[1];
+        int flags = r[2];
+        if (!g_msg || !is_mapped(g_msg)) { r[0] = u32(-EFAULT); return; }
+        gaddr name_p = rd<u32>(g_msg + 0);
+        u32 namelen = rd<u32>(g_msg + 4);
+        gaddr iov_p = rd<u32>(g_msg + 8);
+        u32 iovcnt = rd<u32>(g_msg + 12);
+        gaddr ctl_p = rd<u32>(g_msg + 16);
+        u32 ctllen = rd<u32>(g_msg + 20);
+
+        if (iovcnt > 1024) { r[0] = u32(-EINVAL); return; }
+        std::vector<iovec> h_iov(iovcnt);
+        for (u32 i = 0; i < iovcnt; ++i) {
+            h_iov[i].iov_base = h(rd<u32>(iov_p + i * 8));
+            h_iov[i].iov_len = rd<u32>(iov_p + i * 8 + 4);
+        }
+        msghdr h_msg{};
+        h_msg.msg_name = name_p ? h(name_p) : nullptr;
+        h_msg.msg_namelen = namelen;
+        h_msg.msg_iov = h_iov.data();
+        h_msg.msg_iovlen = iovcnt;
+        h_msg.msg_control = ctl_p ? h(ctl_p) : nullptr;
+        h_msg.msg_controllen = ctllen;
+        h_msg.msg_flags = 0;
+
+        ssize_t res = sendmsg(fd, &h_msg, flags);
+        r[0] = res < 0 ? -errno : res;
+        return;
+    }
+    case 297: {  // recvmsg
+        int fd = r[0];
+        gaddr g_msg = r[1];
+        int flags = r[2];
+        if (!g_msg || !is_mapped(g_msg)) { r[0] = u32(-EFAULT); return; }
+        gaddr name_p = rd<u32>(g_msg + 0);
+        u32 namelen = rd<u32>(g_msg + 4);
+        gaddr iov_p = rd<u32>(g_msg + 8);
+        u32 iovcnt = rd<u32>(g_msg + 12);
+        gaddr ctl_p = rd<u32>(g_msg + 16);
+        u32 ctllen = rd<u32>(g_msg + 20);
+
+        if (iovcnt > 1024) { r[0] = u32(-EINVAL); return; }
+        std::vector<iovec> h_iov(iovcnt);
+        for (u32 i = 0; i < iovcnt; ++i) {
+            h_iov[i].iov_base = h(rd<u32>(iov_p + i * 8));
+            h_iov[i].iov_len = rd<u32>(iov_p + i * 8 + 4);
+        }
+        msghdr h_msg{};
+        h_msg.msg_name = name_p ? h(name_p) : nullptr;
+        h_msg.msg_namelen = namelen;
+        h_msg.msg_iov = h_iov.data();
+        h_msg.msg_iovlen = iovcnt;
+        h_msg.msg_control = ctl_p ? h(ctl_p) : nullptr;
+        h_msg.msg_controllen = ctllen;
+        h_msg.msg_flags = 0;
+
+        ssize_t res = recvmsg(fd, &h_msg, flags);
+        if (res >= 0) {
+            wr<u32>(g_msg + 4, h_msg.msg_namelen);
+            wr<u32>(g_msg + 20, h_msg.msg_controllen);
+            wr<s32>(g_msg + 24, h_msg.msg_flags);
+        }
         r[0] = res < 0 ? -errno : res;
         return;
     }
@@ -1567,6 +2200,18 @@ static void do_syscall(Cpu& cpu) {
         r[0] = res < 0 ? -errno : res;
         return;
     }
+    case 338: {  // set_robust_list
+        cpu.thread->robust_list_head = r[0];
+        cpu.thread->robust_list_len = r[1];
+        r[0] = 0;
+        return;
+    }
+    case 339: {  // get_robust_list
+        if (r[1] && is_mapped(r[1])) wr<u32>(r[1], cpu.thread->robust_list_head);
+        if (r[2] && is_mapped(r[2])) wr<u32>(r[2], cpu.thread->robust_list_len);
+        r[0] = 0;
+        return;
+    }
     case 356: {  // eventfd2
         int res = eventfd(r[0], r[1]);
         r[0] = res < 0 ? -errno : res;
@@ -1581,6 +2226,53 @@ static void do_syscall(Cpu& cpu) {
         int res = accept4(r[0], reinterpret_cast<sockaddr*>(h(r[1])),
                           reinterpret_cast<socklen_t*>(h(r[2])), r[3]);
         r[0] = res < 0 ? -errno : res;
+        return;
+    }
+    case 384: {  // getrandom
+        gaddr buf = r[0];
+        size_t buflen = r[1];
+        unsigned int flags = r[2];
+        if (!buf || !is_mapped(buf)) {
+            r[0] = u32(-EFAULT);
+            return;
+        }
+#if defined(SYS_getrandom)
+        ssize_t res = syscall(SYS_getrandom, h(buf), buflen, flags);
+        r[0] = res < 0 ? -errno : res;
+#elif defined(__NR_getrandom)
+        ssize_t res = syscall(__NR_getrandom, h(buf), buflen, flags);
+        r[0] = res < 0 ? -errno : res;
+#else
+        int urfd = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
+        if (urfd >= 0) {
+            ssize_t n = read(urfd, h(buf), buflen);
+            close(urfd);
+            r[0] = n < 0 ? -errno : n;
+        } else {
+            r[0] = u32(-ENOSYS);
+        }
+#endif
+        return;
+    }
+    case 436: {  // close_range
+        u32 first = r[0];
+        u32 last = r[1];
+        if (first > last) {
+            r[0] = u32(-EINVAL);
+            return;
+        }
+#if defined(__NR_close_range)
+        int res = syscall(__NR_close_range, first, last, r[2]);
+        if (res == 0) {
+            r[0] = 0;
+            return;
+        }
+#endif
+        u32 cap = std::min(last, 1024u);
+        for (u32 fd = first; fd <= cap; ++fd) {
+            close(fd);
+        }
+        r[0] = 0;
         return;
     }
 
