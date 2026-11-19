@@ -747,7 +747,7 @@ Neutralizes permanently defunct ad networks (`AdColony`, `Chartboost`, `Flurry`,
 * **PermissionManager & IPermissionManager Virtualization:** Dynamically proxies `android.permission.IPermissionManager` across `ActivityThread.sPermissionManager` and `ApplicationPackageManager.mPermissionManager`, granting requested legacy permissions (e.g. `android.permission.INTERNET`, `android.permission.ACCESS_NETWORK_STATE`) to prevent legacy SDK assertion failures.
 * **PendingIntent Mutability:** Injects `FLAG_IMMUTABLE` into legacy `PendingIntent` instances to satisfy Android 12+ requirements.
 * **Package UID Ownership:** Rewrites guest package names to the host package (`com.psychostark.vemod`) for `INotificationManager`, `IActivityManager`, and `AudioService`.
-* **Dynamic Package Metadata:** Dynamically synthesizes `PackageInfo` and `ApplicationInfo` containing authentic guest metadata and Google Play Services versions.
+* **Dynamic Package Metadata & microG IPC Routing:** Dynamically synthesizes `PackageInfo` and `ApplicationInfo` containing authentic guest metadata and Google Play Services versions, mapping IPC service bindings and sign-in intents directly to host microG providers (`app.revanced.android.gms`, `org.microg.gms.core`, `com.google.android.gms`).
 
 ### Pillar 5: Hardware-Accelerated Graphics & Audio Virtualization
 * **Dual-Pipeline GLES Bridge & Extensions:** Direct hardware pass-through for 141+ OpenGL ES 2.0 functions alongside fixed-function OpenGL ES 1.1 with native fixed-point `glTexEnvx` and `glTexParameterx`/`glTexParameterxv` translation. Full support for instancing, 32-bit safe shadow buffer mapping, queries, blit/discard, fences, MRT, transform feedback, and dynamic fallback stub generation in `x_eglGetProcAddress`.

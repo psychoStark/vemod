@@ -12,6 +12,7 @@ Got a newer phone running Android 14, 15, or 16 (like the Pixel 8/9, Galaxy S24,
 
 - 🕹️ **Revive Classic Games & Apps:** Play legendary classics like original *Flappy Bird*, classic *Angry Birds* games, early *Temple Run*, *Reckless Racing*, *Spider-Man Unlimited*, and vintage Android apps that modern phones dropped support for.
 - 🚀 **No Root Needed:** Runs 100% in user space on stock Android 14, 15, and 16.
+- 🌐 **Google Play Games & microG Integration:** Native compatibility with open-source microG and ReVanced GmsCore for authentic Google Play Games sign-in, cloud saves, and achievements—plus a safe, compliant offline fallback when microG is absent.
 - 📱 **Home Screen Shortcuts & App Drawer Slots:** Pin installed games directly to your launcher or assign them to native system app drawer launcher shortcuts.
 - ⚡ **Smooth & Fast:** AOT precompiled code cache, direct GPU passthrough (GLES 1.1 / 2.0 / 3.0), OpenSL ES low-latency audio, and 60 FPS pacing.
 - 📦 **One-Click APK / XAPK / APKS Installer:** Pick `.apk`, `.xapk`, or `.apks` files with automatic `.obb` expansion extraction.
@@ -40,6 +41,11 @@ Modern smartphone processors (like Snapdragon 8 Gen 3, Google Tensor G3/G4) drop
 <details>
 <summary><b>Do I need to root my device?</b></summary>
 No! Vemod works entirely as a normal, safe Android app without root permissions.
+</details>
+
+<details>
+<summary><b>Can I sign in to Google Play Games and sync cloud saves?</b></summary>
+Yes! Vemod provides native support for open-source <b>microG</b> (including ReVanced GmsCore). Simply install microG on your device, and Vemod will automatically route Google Play Services IPC, account selection, and cloud saves directly to microG. If microG is not installed, games cleanly fall back to offline mode without crashing.
 </details>
 
 <details>
@@ -99,7 +105,7 @@ The native C++ layer (Dynarmic JIT, bridge, GLES, OpenSL ES) is built via CMake.
 
 Because Vemod runs as a 100% userspace container without device root, kernel modules, or low-level OS modifications:
 - **Play Integrity & SafetyNet:** Hardware attestation cannot be passed for apps requiring certified OEM keybox signatures.
-- **Live Google Play Games Cloud Sync & Multiplayer:** Online multiplayer frameworks requiring signed Google Play Services IPC may run in offline guest mode or show mock sign-in.
+- **Google Services Without microG:** Games requiring Google Play Services will run in offline guest mode unless microG or ReVanced GmsCore is installed.
 - **Custom Hardware Drivers:** External accessories requiring proprietary kernel USB/Bluetooth drivers are not supported.
 
 ---
