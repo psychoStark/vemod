@@ -1,0 +1,1076 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "Vemod: 32-Bit Android APK Container Architecture",
+    "subtitle": "Userspace Virtualization, Multi-Process Isolation, Dynarmic ARM32 JIT & Hardware Passthrough",
+    "output": "vemod.html",
+    "quality_profile": "showcase",
+    "locale": "en",
+    "repository": {
+      "url": "https://github.com/psychoStark/vemod.git",
+      "revision": "76415d8fb7b1ece6c2d38252c79041b199d051ec",
+      "provider": "github",
+      "link_mode": "web"
+    },
+    "views": [
+      {
+        "id": "view-overview",
+        "label": "End-to-End System Overview",
+        "focus": [
+          "c_user",
+          "c_manager",
+          "c_proxy_act",
+          "c_instrumentation",
+          "c_dynarmic",
+          "c_gles",
+          "c_host_gpu"
+        ],
+        "note": "High-level execution journey from user entry down to GPU/Audio hardware passthrough."
+      },
+      {
+        "id": "view-ingestion",
+        "label": "Multi-APK Ingestion & Stub Synthesis",
+        "focus": [
+          "c_manager",
+          "c_extractor",
+          "c_registry",
+          "c_stub_gen",
+          "c_drawer",
+          "c_shortcut"
+        ],
+        "note": "Dynamic ingestion, OBB extraction, AXML binary rewriting, and companion APK signing."
+      },
+      {
+        "id": "view-virtualization",
+        "label": "Process Isolation & Framework Hooks",
+        "focus": [
+          "c_proc_mgr",
+          "c_proxy_act",
+          "c_hook_proxies",
+          "c_instrumentation",
+          "c_guest_ctx",
+          "c_touch_pacer"
+        ],
+        "note": "Isolated slot allocation (:guest1..:guest5), Context/Resource swap, TouchPacer, and system hooks."
+      },
+      {
+        "id": "view-native-bridge",
+        "label": "Native Bridge & Linker Virtualization",
+        "focus": [
+          "c_classloader",
+          "c_proxy_so",
+          "c_native_disp",
+          "c_loader",
+          "c_memory",
+          "c_jni_bridge"
+        ],
+        "note": "64-bit proxy stubs, multi-module ELF loading (APS2 relocations), and 4 GB virtual memory arena."
+      },
+      {
+        "id": "view-execution",
+        "label": "Dynarmic JIT & Syscall Emulation",
+        "focus": [
+          "c_dynarmic",
+          "c_warmup",
+          "c_bionic",
+          "c_syscall",
+          "c_eabi_math",
+          "c_zlib_bridge"
+        ],
+        "note": "Cycle-guarded ARM32 JIT recompiler, .vcache persistent warmup, Bionic sysroot, and 125+ syscalls."
+      }
+    ]
+  },
+  "components": [
+    {
+      "id": "c_user",
+      "type": "external",
+      "label": "Host 64-Bit Android Device",
+      "sublabel": "Snapdragon / Tensor / Dimensity (AArch64)",
+      "icon": "person",
+      "pos": [
+        460,
+        40
+      ],
+      "size": [
+        240,
+        60
+      ]
+    },
+    {
+      "id": "c_drawer",
+      "type": "frontend",
+      "label": "System App Drawer",
+      "sublabel": "Signed Micro-Stubs (com.vemod.container_<pkg>)",
+      "icon": "frontend",
+      "pos": [
+        80,
+        160
+      ],
+      "size": [
+        240,
+        60
+      ]
+    },
+    {
+      "id": "c_shortcut",
+      "type": "frontend",
+      "label": "Home Screen Shortcuts",
+      "sublabel": "1x1 Pinned Shortcuts (ShortcutManagerCompat)",
+      "icon": "frontend",
+      "sources": [
+        {
+          "path": "app/src/main/java/com/vemod/container/container/ContainerRegistry.kt",
+          "line": 147,
+          "end_line": 180,
+          "label": "pinShortcut"
+        }
+      ],
+      "pos": [
+        460,
+        160
+      ],
+      "size": [
+        240,
+        60
+      ]
+    },
+    {
+      "id": "c_manager",
+      "type": "frontend",
+      "label": "Vemod Manager UI",
+      "sublabel": "MainActivity (Jetpack Compose Material 3)",
+      "icon": "frontend",
+      "sources": [
+        {
+          "path": "app/src/main/java/com/vemod/container/ui/MainActivity.kt",
+          "line": 76,
+          "end_line": 120,
+          "label": "handleInstallIntent"
+        }
+      ],
+      "pos": [
+        840,
+        160
+      ],
+      "size": [
+        240,
+        60
+      ]
+    },
+    {
+      "id": "c_stub_gen",
+      "type": "backend",
+      "label": "StubApkGenerator",
+      "sublabel": "On-Device AXML/ARSC Rewriter & APK Signer",
+      "icon": "backend",
+      "sources": [
+        {
+          "path": "app/src/main/java/com/vemod/container/container/StubApkGenerator.kt",
+          "line": 53,
+          "end_line": 110,
+          "label": "generateStubApk"
+        }
+      ],
+      "pos": [
+        80,
+        280
+      ],
+      "size": [
+        240,
+        60
+      ]
+    },
+    {
+      "id": "c_registry",
+      "type": "database",
+      "label": "ContainerRegistry & Storage",
+      "sublabel": "meta.json & Exposed Storage (/sdcard/vemod)",
+      "icon": "database",
+      "sources": [
+        {
+          "path": "app/src/main/java/com/vemod/container/container/ContainerRegistry.kt",
+          "line": 20,
+          "end_line": 60,
+          "label": "getApps"
+        }
+      ],
+      "pos": [
+        460,
+        280
+      ],
+      "size": [
+        240,
+        60
+      ]
+    },
+    {
+      "id": "c_extractor",
+      "type": "backend",
+      "label": "ApkExtractor",
+      "sublabel": "Unpack APK/XAPK, OBB & 32-Bit lib32/ Proxy",
+      "icon": "backend",
+      "sources": [
+        {
+          "path": "app/src/main/java/com/vemod/container/container/ApkExtractor.kt",
+          "line": 53,
+          "end_line": 110,
+          "label": "extractArchiveOrApk"
+        }
+      ],
+      "pos": [
+        840,
+        280
+      ],
+      "size": [
+        240,
+        60
+      ]
+    },
+    {
+      "id": "c_proc_mgr",
+      "type": "backend",
+      "label": "GuestProcessManager",
+      "sublabel": "Dynamic Slot Allocator (:guest1..:guest5)",
+      "icon": "backend",
+      "sources": [
+        {
+          "path": "app/src/main/java/com/vemod/container/proxy/GuestProcessManager.kt",
+          "line": 12,
+          "end_line": 65,
+          "label": "getTargetProxyClass"
+        }
+      ],
+      "pos": [
+        80,
+        400
+      ],
+      "size": [
+        240,
+        60
+      ]
+    },
+    {
+      "id": "c_proxy_act",
+      "type": "frontend",
+      "label": "GuestProxyActivity Router",
+      "sublabel": "STARTING_WINDOW Suppression & Splash Overlay",
+      "icon": "frontend",
+      "sources": [
+        {
+          "path": "app/src/main/java/com/vemod/container/proxy/GuestProxyActivity.kt",
+          "line": 15,
+          "end_line": 50,
+          "label": "routeProxyLaunch"
+        }
+      ],
+      "pos": [
+        460,
+        400
+      ],
+      "size": [
+        240,
+        60
+      ]
+    },
+    {
+      "id": "c_hook_proxies",
+      "type": "security",
+      "label": "Framework Hook Proxies",
+      "sublabel": "IPackage / IActivity / AdSdkNeutralizer",
+      "icon": "security",
+      "sources": [
+        {
+          "path": "app/src/main/java/com/vemod/container/proxy/PackageManagerHook.kt",
+          "line": 26,
+          "end_line": 70,
+          "label": "PackageManagerProxy"
+        },
+        {
+          "path": "app/src/main/java/com/vemod/container/proxy/AdSdkNeutralizer.kt",
+          "line": 20,
+          "end_line": 80,
+          "label": "neutralize"
+        }
+      ],
+      "pos": [
+        840,
+        400
+      ],
+      "size": [
+        240,
+        60
+      ]
+    },
+    {
+      "id": "c_instrumentation",
+      "type": "backend",
+      "label": "VemodInstrumentation",
+      "sublabel": "Activity Reflection, Context Swap & Back Nav",
+      "icon": "backend",
+      "sources": [
+        {
+          "path": "app/src/main/java/com/vemod/container/proxy/VemodInstrumentation.kt",
+          "line": 260,
+          "end_line": 310,
+          "label": "newActivity"
+        }
+      ],
+      "pos": [
+        80,
+        520
+      ],
+      "size": [
+        240,
+        60
+      ]
+    },
+    {
+      "id": "c_guest_ctx",
+      "type": "backend",
+      "label": "GuestContext Virtualization",
+      "sublabel": "Sandbox Paths & AudioTrack Stack Inspector",
+      "icon": "backend",
+      "sources": [
+        {
+          "path": "app/src/main/java/com/vemod/container/virtual/GuestContext.kt",
+          "line": 75,
+          "end_line": 120,
+          "label": "getPackageName"
+        }
+      ],
+      "pos": [
+        460,
+        520
+      ],
+      "size": [
+        240,
+        60
+      ]
+    },
+    {
+      "id": "c_touch_pacer",
+      "type": "frontend",
+      "label": "TouchPacer Event Pacer",
+      "sublabel": "Paces Sub-60ms Taps for 120Hz/240Hz Displays",
+      "icon": "frontend",
+      "sources": [
+        {
+          "path": "app/src/main/java/com/vemod/container/proxy/TouchPacer.kt",
+          "line": 37,
+          "end_line": 90,
+          "label": "install"
+        }
+      ],
+      "pos": [
+        840,
+        520
+      ],
+      "size": [
+        240,
+        60
+      ]
+    },
+    {
+      "id": "c_classloader",
+      "type": "backend",
+      "label": "GuestClassLoader",
+      "sublabel": "PathClassLoader Redirects findLibrary to Proxy",
+      "icon": "backend",
+      "sources": [
+        {
+          "path": "app/src/main/java/com/vemod/container/virtual/GuestClassLoader.kt",
+          "line": 15,
+          "end_line": 45,
+          "label": "findLibrary"
+        }
+      ],
+      "pos": [
+        80,
+        640
+      ],
+      "size": [
+        240,
+        60
+      ]
+    },
+    {
+      "id": "c_proxy_so",
+      "type": "backend",
+      "label": "64-Bit Host Proxy Stub",
+      "sublabel": "libproxy.so Satisfies ART 64-Bit Linker",
+      "icon": "backend",
+      "pos": [
+        460,
+        640
+      ],
+      "size": [
+        240,
+        60
+      ]
+    },
+    {
+      "id": "c_native_disp",
+      "type": "backend",
+      "label": "Native Dispatch & JNI Sync",
+      "sublabel": "Direct ByteBuffer Tracking & Writeback",
+      "icon": "backend",
+      "sources": [
+        {
+          "path": "app/src/main/cpp/jni/native_dispatch.cpp",
+          "line": 140,
+          "end_line": 200,
+          "label": "dispatch_native_method"
+        }
+      ],
+      "pos": [
+        840,
+        640
+      ],
+      "size": [
+        240,
+        60
+      ]
+    },
+    {
+      "id": "c_loader",
+      "type": "backend",
+      "label": "Multi-Module ELF Loader",
+      "sublabel": "Dynamic g_modules & APS2 Packed Relocations",
+      "icon": "backend",
+      "sources": [
+        {
+          "path": "app/src/main/cpp/bridge/loader.cpp",
+          "line": 988,
+          "end_line": 1030,
+          "label": "guest_dlopen"
+        }
+      ],
+      "pos": [
+        80,
+        760
+      ],
+      "size": [
+        240,
+        60
+      ]
+    },
+    {
+      "id": "c_memory",
+      "type": "database",
+      "label": "4 GB Virtual Memory Arena",
+      "sublabel": "Fixed mmap Arena (0x100000000ULL) & Heap brk",
+      "icon": "database",
+      "sources": [
+        {
+          "path": "app/src/main/cpp/bridge/memory.cpp",
+          "line": 23,
+          "end_line": 80,
+          "label": "arena_init"
+        }
+      ],
+      "pos": [
+        460,
+        760
+      ],
+      "size": [
+        240,
+        60
+      ]
+    },
+    {
+      "id": "c_jni_bridge",
+      "type": "backend",
+      "label": "32-Bit JNIEnv* Facade",
+      "sublabel": "Global References & AArch64 Trampolines",
+      "icon": "backend",
+      "sources": [
+        {
+          "path": "app/src/main/cpp/bridge/jni_bridge.cpp",
+          "line": 454,
+          "end_line": 510,
+          "label": "init_jni_bridge"
+        }
+      ],
+      "pos": [
+        840,
+        760
+      ],
+      "size": [
+        240,
+        60
+      ]
+    },
+    {
+      "id": "c_dynarmic",
+      "type": "backend",
+      "label": "Dynarmic ARM32 JIT Engine",
+      "sublabel": "Cycle-Guarded IR Identity Traversal & CPSR Flags",
+      "icon": "backend",
+      "sources": [
+        {
+          "path": "app/src/main/cpp/bridge/cpu.cpp",
+          "line": 2320,
+          "end_line": 2380,
+          "label": "Cpu::Run"
+        }
+      ],
+      "pos": [
+        80,
+        880
+      ],
+      "size": [
+        240,
+        60
+      ]
+    },
+    {
+      "id": "c_warmup",
+      "type": "database",
+      "label": "Persistent JIT Warmup Cache",
+      "sublabel": ".vcache Hot-Block Caching for Locked 60 FPS",
+      "icon": "database",
+      "sources": [
+        {
+          "path": "app/src/main/cpp/bridge/warmup.cpp",
+          "line": 125,
+          "end_line": 144,
+          "label": "warmup_note_frame"
+        }
+      ],
+      "pos": [
+        460,
+        880
+      ],
+      "size": [
+        240,
+        60
+      ]
+    },
+    {
+      "id": "c_bionic",
+      "type": "backend",
+      "label": "Hybrid Bionic Sysroot",
+      "sublabel": "AOSP Nougat API 24 libc / libm / libc++",
+      "icon": "backend",
+      "pos": [
+        840,
+        880
+      ],
+      "size": [
+        240,
+        60
+      ]
+    },
+    {
+      "id": "c_syscall",
+      "type": "security",
+      "label": "Kernel Syscall Dispatcher",
+      "sublabel": "125+ Syscalls, Futex Bitset & Epoll Conversion",
+      "icon": "security",
+      "sources": [
+        {
+          "path": "app/src/main/cpp/bridge/cpu.cpp",
+          "line": 575,
+          "end_line": 650,
+          "label": "do_syscall"
+        }
+      ],
+      "pos": [
+        80,
+        1000
+      ],
+      "size": [
+        240,
+        60
+      ]
+    },
+    {
+      "id": "c_eabi_math",
+      "type": "backend",
+      "label": "ARM EABI Soft-Float Suite",
+      "sublabel": "__aeabi_* Math, Conversions & Comparisons",
+      "icon": "backend",
+      "sources": [
+        {
+          "path": "app/src/main/cpp/bridge/libc.cpp",
+          "line": 2124,
+          "end_line": 2180,
+          "label": "ARM EABI softfp"
+        }
+      ],
+      "pos": [
+        460,
+        1000
+      ],
+      "size": [
+        240,
+        60
+      ]
+    },
+    {
+      "id": "c_zlib_bridge",
+      "type": "backend",
+      "label": "Bionic Zlib Bridge",
+      "sublabel": "32-to-64 Bit z_stream_32 Struct Marshaling",
+      "icon": "backend",
+      "sources": [
+        {
+          "path": "app/src/main/cpp/bridge/zlib_bridge.cpp",
+          "line": 34,
+          "end_line": 75,
+          "label": "z_stream_32"
+        }
+      ],
+      "pos": [
+        840,
+        1000
+      ],
+      "size": [
+        240,
+        60
+      ]
+    },
+    {
+      "id": "c_gles",
+      "type": "cloud",
+      "label": "OpenGL ES 2.0 / 1.1 Bridge",
+      "sublabel": "141+ Functions, Fixed-Point & Shadow VBOs",
+      "icon": "cloud",
+      "sources": [
+        {
+          "path": "app/src/main/cpp/bridge/gles.cpp",
+          "line": 592,
+          "end_line": 650,
+          "label": "x_eglSwapBuffers"
+        }
+      ],
+      "pos": [
+        80,
+        1120
+      ],
+      "size": [
+        240,
+        60
+      ]
+    },
+    {
+      "id": "c_opensles",
+      "type": "cloud",
+      "label": "OpenSL ES 1.0.1 Audio Subsystem",
+      "sublabel": "Dynamic SL_IID_* .bss UUIDs & PCM Queues",
+      "icon": "cloud",
+      "sources": [
+        {
+          "path": "app/src/main/cpp/bridge/opensles_bridge.cpp",
+          "line": 308,
+          "end_line": 380,
+          "label": "sl_Engine_CreateAudioPlayer"
+        }
+      ],
+      "pos": [
+        460,
+        1120
+      ],
+      "size": [
+        240,
+        60
+      ]
+    },
+    {
+      "id": "c_ndk_asset",
+      "type": "backend",
+      "label": "NDK Native Asset Streaming",
+      "sublabel": "AAsset_read, Seek & ALooper Callback Bridge",
+      "icon": "backend",
+      "sources": [
+        {
+          "path": "app/src/main/cpp/bridge/android.cpp",
+          "line": 761,
+          "end_line": 820,
+          "label": "AAsset_read"
+        }
+      ],
+      "pos": [
+        840,
+        1120
+      ],
+      "size": [
+        240,
+        60
+      ]
+    },
+    {
+      "id": "c_host_gpu",
+      "type": "external",
+      "label": "Host Adreno / Mali GPU",
+      "sublabel": "Direct 64-Bit Hardware Acceleration",
+      "icon": "external",
+      "pos": [
+        80,
+        1240
+      ],
+      "size": [
+        240,
+        60
+      ]
+    },
+    {
+      "id": "c_host_audio",
+      "type": "external",
+      "label": "Host AudioTrack / AudioFlinger",
+      "sublabel": "AttributionSource UID Permission Pass",
+      "icon": "external",
+      "pos": [
+        460,
+        1240
+      ],
+      "size": [
+        240,
+        60
+      ]
+    },
+    {
+      "id": "c_host_kernel",
+      "type": "external",
+      "label": "Host Linux Kernel & Filesystem",
+      "sublabel": "SELinux Sandbox, /proc/self & /tmp Cache",
+      "icon": "external",
+      "pos": [
+        840,
+        1240
+      ],
+      "size": [
+        240,
+        60
+      ]
+    }
+  ],
+  "boundaries": [
+    {
+      "kind": "region",
+      "label": "Host Ingestion & Companion Stub Synthesis",
+      "wraps": [
+        "c_drawer",
+        "c_shortcut",
+        "c_manager",
+        "c_stub_gen",
+        "c_registry",
+        "c_extractor"
+      ]
+    },
+    {
+      "kind": "region",
+      "label": "Isolated Container Sandbox & Virtualization (:guest1..:guest5)",
+      "wraps": [
+        "c_proc_mgr",
+        "c_proxy_act",
+        "c_hook_proxies",
+        "c_instrumentation",
+        "c_guest_ctx",
+        "c_touch_pacer",
+        "c_classloader",
+        "c_proxy_so",
+        "c_native_disp"
+      ]
+    },
+    {
+      "kind": "security-group",
+      "label": "Native Bridge Core & Dynarmic ARM32 JIT (libbridge.so)",
+      "wraps": [
+        "c_loader",
+        "c_memory",
+        "c_jni_bridge",
+        "c_dynarmic",
+        "c_warmup",
+        "c_bionic",
+        "c_syscall",
+        "c_eabi_math",
+        "c_zlib_bridge"
+      ]
+    },
+    {
+      "kind": "region",
+      "label": "Hardware Passthrough Subsystems",
+      "wraps": [
+        "c_gles",
+        "c_opensles",
+        "c_ndk_asset"
+      ]
+    }
+  ],
+  "connections": [
+    {
+      "id": "conn-user-drawer",
+      "from": "c_user",
+      "to": "c_drawer",
+      "label": "tap app icon",
+      "variant": "emphasis"
+    },
+    {
+      "id": "conn-user-shortcut",
+      "from": "c_user",
+      "to": "c_shortcut",
+      "label": "launch 1x1 shortcut"
+    },
+    {
+      "id": "conn-user-manager",
+      "from": "c_user",
+      "to": "c_manager",
+      "label": "import APK/XAPK"
+    },
+    {
+      "id": "conn-manager-extractor",
+      "from": "c_manager",
+      "to": "c_extractor",
+      "label": "ingest package",
+      "variant": "default"
+    },
+    {
+      "id": "conn-extractor-registry",
+      "from": "c_extractor",
+      "to": "c_registry",
+      "label": "persist meta.json",
+      "variant": "default"
+    },
+    {
+      "id": "conn-registry-stubgen",
+      "from": "c_registry",
+      "to": "c_stub_gen",
+      "label": "generate companion stub",
+      "variant": "default"
+    },
+    {
+      "id": "conn-stubgen-drawer",
+      "from": "c_stub_gen",
+      "to": "c_drawer",
+      "label": "register in drawer",
+      "variant": "dashed"
+    },
+    {
+      "id": "conn-registry-shortcut",
+      "from": "c_registry",
+      "to": "c_shortcut",
+      "label": "pin to home screen",
+      "variant": "dashed"
+    },
+    {
+      "id": "conn-drawer-procmgr",
+      "from": "c_drawer",
+      "to": "c_proc_mgr",
+      "label": "Intent.ACTION_MAIN",
+      "variant": "emphasis"
+    },
+    {
+      "id": "conn-shortcut-procmgr",
+      "from": "c_shortcut",
+      "to": "c_proxy_act",
+      "label": "launch target slot"
+    },
+    {
+      "id": "conn-procmgr-proxyact",
+      "from": "c_proc_mgr",
+      "to": "c_proxy_act",
+      "label": "allocate slot :guestN",
+      "variant": "emphasis"
+    },
+    {
+      "id": "conn-proxyact-instrument",
+      "from": "c_proxy_act",
+      "to": "c_instrumentation",
+      "label": "attach instrumentation",
+      "variant": "emphasis"
+    },
+    {
+      "id": "conn-instrument-guestctx",
+      "from": "c_instrumentation",
+      "to": "c_guest_ctx",
+      "label": "swap mBase context",
+      "variant": "default"
+    },
+    {
+      "id": "conn-instrument-touchpacer",
+      "from": "c_instrumentation",
+      "to": "c_touch_pacer",
+      "label": "install tap pacer",
+      "variant": "default"
+    },
+    {
+      "id": "conn-instrument-hooks",
+      "from": "c_instrumentation",
+      "to": "c_hook_proxies",
+      "label": "hook IPackageManager & GMS",
+      "variant": "security"
+    },
+    {
+      "id": "conn-instrument-classloader",
+      "from": "c_instrumentation",
+      "to": "c_classloader",
+      "label": "instantiate guest Activity",
+      "variant": "emphasis"
+    },
+    {
+      "id": "conn-classloader-proxyso",
+      "from": "c_classloader",
+      "to": "c_proxy_so",
+      "label": "findLibrary -> libproxy.so",
+      "variant": "emphasis"
+    },
+    {
+      "id": "conn-proxyso-disp",
+      "from": "c_proxy_so",
+      "to": "c_native_disp",
+      "label": "JNI method entry",
+      "variant": "default"
+    },
+    {
+      "id": "conn-classloader-loader",
+      "from": "c_classloader",
+      "to": "c_loader",
+      "label": "guest_dlopen(lib32)",
+      "variant": "emphasis"
+    },
+    {
+      "id": "conn-loader-memory",
+      "from": "c_loader",
+      "to": "c_memory",
+      "label": "mmap 4GB arena",
+      "variant": "default"
+    },
+    {
+      "id": "conn-disp-jnibridge",
+      "from": "c_native_disp",
+      "to": "c_jni_bridge",
+      "label": "JNIEnv* 32-bit trampolines",
+      "variant": "default"
+    },
+    {
+      "id": "conn-loader-dynarmic",
+      "from": "c_loader",
+      "to": "c_dynarmic",
+      "label": "load ELF code segments",
+      "variant": "emphasis"
+    },
+    {
+      "id": "conn-dynarmic-warmup",
+      "from": "c_dynarmic",
+      "to": "c_warmup",
+      "label": "cache hot blocks",
+      "variant": "default"
+    },
+    {
+      "id": "conn-dynarmic-bionic",
+      "from": "c_dynarmic",
+      "to": "c_bionic",
+      "label": "link Nougat libc/libc++",
+      "variant": "default"
+    },
+    {
+      "id": "conn-dynarmic-syscall",
+      "from": "c_dynarmic",
+      "to": "c_syscall",
+      "label": "SVC #0 -> do_syscall",
+      "variant": "emphasis"
+    },
+    {
+      "id": "conn-dynarmic-eabimath",
+      "from": "c_dynarmic",
+      "to": "c_eabi_math",
+      "label": "__aeabi_* softfp routines",
+      "variant": "default"
+    },
+    {
+      "id": "conn-bionic-zlib",
+      "from": "c_bionic",
+      "to": "c_zlib_bridge",
+      "label": "marshal z_stream_32",
+      "variant": "default"
+    },
+    {
+      "id": "conn-dynarmic-gles",
+      "from": "c_dynarmic",
+      "to": "c_gles",
+      "label": "GLES draw & swap calls",
+      "variant": "emphasis"
+    },
+    {
+      "id": "conn-dynarmic-opensles",
+      "from": "c_dynarmic",
+      "to": "c_opensles",
+      "label": "OpenSL ES buffer queues",
+      "variant": "default"
+    },
+    {
+      "id": "conn-dynarmic-ndkasset",
+      "from": "c_dynarmic",
+      "to": "c_ndk_asset",
+      "label": "AAsset streaming",
+      "variant": "default"
+    },
+    {
+      "id": "conn-gles-hostgpu",
+      "from": "c_gles",
+      "to": "c_host_gpu",
+      "label": "direct GPU rendering",
+      "variant": "emphasis"
+    },
+    {
+      "id": "conn-opensles-hostaudio",
+      "from": "c_opensles",
+      "to": "c_host_audio",
+      "label": "PCM audio output",
+      "variant": "default"
+    },
+    {
+      "id": "conn-syscall-hostkernel",
+      "from": "c_syscall",
+      "to": "c_host_kernel",
+      "label": "sandboxed Linux syscalls",
+      "variant": "security"
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "Multi-APK Ingestion & System Integration",
+      "items": [
+        "Dynamic Multi-Archive Ingestion: Unpacks .apk, .xapk, .apks, and .zip archives, extracting 32-bit ELF binaries to lib32/ and OBB expansions to container directories.",
+        "Micro-Stub Companion APKs (~25 KB): Synthesizes standalone signed 64-bit packages with authentic guest branding, AXML/ARSC string rewriting, and Android 15/16 SDK 35 targets for native App Drawer integration.",
+        "Home Screen Pinning: 1x1 pinned shortcuts via ShortcutManagerCompat with high-res extracted icons and decoupled task affinity.",
+        "StartingWindow Suppression: Translucent theme eliminates placeholder blueprint robot splashes before in-process dynamic overlay renders."
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "Multi-Process Isolation & Runtime Virtualization",
+      "items": [
+        "5 Dedicated Isolated Processes (:guest1..:guest5): Dynamic slot allocator prevents memory arena collisions, GLES state interleaving, and Bionic global state conflicts.",
+        "Context & Storage Virtualization: Swaps mBase with GuestContext, redirecting data and database paths into private container storage or public exposed storage (/sdcard/vemod/).",
+        "High-Refresh-Rate Touch Pacing (TouchPacer): Transparent Window.Callback proxy paces sub-60ms ACTION_UP events across distinct render ticks on 120Hz/240Hz screens, restoring instant single-tap responsiveness in decoupled game engines.",
+        "AttributionSource AudioTrack Virtualization: Dynamically inspects call stacks to forward host package UID permissions, restoring background music and sound effects across modern Android 12-16 frameworks.",
+        "Defunct SDK & GMS Neutralizer: Neutralizes defunct ad networks (AdColony, Chartboost, Flurry, AdMob), forces Google Play GameHelper to STATE_CONNECTING, and intercepts unhandled exceptions to prevent main Looper termination."
+      ]
+    },
+    {
+      "dot": "violet",
+      "title": "Native Bridge & Dynarmic ARM32 JIT Engine",
+      "items": [
+        "Dynamic Multi-Module Linker: Isolated g_modules symbol tables resolve CFFI duplicate symbol collisions (Haxe/Lime); built-in SLEB128 decoder unpacks packed relocations (APS2) resolving all 2,199 symbols in libc++.so.",
+        "4 GB Virtual Memory Arena: Private mmap at fixed address (0x100000000ULL) emulates 32-bit pointers with guest heap brk management.",
+        "Cycle-Guarded IR Identity Traversal: Replaced recursive IR identity inspection with bounded iterative traversal (depth <= 32) and cycle checks, eliminating fatal SIGSEGV call stack overflows during JIT optimization passes.",
+        "Persistent Block Cache (.vcache): Automated eglSwapBuffers frame-based hot-block profiling compiles JIT code blocks ahead-of-time on subsequent launches, locking gameplay at smooth 60 FPS."
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "Syscall Emulation & Hardware Acceleration",
+      "items": [
+        "125+ Kernel Syscall Surface: Emulates memory, timers, sockets, futex (with val3=0 bitset match normalization preventing Unity Boehm GC deadlocks), robust mutexes, and non-root sched_* priority fallback.",
+        "Universal Epoll Event Marshaling: Converts 12-byte packed guest epoll_event to 16-byte host structures with strict 8-byte data alignment, preventing pointer corruption in asynchronous network threads.",
+        "Filesystem & Path Redirection: Virtualizes /proc/self/exe to guest base.apk and redirects /data/local/tmp and /tmp into sandboxed container cache.",
+        "Hardware Passthrough Bridges: 141+ OpenGL ES 2.0 functions, fixed-point GLES 1.1 with glTexParameterx texture filtering, 32-bit safe shadow buffer mapping for VBOs, and OpenSL ES 1.0.1 audio with dynamic .bss UUID resolution."
+      ]
+    }
+  ]
+}

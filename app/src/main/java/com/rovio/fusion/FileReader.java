@@ -4,6 +4,7 @@ import android.app.Activity;
 import android.content.res.AssetManager;
 import android.util.Log;
 import com.vemod.container.proxy.VemodInstrumentation;
+import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.FileInputStream;
@@ -98,10 +99,53 @@ public class FileReader {
     }
 
     public static ByteBuffer readFile(String path) {
+        if (path.endsWith(".zip")) {
+            try {
+                return readFileCompressed(path);
+            } catch (Throwable t) {
+                Log.w(TAG, "readFileCompressed direct zip failed for " + path + ": " + t.getMessage());
+            }
+        }
         try {
             return readFileCompressed(path + ".zip");
         } catch (Throwable t) {
-            return readFileUncompressed(path);
+            return readFileAuto(path);
+        }
+    }
+
+    public static ByteBuffer readFileAuto(String path) {
+        try (InputStream is = openAsset(path)) {
+            ByteArrayOutputStream baos = new ByteArrayOutputStream();
+            byte[] buf = new byte[16384];
+            int read;
+            while ((read = is.read(buf)) != -1) {
+                baos.write(buf, 0, read);
+            }
+            byte[] data = baos.toByteArray();
+            // Check if bytes represent a PK zip archive (0x50, 0x4B, 0x03, 0x04)
+            if (data.length >= 4 && data[0] == 0x50 && data[1] == 0x4B && data[2] == 0x03 && data[3] == 0x04) {
+                try (ZipInputStream zis = new ZipInputStream(new ByteArrayInputStream(data))) {
+                    ZipEntry ze = zis.getNextEntry();
+                    if (ze != null) {
+                        ByteArrayOutputStream unzipped = new ByteArrayOutputStream();
+                        while ((read = zis.read(buf)) != -1) {
+                            unzipped.write(buf, 0, read);
+                        }
+                        data = unzipped.toByteArray();
+                        Log.i(TAG, "readFileAuto: unzipped archive " + path + " (" + data.length + " bytes)");
+                    }
+                } catch (Throwable zt) {
+                    Log.w(TAG, "readFileAuto: fallback decompression failed for " + path, zt);
+                }
+            }
+            ByteBuffer bb = ByteBuffer.allocateDirect(data.length);
+            bb.put(data);
+            bb.rewind();
+            Log.i(TAG, "readFileAuto: loaded " + path + " (" + data.length + " bytes)");
+            return bb;
+        } catch (Throwable t) {
+            Log.w(TAG, "readFileAuto failed for " + path + ": " + t.getMessage());
+            return null;
         }
     }
 

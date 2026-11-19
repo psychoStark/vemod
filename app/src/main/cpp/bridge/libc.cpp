@@ -81,8 +81,7 @@ void x_abort(Ctx& c) {
 void x_exit(Ctx& c) {
     int code = int(c.a32());
     c.cpu.dump("exit");
-    NB_LOGE("guest called exit(%d)", code);
-    exit(code);
+    fatal("guest called exit(%d)", code);
 }
 
 void x_raise(Ctx& c) {
@@ -816,6 +815,21 @@ const char* headless_path(const char* p) {
             return apk.c_str();
         }
     }
+    // Redirect legacy temporary directories (/data/local/tmp and /tmp) to container cache
+    if (strcmp(p, "/data/local/tmp") == 0 || strcmp(p, "/data/local/tmp/") == 0 ||
+        strcmp(p, "/tmp") == 0 || strcmp(p, "/tmp/") == 0) {
+        return get_vemod_tmp_dir().c_str();
+    }
+    if (strncmp(p, "/data/local/tmp/", 16) == 0) {
+        static thread_local std::string s_tmp_resolved;
+        s_tmp_resolved = get_vemod_tmp_dir() + "/" + (p + 16);
+        return s_tmp_resolved.c_str();
+    }
+    if (strncmp(p, "/tmp/", 5) == 0) {
+        static thread_local std::string s_tmp_resolved;
+        s_tmp_resolved = get_vemod_tmp_dir() + "/" + (p + 5);
+        return s_tmp_resolved.c_str();
+    }
     if (strcmp(p, "/proc/cpuinfo") == 0) {
         static std::string cpuinfo_path = [] {
             std::vector<std::string> dirs;
@@ -1089,13 +1103,13 @@ namespace {
 int x_fsync(int fd) { return sysret(fsync(fd)); }
 int x_fdatasync(int fd) { return sysret(fdatasync(fd)); }
 int x_ftruncate(int fd, s32 len) { return sysret(ftruncate(fd, len)); }
-int x_unlink(const char* p) { return sysret(unlink(p)); }
-int x_remove(const char* p) { return sysret(remove(p)); }
-int x_rename(const char* a, const char* b) { return sysret(rename(a, b)); }
-int x_mkdir(const char* p, u32 mode) { return sysret(mkdir(p, mode)); }
-int x_rmdir(const char* p) { return sysret(rmdir(p)); }
+int x_unlink(const char* p) { return sysret(unlink(headless_path(p))); }
+int x_remove(const char* p) { return sysret(remove(headless_path(p))); }
+int x_rename(const char* a, const char* b) { return sysret(rename(headless_path(a), headless_path(b))); }
+int x_mkdir(const char* p, u32 mode) { return sysret(mkdir(headless_path(p), mode)); }
+int x_rmdir(const char* p) { return sysret(rmdir(headless_path(p))); }
 int x_access(const char* p, int mode) { return sysret(access(headless_path(p), mode)); }
-int x_chdir(const char* p) { return sysret(chdir(p)); }
+int x_chdir(const char* p) { return sysret(chdir(headless_path(p))); }
 int x_fchmod(int fd, u32 mode) { return sysret(fchmod(fd, mode)); }
 int x_fchown(int fd, u32 uid, u32 gid) { return sysret(fchown(fd, uid, gid)); }
 int x_symlink(const char* a, const char* b) { return sysret(symlink(a, b)); }
@@ -1133,9 +1147,9 @@ u32 x_getcwd(u32 buf, u32 size) {
 }
 
 int x_utimes(const char* p, u32 tv) {
-    if (!tv) return sysret(utimes(p, nullptr));
+    if (!tv) return sysret(utimes(headless_path(p), nullptr));
     struct timeval t[2] = {{rd<s32>(tv), rd<s32>(tv + 4)}, {rd<s32>(tv + 8), rd<s32>(tv + 12)}};
-    return sysret(utimes(p, t));
+    return sysret(utimes(headless_path(p), t));
 }
 
 }  // namespace
@@ -1977,9 +1991,29 @@ s32 x_chmod(gaddr path, u32 mode) {
     if (!path) return -1;
     return sysret(::chmod(hs(path), (mode_t)mode));
 }
-s32 x_utime(gaddr path, gaddr) {
+s32 x_utime(gaddr path, gaddr times) {
     if (!path) return -1;
-    return sysret(::utime(hs(path), nullptr));
+    struct utimbuf host_ut;
+    struct utimbuf* p_ut = nullptr;
+    if (times) {
+        p_ut = &host_ut;
+        host_ut.actime = static_cast<time_t>(rd<s32>(times));
+        host_ut.modtime = static_cast<time_t>(rd<s32>(times + 4));
+    }
+    return sysret(::utime(headless_path(hs(path)), p_ut));
+}
+s32 x_utimensat(int dirfd, gaddr path, gaddr times, int flags) {
+    const char* p = path ? hs(path) : nullptr;
+    struct timespec host_ts[2];
+    struct timespec* p_ts = nullptr;
+    if (times) {
+        p_ts = host_ts;
+        host_ts[0].tv_sec = static_cast<time_t>(rd<s32>(times));
+        host_ts[0].tv_nsec = static_cast<long>(rd<s32>(times + 4));
+        host_ts[1].tv_sec = static_cast<time_t>(rd<s32>(times + 8));
+        host_ts[1].tv_nsec = static_cast<long>(rd<s32>(times + 12));
+    }
+    return sysret(::utimensat(dirfd, p ? headless_path(p) : nullptr, p_ts, flags));
 }
 s32 x_fnmatch(gaddr pattern, gaddr string, int flags) {
     if (!pattern || !string) return -1;
@@ -2109,6 +2143,8 @@ void register_libc() {
     reg("__assert2", x_assert2);
     reg("abort", x_abort);
     reg("exit", x_exit);
+    reg("_exit", x_exit);
+    reg("_Exit", x_exit);
     reg("raise", x_raise);
     reg("bsd_signal", x_bsd_signal);
     reg("__cxa_atexit", x_ret0);
@@ -2470,6 +2506,7 @@ void register_libc() {
     NB_REG("dup", x_dup);
     NB_REG("chmod", x_chmod);
     NB_REG("utime", x_utime);
+    NB_REG("utimensat", x_utimensat);
     NB_REG("fnmatch", x_fnmatch);
     NB_REG("pathconf", x_pathconf);
     NB_REG("statfs", x_statfs);

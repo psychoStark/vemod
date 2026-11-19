@@ -191,7 +191,11 @@ extern "C" void zb_native_dispatch(uint32_t slot, vemod::NativeRegs* regs) noexc
 
     uint64_t ret = nb::call_guest(target->guest_function, args.data(), args.size());
     if (nb::jni_has_direct_buffers()) {
-        nb::jni_sync_direct_buffers_to_host();
+        for (size_t i = 1; i < target->shorty.size(); ++i) {
+            if (target->shorty[i] == 'L' && (i + 1) < args.size()) {
+                nb::jni_sync_buffer_arg(static_cast<uint32_t>(args[i + 1].v));
+            }
+        }
     }
 
     if (target->label == "nativeRender") {
@@ -210,7 +214,7 @@ extern "C" void zb_native_dispatch(uint32_t slot, vemod::NativeRegs* regs) noexc
         case 'V':
             break;
         case 'Z':
-            regs->x[0] = static_cast<uint8_t>(r0);
+            regs->x[0] = (r0 != 0) ? 1 : 0;
             break;
         case 'B':
             regs->x[0] = static_cast<int64_t>(static_cast<int8_t>(r0));

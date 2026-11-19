@@ -26,6 +26,7 @@
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
+#include <utime.h>
 
 #ifdef __ANDROID__
 #include <android/log.h>
@@ -328,6 +329,7 @@ Cpu::Cpu(GuestThread* t, int depth) : thread(t), depth(depth), pid(alloc_pid()) 
     cfg.track_code_ranges = false;
     // Every thread has its own JIT (dynarmic is not re-entrant); nested ones run little code.
     cfg.code_cache_size = depth == 0 ? 128u * 1024 * 1024 : 16u * 1024 * 1024;
+    cfg.define_unpredictable_behaviour = true;
     cfg.optimizations = Dynarmic::all_safe_optimizations |
                         Dynarmic::OptimizationFlag::Unsafe_ReducedErrorFP |
                         Dynarmic::OptimizationFlag::Unsafe_InaccurateNaN |
@@ -357,7 +359,7 @@ bool Cpu::check(gaddr a, u32 n, const char* what) {
 }
 
 std::optional<u32> Cpu::MemoryReadCode(u32 a) {
-    if (!is_mapped(a)) return std::nullopt;
+    if (a < layout::kMiscBase || !is_mapped(a)) return std::nullopt;
     return rd<u32>(a);
 }
 u8 Cpu::MemoryRead8(u32 a) { check(a, 1, "read"); return rd<u8>(a); }
@@ -396,6 +398,26 @@ void Cpu::ExceptionRaised(u32 pc, Dynarmic::A32::Exception e) {
     case E::PreloadDataWithIntentToWrite:
     case E::PreloadInstruction:
         return;
+    case E::UnpredictableInstruction: {
+        u32 insn = is_mapped(pc) ? rd<u32>(pc) : 0;
+        logf(ANDROID_LOG_WARN, "Cpu: Ignored UnpredictableInstruction at %#x [%s] insn=%08x",
+             pc, symbolize(pc).c_str(), insn);
+        jit->Regs()[15] = pc + (jit->Cpsr() & (1 << 5) ? 2 : 4);
+        return;
+    }
+    case E::NoExecuteFault: {
+        if (pc < layout::kMiscBase || pc == 0x10000) {
+            u32 lr = jit->Regs()[14];
+            logf(ANDROID_LOG_WARN, "Cpu: Recovered from null/invalid function call (pc=%#x -> returning to lr=%#x [%s])",
+                 pc, lr, symbolize(lr).c_str());
+            if (is_mapped(lr) && lr >= layout::kMiscBase) {
+                jit->Regs()[0] = 0;
+                jit->Regs()[15] = lr;
+                return;
+            }
+        }
+        break;
+    }
     default:
         break;
     }
@@ -426,11 +448,14 @@ void Cpu::dump(const char* why) {
                             rd<u32>(sp + offset), rd<u32>(sp + offset + 4),
                             rd<u32>(sp + offset + 8), rd<u32>(sp + offset + 12));
     }
-    for (gaddr p = sp; p < sp + 1024 && found < 12 && is_mapped(p); p += 4) {
+    for (gaddr p = sp; p < sp + 2048 && found < 24 && is_mapped(p); p += 4) {
         u32 v = rd<u32>(p);
-        if (v >= layout::kLibBase && v < layout::kLibBase + 0x1b40000 && v != r[14]) {
-            __android_log_print(ANDROID_LOG_ERROR, "VemodBridge", "  stack[%#x] %s", p - sp, symbolize(v).c_str());
-            ++found;
+        if (v >= layout::kLibBase && v != r[14]) {
+            std::string sym = symbolize(v);
+            if (sym.find('(') != std::string::npos) {
+                __android_log_print(ANDROID_LOG_ERROR, "VemodBridge", "  stack[%#x] %s", p - sp, sym.c_str());
+                ++found;
+            }
         }
     }
 #endif
@@ -449,11 +474,14 @@ void Cpu::dump(const char* why) {
                 rd<u32>(sp + offset + 8), rd<u32>(sp + offset + 12));
     }
     found = 0;
-    for (gaddr p = sp; p < sp + 1024 && found < 12 && is_mapped(p); p += 4) {
+    for (gaddr p = sp; p < sp + 2048 && found < 24 && is_mapped(p); p += 4) {
         u32 v = rd<u32>(p);
-        if (v >= layout::kLibBase && v < layout::kLibBase + 0x1b40000 && v != r[14]) {
-            NB_LOGE("  stack[%#x] %s", p - sp, symbolize(v).c_str());
-            ++found;
+        if (v >= layout::kLibBase && v != r[14]) {
+            std::string sym = symbolize(v);
+            if (sym.find('(') != std::string::npos) {
+                NB_LOGE("  stack[%#x] %s", p - sp, sym.c_str());
+                ++found;
+            }
         }
     }
 }
@@ -575,7 +603,10 @@ void set_guest_errno(int e) { wr<s32>(cur_thread().tls + tlsoff::kErrno, e); }
 static void do_syscall(Cpu& cpu) {
     auto& r = cpu.jit->Regs();
     u32 nr = r[7];
-    if (get_log_level() >= LOG_LEVEL_FULL && nr != 240 && nr != 78 && nr != 174 && nr != 175 && nr != 162 && nr != 0xf0002 && nr != 327) {
+    if (get_log_level() >= LOG_LEVEL_FULL &&
+        nr != 3 && nr != 4 && nr != 19 && nr != 45 && nr != 78 && nr != 91 && nr != 125 &&
+        nr != 140 && nr != 141 && nr != 142 && nr != 158 && nr != 162 && nr != 168 && nr != 174 && nr != 175 &&
+        nr != 217 && nr != 240 && nr != 263 && nr != 327 && nr != 0xf0002) {
         NB_LOGI("raw syscall nr=%u r0=%#x r1=%#x r2=%#x r3=%#x", nr, r[0], r[1], r[2], r[3]);
     }
     switch (nr) {
@@ -597,12 +628,22 @@ static void do_syscall(Cpu& cpu) {
 
     // Process & thread lifecycle
     case 1:  // exit
+        logf(ANDROID_LOG_WARN, "Cpu: guest called exit(%d) from thread tid=%u pc=%#x [%s]",
+             int(r[0]), cpu.thread->tid, cpu.jit->Regs()[15], symbolize(cpu.jit->Regs()[15]).c_str());
+        cpu.dump("exit");
         cpu.thread->exiting = true;
+        cpu.thread->exit_value = r[0];
         cpu.jit->HaltExecution();
         return;
-    case 248:  // exit_group
-        exit(int(r[0]));
+    case 248: {  // exit_group
+        logf(ANDROID_LOG_WARN, "Cpu: guest called exit_group(%d) from thread tid=%u pc=%#x [%s]",
+             int(r[0]), cpu.thread->tid, cpu.jit->Regs()[15], symbolize(cpu.jit->Regs()[15]).c_str());
+        cpu.dump("exit_group");
+        cpu.thread->exiting = true;
+        cpu.thread->exit_value = r[0];
+        cpu.jit->HaltExecution();
         return;
+    }
     case 120: {  // clone
         u32 flags = r[0];
         gaddr child_sp = r[1];
@@ -914,12 +955,12 @@ static void do_syscall(Cpu& cpu) {
         r[0] = x_close(r[0]) < 0 ? -errno : 0;
         return;
     case 10: {  // unlink
-        int res = unlink(hs(r[0]));
+        int res = unlink(headless_path(hs(r[0])));
         r[0] = res < 0 ? -errno : res;
         return;
     }
     case 12: {  // chdir
-        int res = chdir(hs(r[0]));
+        int res = chdir(headless_path(hs(r[0])));
         r[0] = res < 0 ? -errno : res;
         return;
     }
@@ -928,23 +969,51 @@ static void do_syscall(Cpu& cpu) {
         r[0] = res < 0 ? -errno : res;
         return;
     }
+    case 30: {  // utime(filename, times)
+        const char* p = hs(r[0]);
+        struct utimbuf host_ut;
+        struct utimbuf* p_ut = nullptr;
+        if (r[1]) {
+            p_ut = &host_ut;
+            host_ut.actime = static_cast<time_t>(rd<s32>(r[1]));
+            host_ut.modtime = static_cast<time_t>(rd<s32>(r[1] + 4));
+        }
+        int res = utime(headless_path(p), p_ut);
+        r[0] = res < 0 ? -errno : 0;
+        return;
+    }
     case 33: {  // access
         int res = access(headless_path(hs(r[0])), r[1]);
         r[0] = res < 0 ? -errno : res;
         return;
     }
+    case 271: {  // utimes(filename, times)
+        const char* p = hs(r[0]);
+        struct timeval host_tv[2];
+        struct timeval* p_tv = nullptr;
+        if (r[1]) {
+            p_tv = host_tv;
+            host_tv[0].tv_sec = static_cast<time_t>(rd<s32>(r[1]));
+            host_tv[0].tv_usec = static_cast<suseconds_t>(rd<s32>(r[1] + 4));
+            host_tv[1].tv_sec = static_cast<time_t>(rd<s32>(r[1] + 8));
+            host_tv[1].tv_usec = static_cast<suseconds_t>(rd<s32>(r[1] + 12));
+        }
+        int res = utimes(headless_path(p), p_tv);
+        r[0] = res < 0 ? -errno : 0;
+        return;
+    }
     case 38: {  // rename
-        int res = rename(hs(r[0]), hs(r[1]));
+        int res = rename(headless_path(hs(r[0])), headless_path(hs(r[1])));
         r[0] = res < 0 ? -errno : res;
         return;
     }
     case 39: {  // mkdir
-        int res = mkdir(hs(r[0]), r[1]);
+        int res = mkdir(headless_path(hs(r[0])), r[1]);
         r[0] = res < 0 ? -errno : res;
         return;
     }
     case 40: {  // rmdir
-        int res = rmdir(hs(r[0]));
+        int res = rmdir(headless_path(hs(r[0])));
         r[0] = res < 0 ? -errno : res;
         return;
     }
@@ -1006,7 +1075,7 @@ static void do_syscall(Cpu& cpu) {
     }
     case 99: {  // statfs(path, buf)
         struct statfs st;
-        int res = statfs(hs(r[0]), &st);
+        int res = statfs(headless_path(hs(r[0])), &st);
         if (res < 0) {
             r[0] = -errno;
         } else {
@@ -1202,7 +1271,7 @@ static void do_syscall(Cpu& cpu) {
     }
     case 193: {  // truncate64
         off64_t len = (u64(r[3]) << 32) | r[2];
-        int res = truncate(hs(r[0]), len);
+        int res = truncate(headless_path(hs(r[0])), len);
         r[0] = res < 0 ? -errno : res;
         return;
     }
@@ -1351,7 +1420,7 @@ static void do_syscall(Cpu& cpu) {
         return;
     }
     case 323: {  // mkdirat
-        int res = mkdirat(r[0], hs(r[1]), r[2]);
+        int res = mkdirat(r[0], headless_path(hs(r[1])), r[2]);
         r[0] = res < 0 ? -errno : res;
         return;
     }
@@ -1362,12 +1431,12 @@ static void do_syscall(Cpu& cpu) {
         return;
     }
     case 328: {  // unlinkat
-        int res = unlinkat(r[0], hs(r[1]), r[2]);
+        int res = unlinkat(r[0], headless_path(hs(r[1])), r[2]);
         r[0] = res < 0 ? -errno : res;
         return;
     }
     case 329: {  // renameat
-        int res = renameat(r[0], hs(r[1]), r[2], hs(r[3]));
+        int res = renameat(r[0], headless_path(hs(r[1])), r[2], headless_path(hs(r[3])));
         r[0] = res < 0 ? -errno : res;
         return;
     }
@@ -1387,14 +1456,57 @@ static void do_syscall(Cpu& cpu) {
         return;
     }
     case 333: {  // fchmodat
-        int res = fchmodat(r[0], hs(r[1]), r[2], r[3]);
+        int res = fchmodat(r[0], headless_path(hs(r[1])), r[2], r[3]);
         r[0] = res < 0 ? -errno : res;
         return;
     }
     case 334:   // faccessat
     case 439: { // faccessat2
-        int res = faccessat(r[0], hs(r[1]), r[2], r[3]);
+        int res = faccessat(r[0], headless_path(hs(r[1])), r[2], r[3]);
         r[0] = res < 0 ? -errno : res;
+        return;
+    }
+    case 326: {  // futimesat(dirfd, pathname, times)
+        int dirfd = static_cast<int>(r[0]);
+        const char* p = r[1] ? hs(r[1]) : nullptr;
+        struct timeval host_tv[2];
+        struct timeval* p_tv = nullptr;
+        if (r[2]) {
+            p_tv = host_tv;
+            host_tv[0].tv_sec = static_cast<time_t>(rd<s32>(r[2]));
+            host_tv[0].tv_usec = static_cast<suseconds_t>(rd<s32>(r[2] + 4));
+            host_tv[1].tv_sec = static_cast<time_t>(rd<s32>(r[2] + 8));
+            host_tv[1].tv_usec = static_cast<suseconds_t>(rd<s32>(r[2] + 12));
+        }
+        int res = futimesat(dirfd, p ? headless_path(p) : nullptr, p_tv);
+        r[0] = res < 0 ? -errno : 0;
+        return;
+    }
+    case 348:    // utimensat(dirfd, pathname, times, flags)
+    case 412: {  // utimensat_time64(dirfd, pathname, times, flags)
+        int dirfd = static_cast<int>(r[0]);
+        const char* p = r[1] ? hs(r[1]) : nullptr;
+        gaddr times_addr = r[2];
+        int flags = static_cast<int>(r[3]);
+
+        struct timespec host_ts[2];
+        struct timespec* p_host_ts = nullptr;
+        if (times_addr) {
+            p_host_ts = host_ts;
+            if (nr == 412) {
+                host_ts[0].tv_sec = static_cast<time_t>(rd<s64>(times_addr));
+                host_ts[0].tv_nsec = static_cast<long>(rd<s64>(times_addr + 8));
+                host_ts[1].tv_sec = static_cast<time_t>(rd<s64>(times_addr + 16));
+                host_ts[1].tv_nsec = static_cast<long>(rd<s64>(times_addr + 24));
+            } else {
+                host_ts[0].tv_sec = static_cast<time_t>(rd<s32>(times_addr));
+                host_ts[0].tv_nsec = static_cast<long>(rd<s32>(times_addr + 4));
+                host_ts[1].tv_sec = static_cast<time_t>(rd<s32>(times_addr + 8));
+                host_ts[1].tv_nsec = static_cast<long>(rd<s32>(times_addr + 12));
+            }
+        }
+        int res = utimensat(dirfd, p ? headless_path(p) : nullptr, p_host_ts, flags);
+        r[0] = res < 0 ? -errno : 0;
         return;
     }
     case 335:
@@ -1921,7 +2033,7 @@ static void do_syscall(Cpu& cpu) {
     // Filesystem stats
     case 266: {  // statfs64(path, sz, buf)
         struct statfs st;
-        int res = statfs(hs(r[0]), &st);
+        int res = statfs(headless_path(hs(r[0])), &st);
         if (res < 0) {
             r[0] = -errno;
         } else {
@@ -1987,7 +2099,8 @@ static void do_syscall(Cpu& cpu) {
         struct epoll_event* p_ev = nullptr;
         if (ev_addr && is_mapped(ev_addr)) {
             host_ev.events = rd<u32>(ev_addr);
-            host_ev.data.u64 = rd<u64>(ev_addr + 4);
+            // ARM 32-bit epoll_event has 4-byte padding after events: data is at offset 8
+            host_ev.data.u64 = rd<u64>(ev_addr + 8);
             p_ev = &host_ev;
         }
         int res = epoll_ctl(epfd, op, fd, p_ev);
@@ -2008,9 +2121,12 @@ static void do_syscall(Cpu& cpu) {
         int res = epoll_wait(epfd, host_events, safe_max, timeout);
         if (res > 0) {
             for (int i = 0; i < res; ++i) {
-                gaddr out = ev_addr + i * 12;
+                // ARM 32-bit struct epoll_event size is 16 bytes:
+                // offset 0: events (u32), offset 4: padding (u32), offset 8: data (u64)
+                gaddr out = ev_addr + i * 16;
                 wr<u32>(out + 0, host_events[i].events);
-                wr<u64>(out + 4, host_events[i].data.u64);
+                wr<u32>(out + 4, 0);
+                wr<u64>(out + 8, host_events[i].data.u64);
             }
         }
         r[0] = res < 0 ? -errno : res;
@@ -2041,9 +2157,12 @@ static void do_syscall(Cpu& cpu) {
         int res = epoll_pwait(epfd, host_events, safe_max, timeout, p_sigmask);
         if (res > 0) {
             for (int i = 0; i < res; ++i) {
-                gaddr out = ev_addr + i * 12;
+                // ARM 32-bit struct epoll_event size is 16 bytes:
+                // offset 0: events (u32), offset 4: padding (u32), offset 8: data (u64)
+                gaddr out = ev_addr + i * 16;
                 wr<u32>(out + 0, host_events[i].events);
-                wr<u64>(out + 4, host_events[i].data.u64);
+                wr<u32>(out + 4, 0);
+                wr<u64>(out + 8, host_events[i].data.u64);
             }
         }
         r[0] = res < 0 ? -errno : res;
@@ -2386,6 +2505,9 @@ u64 call_guest(gaddr fn, const GArg* args, size_t n) {
         if (bool(hr & Dynarmic::HaltReason::UserDefined1)) {
             c.jit->ClearHalt(Dynarmic::HaltReason::UserDefined1);
         }
+    }
+    if (t.exiting) {
+        fatal("call_guest: guest thread %u exited with status %u", t.tid, t.exit_value);
     }
     u64 res = R[0] | (u64(R[1]) << 32);
     --t.depth;

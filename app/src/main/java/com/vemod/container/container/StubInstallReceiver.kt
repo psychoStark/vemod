@@ -4,6 +4,7 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageInstaller
+import android.os.Build
 import android.util.Log
 import android.widget.Toast
 
@@ -13,13 +14,38 @@ class StubInstallReceiver : BroadcastReceiver() {
     }
 
     override fun onReceive(context: Context, intent: Intent) {
+        val action = intent.action
         val status = intent.getIntExtra(PackageInstaller.EXTRA_STATUS, PackageInstaller.STATUS_FAILURE)
         val message = intent.getStringExtra(PackageInstaller.EXTRA_STATUS_MESSAGE)
         val pkg = intent.getStringExtra("package_name") ?: "App"
 
+        if (action == "com.vemod.action.STUB_UNINSTALLED") {
+            Log.i(TAG, "Stub uninstall event for $pkg: status=$status, msg=$message")
+            if (status == PackageInstaller.STATUS_PENDING_USER_ACTION) {
+                val confirmIntent = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    intent.getParcelableExtra(Intent.EXTRA_INTENT, Intent::class.java)
+                } else {
+                    @Suppress("DEPRECATION")
+                    intent.getParcelableExtra<Intent>(Intent.EXTRA_INTENT)
+                }
+                if (confirmIntent != null) {
+                    confirmIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    context.startActivity(confirmIntent)
+                }
+            } else if (status == PackageInstaller.STATUS_SUCCESS) {
+                Toast.makeText(context, "Uninstalled $pkg", Toast.LENGTH_SHORT).show()
+            }
+            return
+        }
+
         when (status) {
             PackageInstaller.STATUS_PENDING_USER_ACTION -> {
-                val confirmIntent = intent.getParcelableExtra<Intent>(Intent.EXTRA_INTENT)
+                val confirmIntent = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    intent.getParcelableExtra(Intent.EXTRA_INTENT, Intent::class.java)
+                } else {
+                    @Suppress("DEPRECATION")
+                    intent.getParcelableExtra<Intent>(Intent.EXTRA_INTENT)
+                }
                 if (confirmIntent != null) {
                     confirmIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                     context.startActivity(confirmIntent)

@@ -56,6 +56,17 @@ class NotificationManagerHook(
     }
 
     override fun invoke(proxy: Any, method: Method, args: Array<Any?>?): Any? {
+        if (method.name == "equals") {
+            val other = args?.getOrNull(0)
+            return proxy === other || real == other
+        }
+        if (method.name == "hashCode") {
+            return real.hashCode()
+        }
+        if (method.name == "toString") {
+            return real.toString()
+        }
+
         if (args != null) {
             for (i in args.indices) {
                 val arg = args[i]

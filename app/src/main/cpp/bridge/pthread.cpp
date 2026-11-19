@@ -40,8 +40,17 @@ struct Pool {
         init(items[idx]);
         return idx;
     }
+    T* get_ptr(u32 idx) {
+        std::lock_guard lk(mu);
+        if (idx >= items.size()) return nullptr;
+        return &items[idx];
+    }
     T& get(u32 idx) {
         std::lock_guard lk(mu);
+        if (idx >= items.size()) {
+            static T fallback{};
+            return fallback;
+        }
         return items[idx];
     }
     void release(u32 idx) {
@@ -68,36 +77,44 @@ pthread_mutex_t* new_mutex_handle(gaddr gm, u32 type_word, bool force) {
     u32 handle = kHandleBit | idx;
     if (force) {
         wr<u32>(gm, handle);
-        return &g_mutexes.get(idx);
+        return g_mutexes.get_ptr(idx);
     }
     u32 expected = type_word;
     if (!__atomic_compare_exchange_n(hp<u32>(gm), &expected, handle, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) {
         // another thread won the race
-        pthread_mutex_destroy(&g_mutexes.get(idx));
+        pthread_mutex_t* mtx = g_mutexes.get_ptr(idx);
+        if (mtx) pthread_mutex_destroy(mtx);
         g_mutexes.release(idx);
-        return &g_mutexes.get(expected & ~kHandleBit);
+        return g_mutexes.get_ptr(expected & ~kHandleBit);
     }
-    return &g_mutexes.get(idx);
+    return g_mutexes.get_ptr(idx);
 }
 
 pthread_mutex_t* mutex_of(gaddr gm) {
     u32 w = __atomic_load_n(hp<u32>(gm), __ATOMIC_ACQUIRE);
-    if (w & kHandleBit) return &g_mutexes.get(w & ~kHandleBit);
+    if (w & kHandleBit) {
+        pthread_mutex_t* mtx = g_mutexes.get_ptr(w & ~kHandleBit);
+        if (mtx) return mtx;
+    }
     return new_mutex_handle(gm, w, false);
 }
 
 pthread_cond_t* cond_of(gaddr gc) {
     u32 w = __atomic_load_n(hp<u32>(gc), __ATOMIC_ACQUIRE);
-    if (w & kHandleBit) return &g_conds.get(w & ~kHandleBit);
+    if (w & kHandleBit) {
+        pthread_cond_t* cond = g_conds.get_ptr(w & ~kHandleBit);
+        if (cond) return cond;
+    }
     u32 idx = g_conds.add([](pthread_cond_t& c) { pthread_cond_init(&c, nullptr); });
     u32 expected = w;
     if (!__atomic_compare_exchange_n(hp<u32>(gc), &expected, kHandleBit | idx, false, __ATOMIC_SEQ_CST,
                                      __ATOMIC_SEQ_CST)) {
-        pthread_cond_destroy(&g_conds.get(idx));
+        pthread_cond_t* cond = g_conds.get_ptr(idx);
+        if (cond) pthread_cond_destroy(cond);
         g_conds.release(idx);
-        return &g_conds.get(expected & ~kHandleBit);
+        return g_conds.get_ptr(expected & ~kHandleBit);
     }
-    return &g_conds.get(idx);
+    return g_conds.get_ptr(idx);
 }
 
 // ------------------------------------------------------------------ mutex / cond
@@ -121,10 +138,14 @@ int x_mutex_init(u32 m, u32 attr) {
 int x_mutex_destroy(u32 m) {
     u32 w = rd<u32>(m);
     if (w & kHandleBit) {
-        pthread_mutex_destroy(&g_mutexes.get(w & ~kHandleBit));
-        g_mutexes.release(w & ~kHandleBit);
+        u32 idx = w & ~kHandleBit;
+        pthread_mutex_t* mtx = g_mutexes.get_ptr(idx);
+        if (mtx) {
+            pthread_mutex_destroy(mtx);
+            g_mutexes.release(idx);
+        }
     }
-    wr<u32>(m, 0xdead0000u);  // neither a handle nor an initializer
+    wr<u32>(m, 0);
     return 0;
 }
 int x_mutex_lock(u32 m) {
@@ -132,7 +153,7 @@ int x_mutex_lock(u32 m) {
     pthread_mutex_t* mtx = mutex_of(m);
     if (!mtx) return EINVAL;
     int rc = pthread_mutex_lock(mtx);
-    if (rc == EDEADLK) return 0;
+    if (rc == EDEADLK || rc == EBUSY) return 0;
     return rc;
 }
 int x_mutex_trylock(u32 m) {
@@ -162,7 +183,7 @@ int x_mutex_timedlock(u32 m, gaddr abs_timeout) {
     ts.tv_sec = gts->tv_sec;
     ts.tv_nsec = gts->tv_nsec;
     int rc = pthread_mutex_timedlock(mtx, &ts);
-    if (rc == EDEADLK) return 0;
+    if (rc == EDEADLK || rc == EBUSY) return 0;
     return rc;
 }
 
@@ -181,10 +202,14 @@ int x_cond_init(u32 c, u32) {
 int x_cond_destroy(u32 c) {
     u32 w = rd<u32>(c);
     if (w & kHandleBit) {
-        pthread_cond_destroy(&g_conds.get(w & ~kHandleBit));
-        g_conds.release(w & ~kHandleBit);
+        u32 idx = w & ~kHandleBit;
+        pthread_cond_t* cond = g_conds.get_ptr(idx);
+        if (cond) {
+            pthread_cond_destroy(cond);
+            g_conds.release(idx);
+        }
     }
-    wr<u32>(c, 0xdead0000u);
+    wr<u32>(c, 0);
     return 0;
 }
 
@@ -212,7 +237,9 @@ int x_sem_init(u32 s, int, u32 value) {
 sem_t* sem_of(u32 s) {
     u32 w = rd<u32>(s);
     if (!(w & kHandleBit)) fatal("guest used an uninitialised semaphore at %#x", s);
-    return &g_sems.get(w & ~kHandleBit);
+    sem_t* sptr = g_sems.get_ptr(w & ~kHandleBit);
+    if (!sptr) fatal("guest used an invalid semaphore index at %#x", s);
+    return sptr;
 }
 int x_sem_destroy(u32 s) {
     u32 w = rd<u32>(s);

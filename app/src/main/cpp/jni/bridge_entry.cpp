@@ -304,12 +304,16 @@ Java_com_vemod_container_bridge_VemodBridge_nativeCallNativeActivityOnCreate(
     };
 
     static auto host_onInputQueueCreated = [](void*, void* queue) {
-        nb::start_host_input_pump(queue);
-        if (!s_callbacks || !s_guest_activity) return;
+        if (!s_callbacks || !s_guest_activity) {
+            nb::start_host_input_pump(queue);
+            return;
+        }
         nb::gaddr fn = nb::rd<uint32_t>(s_callbacks + 11 * 4);
         if (fn) {
             LOGI("Forwarding onInputQueueCreated(queue=%p) to guest %#x", queue, fn);
             nb::call_guest(fn, {nb::ga(s_guest_activity), nb::ga(nb::to_guest_egl(queue))});
+        } else {
+            nb::start_host_input_pump(queue);
         }
     };
 
@@ -359,18 +363,18 @@ Java_com_vemod_container_bridge_VemodBridge_nativeCallNativeActivityOnCreate(
     nb::gaddr obb_path_addr = (host && host->obbPath) ? nb::gstrdup(host->obbPath) : 0;
 
     nb::JniFrame frame(env);
-    uint32_t guest_clazz = (host && host->clazz) ? nb::jni_local(host->clazz) : 0;
+    uint32_t guest_clazz = (host && host->clazz) ? nb::jni_global(host->clazz) : 0;
 
     auto* act32 = reinterpret_cast<uint32_t*>(nb::h(s_guest_activity));
     act32[0] = s_callbacks;                              // callbacks
     act32[1] = nb::jni_guest_vm();                       // vm
     act32[2] = nb::jni_guest_env();                      // env
-    act32[3] = guest_clazz;                              // clazz
+    act32[3] = guest_clazz;                              // clazz (global ref, persists for lifetime of activity)
     act32[4] = internal_path_addr;                       // internalDataPath
     act32[5] = external_path_addr;                       // externalDataPath
     act32[6] = host ? host->sdkVersion : 24;             // sdkVersion
     act32[7] = 0;                                        // instance
-    act32[8] = 0;                                        // assetManager
+    act32[8] = (host && host->assetManager) ? nb::to_guest_egl(host->assetManager) : 0; // assetManager
     act32[9] = obb_path_addr;                            // obbPath
 
     nb::gaddr saved_state_addr = 0;

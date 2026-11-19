@@ -127,7 +127,10 @@ u32 global(jobject o, u32 kind) {
 jobject obj(u32 hnd) {
     if (!hnd) return nullptr;
     u32 idx = hnd >> 2;
-    if ((hnd & 3) || idx >= kMaxRefs) fatal("guest passed an invalid JNI reference %#x", hnd);
+    if ((hnd & 3) || idx >= kMaxRefs) {
+        NB_LOGW("guest passed an invalid JNI reference %#x", hnd);
+        return nullptr;
+    }
     return g_slots[idx].obj;
 }
 
@@ -1224,10 +1227,13 @@ struct DirectBufRecord {
     void* host_ptr;
     size_t alloc_sz;
     size_t capacity;
+    uint64_t last_used;
 };
 static std::mutex g_direct_buf_mu;
 static std::unordered_map<void*, DirectBufRecord> g_direct_buffers;
+static std::unordered_map<gaddr, void*> g_guest_to_host_buf;
 static std::atomic<size_t> g_direct_buf_count{0};
+static uint64_t g_direct_buf_seq{0};
 
 void jni_GetDirectBufferAddress(Ctx& c) {
     c.a32();
@@ -1247,14 +1253,17 @@ void jni_GetDirectBufferAddress(Ctx& c) {
         return;
     }
     std::lock_guard lk(g_direct_buf_mu);
+    uint64_t seq = ++g_direct_buf_seq;
     auto it = g_direct_buffers.find(p);
     if (it != g_direct_buffers.end()) {
+        it->second.last_used = seq;
         if (static_cast<size_t>(cap) <= it->second.alloc_sz) {
             it->second.capacity = static_cast<size_t>(cap);
             memcpy(h(it->second.guest_addr), p, cap);
             c.ret(it->second.guest_addr);
             return;
         } else {
+            g_guest_to_host_buf.erase(it->second.guest_addr);
             map_free(it->second.guest_addr, it->second.alloc_sz);
             g_direct_buffers.erase(it);
             g_direct_buf_count.store(g_direct_buffers.size(), std::memory_order_release);
@@ -1268,7 +1277,8 @@ void jni_GetDirectBufferAddress(Ctx& c) {
         return;
     }
     memcpy(h(ga), p, cap);
-    g_direct_buffers[p] = {ga, p, sz, static_cast<size_t>(cap)};
+    g_direct_buffers[p] = {ga, p, sz, static_cast<size_t>(cap), seq};
+    g_guest_to_host_buf[ga] = p;
     g_direct_buf_count.store(g_direct_buffers.size(), std::memory_order_release);
     if (get_log_level() >= LOG_LEVEL_ADVANCED) {
         NB_LOGI("jni_GetDirectBufferAddress: mirrored host buffer %p (%zu bytes) -> guest %#x", p, (size_t)cap, ga);
@@ -1336,21 +1346,52 @@ gaddr jni_guest_env() { return g_guest_env; }
 gaddr jni_guest_vm() { return g_guest_vm; }
 JNIEnv* jni_env() { return env(); }
 u32 jni_local(jobject o) { return local(o); }
+u32 jni_global(jobject o) {
+    if (!o) return 0;
+    JNIEnv* e = env();
+    jobject g = e->NewGlobalRef(o);
+    return global(g, kGlobalFrame);
+}
 jobject jni_obj(u32 hnd) { return obj(hnd); }
 
 bool jni_has_direct_buffers() {
     return g_direct_buf_count.load(std::memory_order_relaxed) > 0;
 }
 
-void jni_sync_direct_buffers_to_host() {
-    if (!jni_has_direct_buffers()) return;
+void jni_sync_buffer_arg(u32 hnd) {
+    if (!hnd || !t_env || (hnd & 3) || (hnd >> 2) >= kMaxRefs) return;
+    jobject o = obj(hnd);
+    if (!o) return;
+    void* p = t_env->GetDirectBufferAddress(o);
+    if (!p || in_guest(p)) return;
     std::lock_guard lk(g_direct_buf_mu);
-    for (const auto& pair : g_direct_buffers) {
-        const auto& rec = pair.second;
+    auto it = g_direct_buffers.find(p);
+    if (it != g_direct_buffers.end()) {
+        const auto& rec = it->second;
         if (rec.host_ptr && rec.guest_addr && rec.capacity > 0) {
             memcpy(rec.host_ptr, h(rec.guest_addr), rec.capacity);
         }
     }
+}
+
+void jni_sync_buffer_guest(gaddr ga) {
+    if (!ga) return;
+    std::lock_guard lk(g_direct_buf_mu);
+    auto it = g_guest_to_host_buf.find(ga);
+    if (it != g_guest_to_host_buf.end()) {
+        auto d_it = g_direct_buffers.find(it->second);
+        if (d_it != g_direct_buffers.end()) {
+            const auto& rec = d_it->second;
+            if (rec.host_ptr && rec.guest_addr && rec.capacity > 0) {
+                memcpy(rec.host_ptr, h(rec.guest_addr), rec.capacity);
+            }
+        }
+    }
+}
+
+void jni_sync_direct_buffers_to_host() {
+    // Deprecated global full-table sync - replaced by targeted jni_sync_buffer_arg
+    // to prevent memory bandwidth saturation, frame drops, and ART heap corruption.
 }
 
 JniFrame::JniFrame(JNIEnv* e) {

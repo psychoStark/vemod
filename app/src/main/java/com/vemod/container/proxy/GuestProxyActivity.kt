@@ -1,7 +1,9 @@
 package com.vemod.container.proxy
 
 import android.app.Activity
+import android.content.Context
 import android.content.Intent
+import android.os.Build
 import android.os.Bundle
 import android.util.Log
 
@@ -16,6 +18,24 @@ open class GuestProxyActivity : Activity() {
         const val EXTRA_IS_DATA_EXPOSED = "extra_is_data_exposed"
         const val EXTRA_EXPOSED_DIR = "extra_exposed_dir"
         private const val TAG = "GuestProxyActivity"
+    }
+
+    override fun onUserLeaveHint() {
+        val pkg = intent?.getStringExtra(EXTRA_PACKAGE_NAME)
+        val isPipEnabled = if (!pkg.isNullOrEmpty()) {
+            com.vemod.container.container.ContainerRegistry.isPipEnabledForApp(this, pkg)
+        } else {
+            val prefs = getSharedPreferences("vemod_settings", Context.MODE_PRIVATE)
+            prefs.getBoolean("pip_enabled", false)
+        }
+        if (isPipEnabled && Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            try {
+                enterPictureInPictureMode(
+                    android.app.PictureInPictureParams.Builder().build()
+                )
+            } catch (_: Throwable) {}
+        }
+        // Don't call super to prevent unintended system auto-PiP when disabled
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -36,11 +56,25 @@ open class GuestProxyActivity : Activity() {
         val pkg = srcIntent.getStringExtra(EXTRA_PACKAGE_NAME)
             ?: srcIntent.getStringExtra("extra_container_package")
             ?: srcIntent.data?.getQueryParameter("package")
+            ?: srcIntent.data?.getQueryParameter("pkg")
             ?: ""
 
+        if (pkg.isNotEmpty()) {
+            com.vemod.container.container.ContainerRegistry.recordAppLaunch(this, pkg)
+        }
+
         val app = if (pkg.isNotEmpty()) com.vemod.container.container.ContainerRegistry.getApp(this, pkg) else null
-        val orientation = app?.screenOrientation
-            ?: srcIntent.getIntExtra(EXTRA_SCREEN_ORIENTATION, android.content.pm.ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED)
+        if (app == null) {
+            Log.w(TAG, "Container for '$pkg' does not exist or was uninstalled")
+            if (pkg.isNotEmpty()) {
+                android.widget.Toast.makeText(this, "App is not installed in Vemod", android.widget.Toast.LENGTH_LONG).show()
+                com.vemod.container.container.StubApkGenerator.uninstallStub(this, pkg)
+            }
+            finish()
+            return
+        }
+
+        val orientation = app.screenOrientation
 
         val targetClass = GuestProcessManager.getTargetProxyClass(this, pkg, orientation)
         Log.i(TAG, "Router: dispatching $pkg -> ${targetClass.simpleName} (orientation=$orientation)")
@@ -48,19 +82,15 @@ open class GuestProxyActivity : Activity() {
         val forwardIntent = Intent(this, targetClass).apply {
             addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
             srcIntent.extras?.let { putExtras(it) }
-            if (app != null) {
-                putExtra(EXTRA_PACKAGE_NAME, app.packageName)
-                putExtra(EXTRA_CONTAINER_DIR, app.containerDir.absolutePath)
-                putExtra(EXTRA_BASE_APK, app.baseApk.absolutePath)
-                putExtra(EXTRA_LAUNCH_ACTIVITY, app.launchActivity)
-                putExtra(EXTRA_SCREEN_ORIENTATION, app.screenOrientation)
-                putExtra(EXTRA_IS_DATA_EXPOSED, app.isDataExposed)
-                if (app.isDataExposed) {
-                    val exp = com.vemod.container.container.ContainerRegistry.getExposedDir(this@GuestProxyActivity, app)
-                    putExtra(EXTRA_EXPOSED_DIR, exp.absolutePath)
-                }
-            } else if (pkg.isNotEmpty()) {
-                putExtra(EXTRA_PACKAGE_NAME, pkg)
+            putExtra(EXTRA_PACKAGE_NAME, app.packageName)
+            putExtra(EXTRA_CONTAINER_DIR, app.containerDir.absolutePath)
+            putExtra(EXTRA_BASE_APK, app.baseApk.absolutePath)
+            putExtra(EXTRA_LAUNCH_ACTIVITY, app.launchActivity)
+            putExtra(EXTRA_SCREEN_ORIENTATION, app.screenOrientation)
+            putExtra(EXTRA_IS_DATA_EXPOSED, app.isDataExposed)
+            if (app.isDataExposed) {
+                val exp = com.vemod.container.container.ContainerRegistry.getExposedDir(this@GuestProxyActivity, app)
+                putExtra(EXTRA_EXPOSED_DIR, exp.absolutePath)
             }
         }
         startActivity(forwardIntent)

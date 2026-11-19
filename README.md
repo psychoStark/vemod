@@ -49,6 +49,52 @@ Each app is isolated safely inside Vemod. You can remove any installed app at an
 
 ---
 
+## 🔨 Building from Source
+
+### Prerequisites
+
+| Requirement | Version |
+|---|---|
+| Android Studio | Ladybug (2024.2) or later |
+| JDK | 17+ |
+| Android SDK (compileSdk) | 35 |
+| Android NDK | 28.2.13676358 |
+| CMake | 3.22.1 |
+| Kotlin | 2.x (via Compose compiler plugin) |
+
+### Build Steps
+
+1. **Clone** the repository:
+   ```bash
+   git clone https://github.com/<your-org>/vemod.git
+   cd vemod
+   ```
+
+2. **Build** (debug):
+   ```bash
+   ./gradlew assembleDebug
+   ```
+   or for release:
+   ```bash
+   ./gradlew assembleRelease
+   ```
+
+3. **Output APK** will be at:
+   ```
+   app/build/outputs/apk/debug/app-debug.apk
+   app/build/outputs/apk/release/app-release-unsigned.apk
+   ```
+
+### Architecture
+
+Vemod builds exclusively for `arm64-v8a`. The 32-bit guest binaries run via the embedded Dynarmic JIT — no 32-bit host libraries are required.
+
+### Native Build Notes
+
+The native C++ layer (Dynarmic JIT, bridge, GLES, OpenSL ES) is built via CMake. First build may take several minutes as it compiles Dynarmic and its dependencies (biscuit, fmt, mcl, oaknut, zydis). Subsequent builds are incremental.
+
+---
+
 ## ⚠️ Unsupported Systems & Limitations
 
 Because Vemod runs as a 100% userspace container without device root, kernel modules, or low-level OS modifications:
@@ -66,4 +112,4 @@ Because Vemod runs as a 100% userspace container without device root, kernel mod
 
 ## 🛠️ For Developers & Technical Deep-Dive
 
-Looking for the technical internals, JIT compilation engine (Dynarmic), JNI bridging, syscall router, and architecture? See the full [Technical Documentation](documentation.md).
+Looking for the technical internals, JIT compilation engine (Dynarmic), JNI bridging, syscall router, and architecture? See the full [Technical Documentation](docs/documentation.md).

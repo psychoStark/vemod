@@ -26,7 +26,17 @@ object WindowSessionHook {
             val proxy = Proxy.newProxyInstance(
                 sessionClass.classLoader,
                 arrayOf(sessionClass)
-            ) { _, method, args ->
+            ) { p, method, args ->
+                if (method.name == "equals") {
+                    val other = args?.getOrNull(0)
+                    return@newProxyInstance p === other || realSession == other
+                }
+                if (method.name == "hashCode") {
+                    return@newProxyInstance realSession.hashCode()
+                }
+                if (method.name == "toString") {
+                    return@newProxyInstance realSession.toString()
+                }
                 if (args != null) {
                     for (i in args.indices) {
                         val arg = args[i]

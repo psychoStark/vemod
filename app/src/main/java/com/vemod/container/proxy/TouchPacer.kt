@@ -80,6 +80,17 @@ class TouchPacer private constructor(
     }
 
     override fun invoke(proxy: Any?, method: Method, args: Array<out Any?>?): Any? {
+        if (method.name == "equals") {
+            val other = args?.getOrNull(0)
+            return proxy === other || delegate == other
+        }
+        if (method.name == "hashCode") {
+            return delegate.hashCode()
+        }
+        if (method.name == "toString") {
+            return delegate.toString()
+        }
+
         if (method.name == "dispatchTouchEvent" && args != null && args.isNotEmpty()) {
             val event = args[0] as? MotionEvent
             if (event != null) {

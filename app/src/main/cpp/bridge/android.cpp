@@ -3,7 +3,9 @@
 #include <cstdio>
 #include <mutex>
 #include <unordered_map>
+#include <unistd.h>
 
+#include "cpu.h"
 #include "jni_bridge.h"
 #include "nb.h"
 
@@ -87,6 +89,20 @@ void x_log_print(Ctx& c) {
 int x_log_write(int prio, const char* tag, const char* text) {
     log_write(prio, tag ? tag : "nin", text ? text : "");
     return 1;
+}
+
+void x_log_assert(Ctx& c) {
+    const char* cond = hs(c.a32());
+    const char* tag = hs(c.a32());
+    const char* fmt = hs(c.a32());
+    std::string s;
+    if (fmt) {
+        CtxArgs a(c);
+        s = gformat(fmt, a);
+    }
+    log_write(ANDROID_LOG_FATAL, tag ? tag : "assert", s.c_str());
+    c.cpu.dump("assertion failure");
+    fatal("guest assertion failed [%s] (%s): %s", tag ? tag : "assert", cond ? cond : "?", s.c_str());
 }
 
 // ------------------------------------------------------------------ assets
@@ -348,6 +364,9 @@ int x_ALooper_pollOnce(int timeoutMillis, u32 outFd, u32 outEvents, u32 outData)
     if (outFd && is_mapped(outFd)) wr<s32>(outFd, fd);
     if (outEvents && is_mapped(outEvents)) wr<s32>(outEvents, events);
     if (outData && is_mapped(outData)) wr<u32>(outData, to_guest_egl(data));
+    if (timeoutMillis <= 0 && res < 0) {
+        usleep(1000);
+    }
     return res;
 #else
     return kALooperPollTimeout;
@@ -365,6 +384,9 @@ int x_ALooper_pollAll(int timeoutMillis, u32 outFd, u32 outEvents, u32 outData) 
     if (outFd && is_mapped(outFd)) wr<s32>(outFd, fd);
     if (outEvents && is_mapped(outEvents)) wr<s32>(outEvents, events);
     if (outData && is_mapped(outData)) wr<u32>(outData, to_guest_egl(data));
+    if (timeoutMillis <= 0 && res < 0) {
+        usleep(1000);
+    }
     return res;
 #else
     return kALooperPollTimeout;
@@ -395,11 +417,41 @@ int x_ALooper_removeFd(u32 looper, int fd) {
 }
 
 // ------------------------------------------------------------------ AInputQueue
-void x_AInputQueue_attachLooper(u32 queue, u32 looper, int ident, u32 /*callback*/, u32 /*data*/) {
+struct InputQueueCbContext {
+    u32 guest_cb;
+    u32 guest_data;
+};
+static std::mutex s_input_queue_cb_mutex;
+static std::vector<std::unique_ptr<InputQueueCbContext>> s_input_queue_cbs;
+
+#ifdef NB_ANDROID_RUNTIME
+static int input_queue_looper_callback(int fd, int events, void* data) {
+    auto* ctx = static_cast<InputQueueCbContext*>(data);
+    if (!ctx) return 1;
+    if (ctx->guest_cb) {
+        return static_cast<int>(call_guest(ctx->guest_cb, {ga(fd), ga(events), ga(ctx->guest_data)}));
+    }
+    return 1;
+}
+#endif
+
+void x_AInputQueue_attachLooper(u32 queue, u32 looper, int ident, u32 callback, u32 data) {
 #ifdef NB_ANDROID_RUNTIME
     AInputQueue* q = (AInputQueue*)to_host_egl(queue);
     ALooper* l = (ALooper*)to_host_egl(looper);
-    if (q && l) AInputQueue_attachLooper(q, l, ident, nullptr, nullptr);
+    ALooper_callbackFunc host_cb = nullptr;
+    void* host_data = nullptr;
+    if (callback) {
+        std::lock_guard<std::mutex> lock(s_input_queue_cb_mutex);
+        auto c = std::make_unique<InputQueueCbContext>();
+        c->guest_cb = callback;
+        c->guest_data = data;
+        host_cb = input_queue_looper_callback;
+        host_data = c.get();
+        s_input_queue_cbs.push_back(std::move(c));
+    }
+    if (q && l) AInputQueue_attachLooper(q, l, ident, host_cb, host_data);
+    NB_LOGI("AInputQueue_attachLooper(q=%p, l=%p, ident=%d, cb=%#x, data=%#x)", q, l, ident, callback, data);
 #endif
 }
 
@@ -407,6 +459,7 @@ void x_AInputQueue_detachLooper(u32 queue) {
 #ifdef NB_ANDROID_RUNTIME
     AInputQueue* q = (AInputQueue*)to_host_egl(queue);
     if (q) AInputQueue_detachLooper(q);
+    NB_LOGI("AInputQueue_detachLooper(q=%p)", q);
 #endif
 }
 
@@ -426,6 +479,11 @@ int x_AInputQueue_getEvent(u32 queue, u32 outEvent) {
         int res = AInputQueue_getEvent(q, &ev);
         if (res >= 0 && ev) {
             wr<u32>(outEvent, to_guest_egl(ev));
+            static std::atomic<int> s_ev_cnt{0};
+            if (++s_ev_cnt % 30 == 1) {
+                int type = AInputEvent_getType(ev);
+                NB_LOGI("AInputQueue_getEvent: event=%p (type=%d, count=%d)", ev, type, s_ev_cnt.load());
+            }
             return res;
         }
     }
@@ -451,37 +509,245 @@ void x_AInputQueue_finishEvent(u32 queue, u32 event, int handled) {
 }
 
 // ------------------------------------------------------------------ AInputEvent & AMotionEvent
-int x_AInputEvent_getType(u32 /*event*/) { return 0; }
-int x_AInputEvent_getDeviceId(u32 /*event*/) { return 0; }
-int x_AInputEvent_getSource(u32 /*event*/) { return 0; }
+int x_AInputEvent_getType(u32 event) {
+#ifdef NB_ANDROID_RUNTIME
+    auto* ev = static_cast<const AInputEvent*>(to_host_egl(event));
+    if (ev) return AInputEvent_getType(ev);
+#endif
+    return 0;
+}
 
-int x_AMotionEvent_getAction(u32 /*event*/) { return 0; }
-int x_AMotionEvent_getFlags(u32 /*event*/) { return 0; }
-int x_AMotionEvent_getMetaState(u32 /*event*/) { return 0; }
-int x_AMotionEvent_getButtonState(u32 /*event*/) { return 0; }
-int x_AMotionEvent_getEdgeFlags(u32 /*event*/) { return 0; }
-s64 x_AMotionEvent_getDownTime(u32 /*event*/) { return 0; }
-s64 x_AMotionEvent_getEventTime(u32 /*event*/) { return 0; }
-u32 x_AMotionEvent_getXOffset(u32 /*event*/) { return 0; }
-u32 x_AMotionEvent_getYOffset(u32 /*event*/) { return 0; }
-u32 x_AMotionEvent_getXPrecision(u32 /*event*/) { return 0; }
-u32 x_AMotionEvent_getYPrecision(u32 /*event*/) { return 0; }
-u32 x_AMotionEvent_getPointerCount(u32 /*event*/) { return 1; }
-int x_AMotionEvent_getPointerId(u32 /*event*/, u32 /*idx*/) { return 0; }
-u32 x_AMotionEvent_getToolType(u32 /*event*/, u32 /*idx*/) { return 0; }
-u32 x_AMotionEvent_getRawX(u32 /*event*/, u32 /*idx*/) { return 0; }
-u32 x_AMotionEvent_getRawY(u32 /*event*/, u32 /*idx*/) { return 0; }
-u32 x_AMotionEvent_getX(u32 /*event*/, u32 /*idx*/) { return 0; }
-u32 x_AMotionEvent_getY(u32 /*event*/, u32 /*idx*/) { return 0; }
-u32 x_AMotionEvent_getPressure(u32 /*event*/, u32 /*idx*/) { return 0; }
-u32 x_AMotionEvent_getSize(u32 /*event*/, u32 /*idx*/) { return 0; }
-u32 x_AMotionEvent_getTouchMajor(u32 /*event*/, u32 /*idx*/) { return 0; }
-u32 x_AMotionEvent_getTouchMinor(u32 /*event*/, u32 /*idx*/) { return 0; }
-u32 x_AMotionEvent_getToolMajor(u32 /*event*/, u32 /*idx*/) { return 0; }
-u32 x_AMotionEvent_getToolMinor(u32 /*event*/, u32 /*idx*/) { return 0; }
-u32 x_AMotionEvent_getOrientation(u32 /*event*/, u32 /*idx*/) { return 0; }
-u32 x_AMotionEvent_getAxisValue(u32 /*event*/, int /*axis*/, u32 /*idx*/) { return 0; }
-u32 x_AMotionEvent_getHistorySize(u32 /*event*/) { return 0; }
+int x_AInputEvent_getDeviceId(u32 event) {
+#ifdef NB_ANDROID_RUNTIME
+    auto* ev = static_cast<const AInputEvent*>(to_host_egl(event));
+    if (ev) return AInputEvent_getDeviceId(ev);
+#endif
+    return 0;
+}
+
+int x_AInputEvent_getSource(u32 event) {
+#ifdef NB_ANDROID_RUNTIME
+    auto* ev = static_cast<const AInputEvent*>(to_host_egl(event));
+    if (ev) return AInputEvent_getSource(ev);
+#endif
+    return 0;
+}
+
+int x_AMotionEvent_getAction(u32 event) {
+#ifdef NB_ANDROID_RUNTIME
+    auto* ev = static_cast<const AInputEvent*>(to_host_egl(event));
+    if (ev) return AMotionEvent_getAction(ev);
+#endif
+    return 0;
+}
+
+int x_AMotionEvent_getFlags(u32 event) {
+#ifdef NB_ANDROID_RUNTIME
+    auto* ev = static_cast<const AInputEvent*>(to_host_egl(event));
+    if (ev) return AMotionEvent_getFlags(ev);
+#endif
+    return 0;
+}
+
+int x_AMotionEvent_getMetaState(u32 event) {
+#ifdef NB_ANDROID_RUNTIME
+    auto* ev = static_cast<const AInputEvent*>(to_host_egl(event));
+    if (ev) return AMotionEvent_getMetaState(ev);
+#endif
+    return 0;
+}
+
+int x_AMotionEvent_getButtonState(u32 event) {
+#ifdef NB_ANDROID_RUNTIME
+    auto* ev = static_cast<const AInputEvent*>(to_host_egl(event));
+    if (ev) return AMotionEvent_getButtonState(ev);
+#endif
+    return 0;
+}
+
+int x_AMotionEvent_getEdgeFlags(u32 event) {
+#ifdef NB_ANDROID_RUNTIME
+    auto* ev = static_cast<const AInputEvent*>(to_host_egl(event));
+    if (ev) return AMotionEvent_getEdgeFlags(ev);
+#endif
+    return 0;
+}
+
+s64 x_AMotionEvent_getDownTime(u32 event) {
+#ifdef NB_ANDROID_RUNTIME
+    auto* ev = static_cast<const AInputEvent*>(to_host_egl(event));
+    if (ev) return AMotionEvent_getDownTime(ev);
+#endif
+    return 0;
+}
+
+s64 x_AMotionEvent_getEventTime(u32 event) {
+#ifdef NB_ANDROID_RUNTIME
+    auto* ev = static_cast<const AInputEvent*>(to_host_egl(event));
+    if (ev) return AMotionEvent_getEventTime(ev);
+#endif
+    return 0;
+}
+
+float x_AMotionEvent_getXOffset(u32 event) {
+#ifdef NB_ANDROID_RUNTIME
+    auto* ev = static_cast<const AInputEvent*>(to_host_egl(event));
+    if (ev) return AMotionEvent_getXOffset(ev);
+#endif
+    return 0.0f;
+}
+
+float x_AMotionEvent_getYOffset(u32 event) {
+#ifdef NB_ANDROID_RUNTIME
+    auto* ev = static_cast<const AInputEvent*>(to_host_egl(event));
+    if (ev) return AMotionEvent_getYOffset(ev);
+#endif
+    return 0.0f;
+}
+
+float x_AMotionEvent_getXPrecision(u32 event) {
+#ifdef NB_ANDROID_RUNTIME
+    auto* ev = static_cast<const AInputEvent*>(to_host_egl(event));
+    if (ev) return AMotionEvent_getXPrecision(ev);
+#endif
+    return 0.0f;
+}
+
+float x_AMotionEvent_getYPrecision(u32 event) {
+#ifdef NB_ANDROID_RUNTIME
+    auto* ev = static_cast<const AInputEvent*>(to_host_egl(event));
+    if (ev) return AMotionEvent_getYPrecision(ev);
+#endif
+    return 0.0f;
+}
+
+u32 x_AMotionEvent_getPointerCount(u32 event) {
+#ifdef NB_ANDROID_RUNTIME
+    auto* ev = static_cast<const AInputEvent*>(to_host_egl(event));
+    if (ev) return static_cast<u32>(AMotionEvent_getPointerCount(ev));
+#endif
+    return 1;
+}
+
+int x_AMotionEvent_getPointerId(u32 event, u32 idx) {
+#ifdef NB_ANDROID_RUNTIME
+    auto* ev = static_cast<const AInputEvent*>(to_host_egl(event));
+    if (ev) return AMotionEvent_getPointerId(ev, idx);
+#endif
+    return 0;
+}
+
+int x_AMotionEvent_getToolType(u32 event, u32 idx) {
+#ifdef NB_ANDROID_RUNTIME
+    auto* ev = static_cast<const AInputEvent*>(to_host_egl(event));
+    if (ev) return AMotionEvent_getToolType(ev, idx);
+#endif
+    return 0;
+}
+
+float x_AMotionEvent_getRawX(u32 event, u32 idx) {
+#ifdef NB_ANDROID_RUNTIME
+    auto* ev = static_cast<const AInputEvent*>(to_host_egl(event));
+    if (ev) return AMotionEvent_getRawX(ev, idx);
+#endif
+    return 0.0f;
+}
+
+float x_AMotionEvent_getRawY(u32 event, u32 idx) {
+#ifdef NB_ANDROID_RUNTIME
+    auto* ev = static_cast<const AInputEvent*>(to_host_egl(event));
+    if (ev) return AMotionEvent_getRawY(ev, idx);
+#endif
+    return 0.0f;
+}
+
+float x_AMotionEvent_getX(u32 event, u32 idx) {
+#ifdef NB_ANDROID_RUNTIME
+    auto* ev = static_cast<const AInputEvent*>(to_host_egl(event));
+    if (ev) return AMotionEvent_getX(ev, idx);
+#endif
+    return 0.0f;
+}
+
+float x_AMotionEvent_getY(u32 event, u32 idx) {
+#ifdef NB_ANDROID_RUNTIME
+    auto* ev = static_cast<const AInputEvent*>(to_host_egl(event));
+    if (ev) return AMotionEvent_getY(ev, idx);
+#endif
+    return 0.0f;
+}
+
+float x_AMotionEvent_getPressure(u32 event, u32 idx) {
+#ifdef NB_ANDROID_RUNTIME
+    auto* ev = static_cast<const AInputEvent*>(to_host_egl(event));
+    if (ev) return AMotionEvent_getPressure(ev, idx);
+#endif
+    return 0.0f;
+}
+
+float x_AMotionEvent_getSize(u32 event, u32 idx) {
+#ifdef NB_ANDROID_RUNTIME
+    auto* ev = static_cast<const AInputEvent*>(to_host_egl(event));
+    if (ev) return AMotionEvent_getSize(ev, idx);
+#endif
+    return 0.0f;
+}
+
+float x_AMotionEvent_getTouchMajor(u32 event, u32 idx) {
+#ifdef NB_ANDROID_RUNTIME
+    auto* ev = static_cast<const AInputEvent*>(to_host_egl(event));
+    if (ev) return AMotionEvent_getTouchMajor(ev, idx);
+#endif
+    return 0.0f;
+}
+
+float x_AMotionEvent_getTouchMinor(u32 event, u32 idx) {
+#ifdef NB_ANDROID_RUNTIME
+    auto* ev = static_cast<const AInputEvent*>(to_host_egl(event));
+    if (ev) return AMotionEvent_getTouchMinor(ev, idx);
+#endif
+    return 0.0f;
+}
+
+float x_AMotionEvent_getToolMajor(u32 event, u32 idx) {
+#ifdef NB_ANDROID_RUNTIME
+    auto* ev = static_cast<const AInputEvent*>(to_host_egl(event));
+    if (ev) return AMotionEvent_getToolMajor(ev, idx);
+#endif
+    return 0.0f;
+}
+
+float x_AMotionEvent_getToolMinor(u32 event, u32 idx) {
+#ifdef NB_ANDROID_RUNTIME
+    auto* ev = static_cast<const AInputEvent*>(to_host_egl(event));
+    if (ev) return AMotionEvent_getToolMinor(ev, idx);
+#endif
+    return 0.0f;
+}
+
+float x_AMotionEvent_getOrientation(u32 event, u32 idx) {
+#ifdef NB_ANDROID_RUNTIME
+    auto* ev = static_cast<const AInputEvent*>(to_host_egl(event));
+    if (ev) return AMotionEvent_getOrientation(ev, idx);
+#endif
+    return 0.0f;
+}
+
+float x_AMotionEvent_getAxisValue(u32 event, int axis, u32 idx) {
+#ifdef NB_ANDROID_RUNTIME
+    auto* ev = static_cast<const AInputEvent*>(to_host_egl(event));
+    if (ev) return AMotionEvent_getAxisValue(ev, axis, idx);
+#endif
+    return 0.0f;
+}
+
+u32 x_AMotionEvent_getHistorySize(u32 event) {
+#ifdef NB_ANDROID_RUNTIME
+    auto* ev = static_cast<const AInputEvent*>(to_host_egl(event));
+    if (ev) return static_cast<u32>(AMotionEvent_getHistorySize(ev));
+#endif
+    return 0;
+}
 
 // ------------------------------------------------------------------ AConfiguration
 u32 x_AConfiguration_new() { return 0x3000; }
@@ -490,14 +756,94 @@ void x_AConfiguration_fromAssetManager(u32 /*config*/, u32 /*am*/) {}
 int x_AConfiguration_getOrientation(u32 /*config*/) { return 1; }
 
 // ------------------------------------------------------------- AKeyEvent
-int x_AKeyEvent_getAction(u32 /*event*/) { return 0; }
-int x_AKeyEvent_getKeyCode(u32 /*event*/) { return 0; }
-int x_AKeyEvent_getMetaState(u32 /*event*/) { return 0; }
+int x_AKeyEvent_getAction(u32 event) {
+#ifdef NB_ANDROID_RUNTIME
+    auto* ev = static_cast<const AInputEvent*>(to_host_egl(event));
+    if (ev) return AKeyEvent_getAction(ev);
+#endif
+    return 0;
+}
+
+int x_AKeyEvent_getKeyCode(u32 event) {
+#ifdef NB_ANDROID_RUNTIME
+    auto* ev = static_cast<const AInputEvent*>(to_host_egl(event));
+    if (ev) return AKeyEvent_getKeyCode(ev);
+#endif
+    return 0;
+}
+
+int x_AKeyEvent_getScanCode(u32 event) {
+#ifdef NB_ANDROID_RUNTIME
+    auto* ev = static_cast<const AInputEvent*>(to_host_egl(event));
+    if (ev) return AKeyEvent_getScanCode(ev);
+#endif
+    return 0;
+}
+
+int x_AKeyEvent_getMetaState(u32 event) {
+#ifdef NB_ANDROID_RUNTIME
+    auto* ev = static_cast<const AInputEvent*>(to_host_egl(event));
+    if (ev) return AKeyEvent_getMetaState(ev);
+#endif
+    return 0;
+}
+
+int x_AKeyEvent_getRepeatCount(u32 event) {
+#ifdef NB_ANDROID_RUNTIME
+    auto* ev = static_cast<const AInputEvent*>(to_host_egl(event));
+    if (ev) return AKeyEvent_getRepeatCount(ev);
+#endif
+    return 0;
+}
+
+s64 x_AKeyEvent_getDownTime(u32 event) {
+#ifdef NB_ANDROID_RUNTIME
+    auto* ev = static_cast<const AInputEvent*>(to_host_egl(event));
+    if (ev) return AKeyEvent_getDownTime(ev);
+#endif
+    return 0;
+}
+
+s64 x_AKeyEvent_getEventTime(u32 event) {
+#ifdef NB_ANDROID_RUNTIME
+    auto* ev = static_cast<const AInputEvent*>(to_host_egl(event));
+    if (ev) return AKeyEvent_getEventTime(ev);
+#endif
+    return 0;
+}
+
+int x_AKeyEvent_getFlags(u32 event) {
+#ifdef NB_ANDROID_RUNTIME
+    auto* ev = static_cast<const AInputEvent*>(to_host_egl(event));
+    if (ev) return AKeyEvent_getFlags(ev);
+#endif
+    return 0;
+}
 
 // ------------------------------------------------------------- AMotionEvent historical
-float x_AMotionEvent_getHistoricalX(u32 /*event*/, u32 /*idx*/, u32 /*history_idx*/) { return 0.0f; }
-float x_AMotionEvent_getHistoricalY(u32 /*event*/, u32 /*idx*/, u32 /*history_idx*/) { return 0.0f; }
-s64 x_AMotionEvent_getHistoricalEventTime(u32 /*event*/, u32 /*history_idx*/) { return 0; }
+float x_AMotionEvent_getHistoricalX(u32 event, u32 idx, u32 history_idx) {
+#ifdef NB_ANDROID_RUNTIME
+    auto* ev = static_cast<const AInputEvent*>(to_host_egl(event));
+    if (ev) return AMotionEvent_getHistoricalX(ev, idx, history_idx);
+#endif
+    return 0.0f;
+}
+
+float x_AMotionEvent_getHistoricalY(u32 event, u32 idx, u32 history_idx) {
+#ifdef NB_ANDROID_RUNTIME
+    auto* ev = static_cast<const AInputEvent*>(to_host_egl(event));
+    if (ev) return AMotionEvent_getHistoricalY(ev, idx, history_idx);
+#endif
+    return 0.0f;
+}
+
+s64 x_AMotionEvent_getHistoricalEventTime(u32 event, u32 history_idx) {
+#ifdef NB_ANDROID_RUNTIME
+    auto* ev = static_cast<const AInputEvent*>(to_host_egl(event));
+    if (ev) return AMotionEvent_getHistoricalEventTime(ev, history_idx);
+#endif
+    return 0;
+}
 
 // ------------------------------------------------------------- ASensor
 u32 x_ASensorManager_getInstance() {
@@ -546,7 +892,34 @@ int x_ASensorManager_getSensorList(u32 mgr, u32 /*list*/) {
     return 0;
 }
 
-u32 x_ASensorManager_createEventQueue(u32 mgr, u32 looper, int ident, u32 /*cb*/, u32 /*data*/) {
+struct SensorCbContext {
+    u32 guest_cb;
+    u32 guest_data;
+    ASensorEventQueue* queue;
+};
+
+static std::mutex s_sensor_cb_mutex;
+static std::vector<std::unique_ptr<SensorCbContext>> s_sensor_cbs;
+
+#ifdef NB_ANDROID_RUNTIME
+static int sensor_looper_callback(int fd, int events, void* data) {
+    auto* ctx = static_cast<SensorCbContext*>(data);
+    if (!ctx) return 1;
+    if (ctx->guest_cb) {
+        call_guest(ctx->guest_cb, {ga(fd), ga(events), ga(ctx->guest_data)});
+    }
+    // Safety check: drain any remaining events to prevent infinite looper spin
+    if (ctx->queue) {
+        ASensorEvent drain[8];
+        while (ASensorEventQueue_hasEvents(ctx->queue) > 0) {
+            if (ASensorEventQueue_getEvents(ctx->queue, drain, 8) <= 0) break;
+        }
+    }
+    return 1;
+}
+#endif
+
+u32 x_ASensorManager_createEventQueue(u32 mgr, u32 looper, int ident, u32 cb, u32 data) {
 #ifdef NB_ANDROID_RUNTIME
     ASensorManager* sm = (ASensorManager*)to_host_egl(mgr);
     if (!sm) {
@@ -557,8 +930,27 @@ u32 x_ASensorManager_createEventQueue(u32 mgr, u32 looper, int ident, u32 /*cb*/
         l = ALooper_forThread();
         if (!l) l = ALooper_prepare(ALOOPER_PREPARE_ALLOW_NON_CALLBACKS);
     }
-    ASensorEventQueue* eq = sm ? ASensorManager_createEventQueue(sm, l, ident, nullptr, nullptr) : nullptr;
-    NB_LOGI("ASensorManager_createEventQueue(sm=%p, looper=%p, ident=%d) -> %p (handle %#x)", sm, l, ident, eq, to_guest_egl(eq));
+    ALooper_callbackFunc host_cb = nullptr;
+    void* host_data = nullptr;
+    SensorCbContext* ctx = nullptr;
+    if (cb) {
+        std::lock_guard<std::mutex> lock(s_sensor_cb_mutex);
+        auto c = std::make_unique<SensorCbContext>();
+        c->guest_cb = cb;
+        c->guest_data = data;
+        c->queue = nullptr;
+        ctx = c.get();
+        host_cb = sensor_looper_callback;
+        host_data = ctx;
+        s_sensor_cbs.push_back(std::move(c));
+    }
+    int effective_ident = cb ? ALOOPER_POLL_CALLBACK : ident;
+    ASensorEventQueue* eq = sm ? ASensorManager_createEventQueue(sm, l, effective_ident, host_cb, host_data) : nullptr;
+    if (ctx) {
+        ctx->queue = eq;
+    }
+    NB_LOGI("ASensorManager_createEventQueue(sm=%p, looper=%p, ident=%d, cb=%#x, data=%#x) -> %p (handle %#x)",
+            sm, l, ident, cb, data, eq, to_guest_egl(eq));
     return to_guest_egl(eq);
 #else
     return 0x3020;
@@ -753,6 +1145,7 @@ int x_ANativeWindow_unlockAndPost(u32 /*win*/) { return 0; }
 void register_android() {
     reg("__android_log_print", x_log_print);
     NB_REG("__android_log_write", x_log_write);
+    reg("__android_log_assert", x_log_assert);
     NB_REG("AAssetManager_fromJava", x_mgr_from_java);
     NB_REG("AAssetManager_open", x_asset_open);
     NB_REG("AAsset_getLength", x_asset_length);
@@ -821,7 +1214,12 @@ void register_android() {
     // AKeyEvent
     NB_REG("AKeyEvent_getAction", x_AKeyEvent_getAction);
     NB_REG("AKeyEvent_getKeyCode", x_AKeyEvent_getKeyCode);
+    NB_REG("AKeyEvent_getScanCode", x_AKeyEvent_getScanCode);
     NB_REG("AKeyEvent_getMetaState", x_AKeyEvent_getMetaState);
+    NB_REG("AKeyEvent_getRepeatCount", x_AKeyEvent_getRepeatCount);
+    NB_REG("AKeyEvent_getDownTime", x_AKeyEvent_getDownTime);
+    NB_REG("AKeyEvent_getEventTime", x_AKeyEvent_getEventTime);
+    NB_REG("AKeyEvent_getFlags", x_AKeyEvent_getFlags);
 
     // ASensor
     NB_REG("ASensorManager_getInstance", x_ASensorManager_getInstance);

@@ -43,9 +43,13 @@ captures/
 .idea/modules.xml
 .idea/workspace.xml
 
-# Keystore files
+# Keystore files & Private signing keys
 *.jks
 *.keystore
+*.p12
+*.key
+*.pem
+keystore.properties
 
 # Google Services (if any)
 google-services.json
@@ -72,9 +76,17 @@ Thumbs.db
 # Kotlin
 .kotlin/
 
+# Runtime caches and generated files
+*.vcache
+*.stub.apk
+temp_unsigned.apk
+export/
+test_apks/
+
 # Test folders and reference files
 to test/
 refference/
+reference/
 armeabi-v7a/
 bionic_aosp/
 custom_bionic/
@@ -85,3 +97,14 @@ tango32-module/
 /*.zip
 /*.so
 armeabi-v7a-24_r07.zip
+DIAGNOSIS_REPORT.md
+FIX_PLAN.md
+
+# Archify temporary files, receipts and review dirs
+.archify/
+archify/*.finalize*.json
+archify/*.browser-check.json
+archify/*.delivery*.json
+archify/review-*/
+archify/*.backup.json
+

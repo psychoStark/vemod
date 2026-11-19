@@ -34,21 +34,48 @@ public class FuseAudio implements AudioTrack.OnPlaybackPositionUpdateListener {
         }
     }
 
-    public int AudioCreate(int streamType, int sampleRateInHz, int channelConfig, int audioFormat) {
+    public int AudioCreate(int arg0, int arg1, int arg2, int arg3) {
         m_started = false;
         m_initialized = false;
-        int channel = (channelConfig == 1) ? 2 : 3;
-        int format = (audioFormat == 16) ? 2 : 3;
-        int minBuf = AudioTrack.getMinBufferSize(sampleRateInHz, channel, format);
-        m_trackbuf_size = minBuf * 2;
+
+        // Polarbit signature: AudioCreate(sampleRate, channels, audioFormat, in_bufsize)
+        // E.g. (22050, 2, 16, 14176)
+        int sampleRate = arg0;
+        int channels = arg1;
+        int audioFormat = arg2;
+        int in_bufsize = arg3;
+
+        // Handle swapped cases if any
+        if (sampleRate < 4000 && in_bufsize >= 4000) {
+            int tmp = sampleRate;
+            sampleRate = in_bufsize;
+            in_bufsize = tmp;
+        }
+        if (sampleRate < 4000 || sampleRate > 192000) {
+            sampleRate = 22050;
+        }
+
+        int numChannels = (channels == 1) ? 1 : 2;
+        int channelConfig = (numChannels == 1) ? android.media.AudioFormat.CHANNEL_OUT_MONO : android.media.AudioFormat.CHANNEL_OUT_STEREO;
+        int encoding = (audioFormat == 8) ? android.media.AudioFormat.ENCODING_PCM_8BIT : android.media.AudioFormat.ENCODING_PCM_16BIT;
+        int bytesPerSample = (audioFormat == 8) ? 1 : 2;
+
+        m_bytesperframe = numChannels * bytesPerSample;
+        int minBuf = AudioTrack.getMinBufferSize(sampleRate, channelConfig, encoding);
+        m_trackbuf_size = Math.max(minBuf * 2, (in_bufsize > 0 && in_bufsize < 65536) ? in_bufsize : 8192);
         if (m_trackbuf_size <= 0) m_trackbuf_size = 8192;
-        m_track = new AudioTrack(streamType, sampleRateInHz, channel, format, m_trackbuf_size, 1);
-        m_bytesperframe = (channelConfig * audioFormat) / 8;
-        if (m_bytesperframe <= 0) m_bytesperframe = 4;
+
+        try {
+            m_track = new AudioTrack(AudioManager.STREAM_MUSIC, sampleRate, channelConfig, encoding, m_trackbuf_size, AudioTrack.MODE_STREAM);
+        } catch (Throwable t) {
+            Log.e(LOG_TAG, "FuseAudio: Failed to instantiate AudioTrack", t);
+            m_track = new AudioTrack(AudioManager.STREAM_MUSIC, 22050, android.media.AudioFormat.CHANNEL_OUT_STEREO, android.media.AudioFormat.ENCODING_PCM_16BIT, 8192, AudioTrack.MODE_STREAM);
+        }
+
         m_mixbuf = ByteBuffer.allocateDirect(m_trackbuf_size);
         m_intbuf = new byte[m_trackbuf_size];
         AudioSetVolume();
-        Log.i(LOG_TAG, "AudioCreate: rate=" + sampleRateInHz + ", ch=" + channelConfig + ", bufsize=" + m_trackbuf_size);
+        Log.i(LOG_TAG, "AudioCreate: rate=" + sampleRate + ", ch=" + numChannels + ", bits=" + (bytesPerSample * 8) + ", bufsize=" + m_trackbuf_size + ", bytesperframe=" + m_bytesperframe);
         return 0;
     }
 
@@ -64,10 +91,9 @@ public class FuseAudio implements AudioTrack.OnPlaybackPositionUpdateListener {
     }
 
     void AudioSetVolume() {
-        if (m_track != null && m_am != null) {
+        if (m_track != null) {
             try {
-                float v = (float)(m_am.getStreamVolume(3) | 1);
-                m_track.setStereoVolume(v, v);
+                m_track.setStereoVolume(1.0f, 1.0f);
             } catch (Throwable ignored) {}
         }
     }
@@ -75,11 +101,12 @@ public class FuseAudio implements AudioTrack.OnPlaybackPositionUpdateListener {
     public void AudioSetVolume(int left, int right) {
         if (m_track != null) {
             try {
-                float max = AudioTrack.getMaxVolume();
-                float min = AudioTrack.getMinVolume();
-                float range = max - min;
-                float l = min + (left * range / 100.0f);
-                float r = min + (right * range / 100.0f);
+                float l = Math.max(0.0f, Math.min(1.0f, left / 100.0f));
+                float r = Math.max(0.0f, Math.min(1.0f, right / 100.0f));
+                if (l == 0f && r == 0f && (left > 0 || right > 0)) {
+                    l = 1.0f;
+                    r = 1.0f;
+                }
                 m_track.setStereoVolume(l, r);
             } catch (Throwable ignored) {}
         }
@@ -92,7 +119,8 @@ public class FuseAudio implements AudioTrack.OnPlaybackPositionUpdateListener {
         if (m_track == null) return 0;
 
         int period = m_trackbuf_size / (m_bytesperframe * 2);
-        if (period <= 0) period = 1024;
+        if (period <= 0) period = 512;
+        if (period > 2048) period = 1024;
         m_lastframe = 0;
         try {
             m_track.setPositionNotificationPeriod(period);
@@ -115,10 +143,14 @@ public class FuseAudio implements AudioTrack.OnPlaybackPositionUpdateListener {
                 while (m_started && m_track != null) {
                     try {
                         if (m_mixbuf != null && m_intbuf != null && mixFn != null) {
-                            mixFn.invoke(null, m_mixbuf, periodicFrames);
-                            m_mixbuf.get(m_intbuf, 0, writeBytes);
                             m_mixbuf.position(0);
-                            int written = m_track.write(m_intbuf, 0, writeBytes);
+                            m_mixbuf.limit(writeBytes);
+                            mixFn.invoke(null, m_mixbuf, periodicFrames);
+                            m_mixbuf.position(0);
+                            int toRead = Math.min(writeBytes, m_mixbuf.remaining());
+                            m_mixbuf.get(m_intbuf, 0, toRead);
+                            m_mixbuf.position(0);
+                            int written = m_track.write(m_intbuf, 0, toRead);
                             if (written < 0) {
                                 Thread.sleep(10);
                             }
@@ -128,8 +160,8 @@ public class FuseAudio implements AudioTrack.OnPlaybackPositionUpdateListener {
                     } catch (InterruptedException ie) {
                         break;
                     } catch (Throwable t) {
-                        // ignore and continue or break on fatal
-                        break;
+                        Log.w(LOG_TAG, "FuseAudioPump suppressed error: " + t.getMessage());
+                        try { Thread.sleep(20); } catch (Throwable ignored) {}
                     }
                 }
             }

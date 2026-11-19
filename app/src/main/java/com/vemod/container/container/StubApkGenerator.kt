@@ -1,11 +1,13 @@
 package com.vemod.container.container
 
+import android.app.Activity
 import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageInstaller
 import android.content.pm.PackageManager
 import android.net.Uri
+import android.os.Build
 import android.util.Log
 import androidx.core.content.FileProvider
 import com.android.apksig.ApkSigner
@@ -18,6 +20,8 @@ import java.nio.ByteOrder
 import java.security.KeyStore
 import java.security.PrivateKey
 import java.security.cert.X509Certificate
+import java.util.Collections
+import java.util.LinkedHashMap
 import java.util.zip.CRC32
 import java.util.zip.ZipEntry
 import java.util.zip.ZipOutputStream
@@ -30,18 +34,52 @@ object StubApkGenerator {
         return "$STUB_PKG_PREFIX$guestPackage"
     }
 
+    fun getInstalledStubPackages(context: Context, guestPackage: String): List<String> {
+        val found = mutableListOf<String>()
+        val defaultStub = getStubPackageName(guestPackage)
+        val legacyStub = "com.vemod.stub.$guestPackage"
+
+        if (isPackageInstalled(context, defaultStub)) {
+            found.add(defaultStub)
+        }
+        if (isPackageInstalled(context, legacyStub) && !found.contains(legacyStub)) {
+            found.add(legacyStub)
+        }
+
+        // Broad fallback scan in case package naming differed slightly
+        try {
+            val installed = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                context.packageManager.getInstalledPackages(PackageManager.PackageInfoFlags.of(0))
+            } else {
+                @Suppress("DEPRECATION")
+                context.packageManager.getInstalledPackages(0)
+            }
+            for (info in installed) {
+                val pkg = info.packageName
+                if ((pkg.startsWith(STUB_PKG_PREFIX) || pkg.startsWith("com.vemod.stub.")) &&
+                    pkg.endsWith(guestPackage) && !found.contains(pkg)) {
+                    found.add(pkg)
+                }
+            }
+        } catch (e: Throwable) {
+            Log.w(TAG, "Failed to query installed packages: ${e.message}")
+        }
+        return found
+    }
+
     fun isStubInstalled(context: Context, guestPackage: String): Boolean {
-        val stubPkg = getStubPackageName(guestPackage)
-        return try {
-            context.packageManager.getPackageInfo(stubPkg, 0)
-            true
-        } catch (_: Throwable) {
-            // Also check old stub package prefix for backward compatibility
-            try {
-                context.packageManager.getPackageInfo("com.vemod.stub.$guestPackage", 0)
-                true
-            } catch (_: Throwable) {
-                false
+        return getInstalledStubPackages(context, guestPackage).isNotEmpty()
+    }
+
+    fun createUninstallIntent(context: Context, guestPackage: String): Intent? {
+        val stubs = getInstalledStubPackages(context, guestPackage)
+        if (stubs.isEmpty()) return null
+        val stubPkg = stubs.first()
+        val uri = Uri.parse("package:$stubPkg")
+        return Intent(Intent.ACTION_DELETE, uri).apply {
+            putExtra(Intent.EXTRA_RETURN_RESULT, true)
+            if (context !is Activity) {
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
             }
         }
     }
@@ -154,11 +192,13 @@ object StubApkGenerator {
                 action = "com.vemod.action.STUB_INSTALLED"
                 putExtra("package_name", app.packageName)
             }
+            val pendingFlags = PendingIntent.FLAG_UPDATE_CURRENT or
+                    (if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) PendingIntent.FLAG_MUTABLE else 0)
             val pendingIntent = PendingIntent.getBroadcast(
                 context,
                 sessionId,
                 intent,
-                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_MUTABLE
+                pendingFlags
             )
 
             session.commit(pendingIntent.intentSender)
@@ -174,16 +214,91 @@ object StubApkGenerator {
         }
     }
 
-    fun uninstallStub(context: Context, guestPackage: String) {
-        val stubPkg = getStubPackageName(guestPackage)
+    private val recentlyUninstalledStubs = Collections.synchronizedMap(object : LinkedHashMap<String, Long>(16, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Long>?): Boolean {
+            return size > 50
+        }
+    })
+
+    fun uninstallStub(context: Context, guestPackage: String): Boolean {
+        // Debounce: prevent duplicate uninstall prompts if invoked multiple times in a short window
+        val now = System.currentTimeMillis()
+        val lastTime = recentlyUninstalledStubs[guestPackage] ?: 0L
+        if (now - lastTime < 3000L) {
+            Log.d(TAG, "Uninstall for $guestPackage was recently initiated, skipping duplicate request")
+            return false
+        }
+
+        val stubs = getInstalledStubPackages(context, guestPackage)
+
+        // Clean up cached stub APK file on disk if it exists
         try {
-            val intent = Intent(Intent.ACTION_UNINSTALL_PACKAGE).apply {
-                data = Uri.parse("package:$stubPkg")
-                flags = Intent.FLAG_ACTIVITY_NEW_TASK
+            val containerDir = File(ContainerRegistry.getContainersDir(context), guestPackage)
+            val stubApk = File(containerDir, "$guestPackage.stub.apk")
+            if (stubApk.exists()) {
+                stubApk.delete()
             }
-            context.startActivity(intent)
-        } catch (e: Throwable) {
-            Log.e(TAG, "Failed to launch uninstaller for $stubPkg", e)
+        } catch (_: Throwable) {}
+
+        if (stubs.isEmpty()) {
+            Log.d(TAG, "No installed stubs found for $guestPackage")
+            return false
+        }
+
+        recentlyUninstalledStubs[guestPackage] = now
+        var anyLaunched = false
+
+        for (stubPkg in stubs) {
+            try {
+                // Direct ACTION_DELETE prompts the Android system uninstall dialog
+                val intent = Intent(Intent.ACTION_DELETE).apply {
+                    data = Uri.parse("package:$stubPkg")
+                    putExtra(Intent.EXTRA_RETURN_RESULT, true)
+                    if (context !is Activity) {
+                        flags = Intent.FLAG_ACTIVITY_NEW_TASK
+                    }
+                }
+                context.startActivity(intent)
+                Log.i(TAG, "Launched ACTION_DELETE uninstaller for $stubPkg")
+                anyLaunched = true
+            } catch (e: Throwable) {
+                Log.w(TAG, "ACTION_DELETE failed for $stubPkg, trying PackageInstaller", e)
+                try {
+                    val installer = context.packageManager.packageInstaller
+                    val receiverIntent = Intent(context, StubInstallReceiver::class.java).apply {
+                        action = "com.vemod.action.STUB_UNINSTALLED"
+                        putExtra("package_name", guestPackage)
+                    }
+                    val pendingFlags = PendingIntent.FLAG_UPDATE_CURRENT or
+                            (if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) PendingIntent.FLAG_MUTABLE else 0)
+                    val pendingIntent = PendingIntent.getBroadcast(
+                        context,
+                        stubPkg.hashCode(),
+                        receiverIntent,
+                        pendingFlags
+                    )
+                    installer.uninstall(stubPkg, pendingIntent.intentSender)
+                    Log.i(TAG, "Requested PackageInstaller uninstall for $stubPkg")
+                    anyLaunched = true
+                } catch (e2: Throwable) {
+                    Log.e(TAG, "Failed to uninstall $stubPkg via PackageInstaller", e2)
+                }
+            }
+        }
+        return anyLaunched
+    }
+
+    private fun isPackageInstalled(context: Context, pkg: String): Boolean {
+        return try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                context.packageManager.getPackageInfo(pkg, PackageManager.PackageInfoFlags.of(0))
+            } else {
+                @Suppress("DEPRECATION")
+                context.packageManager.getPackageInfo(pkg, 0)
+            }
+            true
+        } catch (_: Throwable) {
+            false
         }
     }
 

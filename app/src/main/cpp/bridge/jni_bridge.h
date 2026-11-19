@@ -21,9 +21,12 @@ public:
 };
 
 u32 jni_local(jobject o);  // host local ref -> guest handle in the current frame
+u32 jni_global(jobject o); // host global ref -> permanent guest handle
 jobject jni_obj(u32 h);    // guest handle -> host reference
 
 void jni_sync_direct_buffers_to_host();
 bool jni_has_direct_buffers();
+void jni_sync_buffer_arg(u32 hnd);
+void jni_sync_buffer_guest(gaddr ga);
 
 }  // namespace nb

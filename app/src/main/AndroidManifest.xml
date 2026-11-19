@@ -4,6 +4,7 @@
 
     <uses-permission android:name="com.android.launcher.permission.INSTALL_SHORTCUT" />
     <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+    <uses-permission android:name="android.permission.REQUEST_DELETE_PACKAGES" />
     <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES" tools:ignore="QueryAllPackages" />
     <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32" />
     <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="29" tools:ignore="ScopedStorage" />
@@ -20,6 +21,10 @@
     <queries>
         <intent>
             <action android:name="android.intent.action.MAIN" />
+        </intent>
+        <intent>
+            <action android:name="android.intent.action.DELETE" />
+            <data android:scheme="package" />
         </intent>
     </queries>
 
@@ -215,6 +220,7 @@
             android:exported="true">
             <intent-filter>
                 <action android:name="com.vemod.action.STUB_INSTALLED" />
+                <action android:name="com.vemod.action.STUB_UNINSTALLED" />
             </intent-filter>
         </receiver>
 

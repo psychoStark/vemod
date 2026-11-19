@@ -150,12 +150,54 @@ class GuestContext(
                pkg.contains("google")
     }
 
+    override fun startActivity(intent: android.content.Intent) {
+        try {
+            val targetIntent = if (intent.action == android.content.Intent.ACTION_SEND) {
+                android.content.Intent.createChooser(intent, null).apply {
+                    addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+                }
+            } else {
+                android.content.Intent(intent).apply {
+                    addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+                }
+            }
+            baseContext.startActivity(targetIntent)
+        } catch (e: Throwable) {
+            Log.w("GuestContext", "startActivity failed safely: ${e.message}")
+        }
+    }
+
+    override fun startActivity(intent: android.content.Intent, options: android.os.Bundle?) {
+        try {
+            val targetIntent = if (intent.action == android.content.Intent.ACTION_SEND) {
+                android.content.Intent.createChooser(intent, null).apply {
+                    addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+                }
+            } else {
+                android.content.Intent(intent).apply {
+                    addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+                }
+            }
+            baseContext.startActivity(targetIntent, options)
+        } catch (e: Throwable) {
+            Log.w("GuestContext", "startActivity with options failed safely: ${e.message}")
+        }
+    }
+
     override fun bindService(service: android.content.Intent, conn: android.content.ServiceConnection, flags: Int): Boolean {
+        if (com.vemod.container.proxy.MockBillingService.isBillingOrLicensing(service)) {
+            return com.vemod.container.proxy.MockBillingService.mockBind(service, conn)
+        }
         if (isGoogleService(service)) {
             Log.w("GuestContext", "Preventing bindService to Google service: $service")
             return false
         }
-        return super.bindService(service, conn, flags)
+        return try {
+            super.bindService(service, conn, flags)
+        } catch (e: Throwable) {
+            Log.w("GuestContext", "Preventing crash in bindService: $service (${e.message})")
+            false
+        }
     }
 
     override fun startService(service: android.content.Intent): android.content.ComponentName? {
@@ -163,7 +205,12 @@ class GuestContext(
             Log.w("GuestContext", "Preventing startService to Google service: $service")
             return null
         }
-        return super.startService(service)
+        return try {
+            super.startService(service)
+        } catch (e: Throwable) {
+            Log.w("GuestContext", "Preventing crash in startService: $service (${e.message})")
+            null
+        }
     }
 
     override fun unbindService(conn: android.content.ServiceConnection) {
@@ -263,6 +310,23 @@ class GuestContext(
     private var guestLayoutInflater: LayoutInflater? = null
     private var guestWindowManager: WindowManager? = null
 
+    private var guestLocationManager: Any? = null
+
+    private fun defaultReturnValue(returnType: Class<*>): Any? = when {
+        returnType == java.lang.Boolean.TYPE -> false
+        returnType == java.lang.Integer.TYPE -> 0
+        returnType == java.lang.Long.TYPE -> 0L
+        returnType == java.lang.Float.TYPE -> 0.0f
+        returnType == java.lang.Double.TYPE -> 0.0
+        returnType == java.lang.Byte.TYPE -> 0.toByte()
+        returnType == java.lang.Short.TYPE -> 0.toShort()
+        returnType == java.lang.Character.TYPE -> '\u0000'
+        returnType == java.util.List::class.java -> emptyList<Any>()
+        returnType == java.util.Set::class.java -> emptySet<Any>()
+        returnType == java.util.Map::class.java -> emptyMap<Any, Any>()
+        else -> null
+    }
+
     override fun getSystemService(name: String): Any? {
         if (name == Context.LAYOUT_INFLATER_SERVICE) {
             if (guestLayoutInflater == null) {
@@ -279,6 +343,153 @@ class GuestContext(
                 }
             }
             return guestWindowManager ?: super.getSystemService(name)
+        }
+        if (name == Context.LOCATION_SERVICE) {
+            val hostHasFine = baseContext.checkSelfPermission(android.Manifest.permission.ACCESS_FINE_LOCATION) == android.content.pm.PackageManager.PERMISSION_GRANTED
+            val hostHasCoarse = baseContext.checkSelfPermission(android.Manifest.permission.ACCESS_COARSE_LOCATION) == android.content.pm.PackageManager.PERMISSION_GRANTED
+            val realLocationManager = super.getSystemService(name) as? android.location.LocationManager
+            if (realLocationManager != null && (hostHasFine || hostHasCoarse)) {
+                return realLocationManager
+            }
+            if (guestLocationManager == null && realLocationManager != null) {
+                try {
+                    // LocationManager delegates to internal mService (ILocationManager).
+                    // We proxy mService so getLastKnownLocation and other calls return null/safe stubs
+                    // without throwing SecurityException when host lacks runtime location permissions.
+                    var mServiceField: java.lang.reflect.Field? = null
+                    var cls: Class<*>? = realLocationManager.javaClass
+                    while (cls != null && cls != Any::class.java) {
+                        try {
+                            mServiceField = cls.getDeclaredField("mService")
+                            break
+                        } catch (_: NoSuchFieldException) {
+                            cls = cls.superclass
+                        }
+                    }
+                    if (mServiceField != null) {
+                        mServiceField.isAccessible = true
+                        val origService = mServiceField.get(realLocationManager)
+                        if (origService != null) {
+                            val allInterfaces = mutableSetOf<Class<*>>()
+                            var sCls: Class<*>? = origService.javaClass
+                            while (sCls != null) {
+                                allInterfaces.addAll(sCls.interfaces)
+                                sCls = sCls.superclass
+                            }
+                            val proxyService = java.lang.reflect.Proxy.newProxyInstance(
+                                origService.javaClass.classLoader ?: javaClass.classLoader,
+                                allInterfaces.toTypedArray()
+                            ) { proxy, method, args ->
+                                val mName = method.name
+                                if (mName == "equals") {
+                                    val other = args?.getOrNull(0)
+                                    return@newProxyInstance proxy === other || origService == other
+                                }
+                                if (mName == "hashCode") {
+                                    return@newProxyInstance origService.hashCode()
+                                }
+                                if (mName == "toString") {
+                                    return@newProxyInstance origService.toString()
+                                }
+                                if (mName.startsWith("getLastLocation") || mName.startsWith("getCurrentLocation")) {
+                                    defaultReturnValue(method.returnType)
+                                } else if (mName.startsWith("requestLocationUpdates") || mName.startsWith("removeUpdates")) {
+                                    defaultReturnValue(method.returnType)
+                                } else if (mName == "isProviderEnabled") {
+                                    false
+                                } else if (mName.startsWith("getProviders") || mName.startsWith("getAllProviders")) {
+                                    emptyList<String>()
+                                } else {
+                                    try {
+                                        method.invoke(origService, *(args ?: emptyArray()))
+                                    } catch (e: java.lang.reflect.InvocationTargetException) {
+                                        if (e.targetException is SecurityException) {
+                                            Log.w("GuestContext", "Suppressed SecurityException in ILocationManager.$mName: ${e.targetException.message}")
+                                            defaultReturnValue(method.returnType)
+                                        } else {
+                                            throw e.targetException
+                                        }
+                                    } catch (e: SecurityException) {
+                                        Log.w("GuestContext", "Suppressed SecurityException in ILocationManager.$mName: ${e.message}")
+                                        defaultReturnValue(method.returnType)
+                                    }
+                                }
+                            }
+                            mServiceField.set(realLocationManager, proxyService)
+                            Log.i("GuestContext", "Successfully wrapped LocationManager.mService with security proxy")
+                        }
+                    }
+                    guestLocationManager = realLocationManager
+                } catch (t: Throwable) {
+                    Log.w("GuestContext", "Failed to proxy LocationManager mService", t)
+                    guestLocationManager = realLocationManager
+                }
+            }
+            return guestLocationManager ?: realLocationManager
+        }
+        if (name == Context.TELEPHONY_SERVICE || name == "telephony_registry") {
+            val service = super.getSystemService(name)
+            if (service != null) {
+                try {
+                    var cls: Class<*>? = service.javaClass
+                    while (cls != null && cls != Any::class.java) {
+                        for (f in cls.declaredFields) {
+                            f.isAccessible = true
+                            val orig = f.get(service) ?: continue
+                            val typeName = orig.javaClass.name
+                            if (typeName.contains("Telephony") || typeName.contains("ITelephony")) {
+                                if (!java.lang.reflect.Proxy.isProxyClass(orig.javaClass)) {
+                                    val allIfaces = mutableSetOf<Class<*>>()
+                                    var c: Class<*>? = orig.javaClass
+                                    while (c != null) {
+                                        allIfaces.addAll(c.interfaces)
+                                        c = c.superclass
+                                    }
+                                    val proxy = java.lang.reflect.Proxy.newProxyInstance(
+                                        orig.javaClass.classLoader ?: javaClass.classLoader,
+                                        allIfaces.toTypedArray()
+                                    ) { p, method, args ->
+                                        val mName = method.name
+                                        if (mName == "equals") {
+                                            val other = args?.getOrNull(0)
+                                            return@newProxyInstance p === other || orig == other
+                                        }
+                                        if (mName == "hashCode") {
+                                            return@newProxyInstance orig.hashCode()
+                                        }
+                                        if (mName == "toString") {
+                                            return@newProxyInstance orig.toString()
+                                        }
+                                        if (mName.startsWith("listen")) {
+                                            defaultReturnValue(method.returnType)
+                                        } else {
+                                            try {
+                                                method.invoke(orig, *(args ?: emptyArray()))
+                                            } catch (e: java.lang.reflect.InvocationTargetException) {
+                                                if (e.targetException is SecurityException) {
+                                                    Log.w("GuestContext", "Suppressed SecurityException in Telephony.$mName: ${e.targetException.message}")
+                                                    defaultReturnValue(method.returnType)
+                                                } else {
+                                                    throw e.targetException
+                                                }
+                                            } catch (e: SecurityException) {
+                                                Log.w("GuestContext", "Suppressed SecurityException in Telephony.$mName: ${e.message}")
+                                                defaultReturnValue(method.returnType)
+                                            }
+                                        }
+                                    }
+                                    f.set(service, proxy)
+                                    Log.i("GuestContext", "Successfully secured field ${f.name} in ${service.javaClass.simpleName}")
+                                }
+                            }
+                        }
+                        cls = cls.superclass
+                    }
+                } catch (t: Throwable) {
+                    Log.w("GuestContext", "Failed to secure telephony service", t)
+                }
+            }
+            return service
         }
         val s = super.getSystemService(name)
         if (name == Context.ALARM_SERVICE && s is android.app.AlarmManager) {

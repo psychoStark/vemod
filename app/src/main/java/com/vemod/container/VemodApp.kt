@@ -128,6 +128,9 @@ class VemodApp : Application() {
     }
 
     override fun bindService(service: android.content.Intent, conn: android.content.ServiceConnection, flags: Int): Boolean {
+        if (com.vemod.container.proxy.MockBillingService.isBillingOrLicensing(service)) {
+            return com.vemod.container.proxy.MockBillingService.mockBind(service, conn)
+        }
         if (isGoogleService(service)) {
             Log.w("VemodApp", "Preventing Application.bindService to Google service: $service")
             return false

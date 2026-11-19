@@ -281,6 +281,7 @@ void preload_sysroot(const char* dir);
 bool is_sysroot_loaded();
 void set_container_dir(const char* dir);
 const std::string& get_container_dir();
+const std::string& get_vemod_tmp_dir();
 const std::string& get_guest_apk_path();
 bool is_proc_self_exe(const char* path);
 

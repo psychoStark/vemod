@@ -55,6 +55,17 @@ class ActivityManagerHook(
     }
 
     override fun invoke(proxy: Any, method: Method, args: Array<Any?>?): Any? {
+        if (method.name == "equals") {
+            val other = args?.getOrNull(0)
+            return proxy === other || real == other
+        }
+        if (method.name == "hashCode") {
+            return real.hashCode()
+        }
+        if (method.name == "toString") {
+            return real.toString()
+        }
+
         if (args != null && method.name.contains("IntentSender", ignoreCase = true)) {
             // Fix packageName argument so AMS doesn't throw Permission Denial
             for (i in args.indices) {
@@ -66,16 +77,17 @@ class ActivityManagerHook(
                 }
             }
             // Ensure PendingIntent mutability flag is present on Android 12+ (SDK 31+).
-            // On Android 14+ (U+), implicit intents MUST use FLAG_IMMUTABLE.
-            for (i in args.indices) {
-                val arg = args[i]
-                if (arg is Int) {
-                    val immutable = PendingIntent.FLAG_IMMUTABLE
-                    val mutable = PendingIntent.FLAG_MUTABLE
-                    if ((arg and (immutable or mutable)) == 0) {
-                        args[i] = arg or immutable
-                        Log.i(TAG, "${method.name}: patched flags $arg -> ${args[i]}")
-                    }
+            // In getIntentSenderWithFeature(..., int flags, Bundle options, int userId):
+            // Parameter index of 'flags' is args.size - 3 (or the Int before options and userId).
+            // Do NOT mutate 'userId' (the last parameter) or 'type' / 'requestCode'!
+            val flagsIndex = args.indexOfLast { it is Int && args.indexOf(it) != args.size - 1 }
+            if (flagsIndex in 0 until args.size - 1) {
+                val arg = args[flagsIndex] as Int
+                val immutable = PendingIntent.FLAG_IMMUTABLE
+                val mutable = PendingIntent.FLAG_MUTABLE
+                if ((arg and (immutable or mutable)) == 0) {
+                    args[flagsIndex] = arg or immutable
+                    Log.i(TAG, "${method.name}: patched flags at index $flagsIndex: $arg -> ${args[flagsIndex]}")
                 }
             }
         }
@@ -114,7 +126,12 @@ class ActivityManagerHook(
             if (cause is SecurityException || cause is IllegalArgumentException || cause is android.os.RemoteException) {
                 if (method.name.startsWith("registerReceiver") || method.name.contains("IntentSender", ignoreCase = true)) {
                     Log.w(TAG, "Suppressed ${cause.javaClass.simpleName} in ${method.name}: ${cause.message}")
-                    return null
+                    return when (method.returnType) {
+                        Boolean::class.javaPrimitiveType -> false
+                        Int::class.javaPrimitiveType -> 0
+                        Long::class.javaPrimitiveType -> 0L
+                        else -> null
+                    }
                 }
             }
             throw cause

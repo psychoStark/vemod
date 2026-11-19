@@ -27,7 +27,120 @@ object AdSdkNeutralizer {
         neutralizeVungle(activity.classLoader)
         neutralizeTapjoy(activity.classLoader)
         neutralizeMoPub(activity.classLoader)
+        neutralizeAdMarvel(activity.classLoader)
+        neutralizeInMobi(activity.classLoader)
+        neutralizeEulaAndAdPreferences(activity)
         neutralizeGenericAdFlags(activity)
+        neutralizeAdMob(activity)
+    }
+
+    private fun neutralizeEulaAndAdPreferences(activity: Activity) {
+        try {
+            // Pre-accept Fingersoft EULA & AdManager settings
+            activity.getSharedPreferences("ADMANAGER_SETTINGS", android.content.Context.MODE_PRIVATE)
+                .edit()
+                .putInt("EULAVERSION_1_SHOWED", 1)
+                .putInt("startup_counter", 10)
+                .apply()
+
+            activity.getSharedPreferences("fsadsdk", android.content.Context.MODE_PRIVATE)
+                .edit()
+                .putBoolean("fsadsdk_eula_accepted", true)
+                .putBoolean("EULA_KEY", true)
+                .putInt("EULAVERSION_1_SHOWED", 1)
+                .apply()
+
+            activity.getSharedPreferences("fsadsdk_eula", android.content.Context.MODE_PRIVATE)
+                .edit()
+                .putBoolean("fsadsdk_eula_accepted", true)
+                .apply()
+
+            // Generic privacy/EULA/consent preferences for legacy 32-bit games
+            activity.getSharedPreferences("consent", android.content.Context.MODE_PRIVATE)
+                .edit()
+                .putBoolean("eula_accepted", true)
+                .putBoolean("privacy_accepted", true)
+                .putBoolean("gdpr_consent", true)
+                .putBoolean("terms_accepted", true)
+                .apply()
+
+            // Reflectively disable Fingersoft AdManager state if loaded
+            val cl = activity.classLoader
+            try {
+                val adMgrClass = cl.loadClass("com.fingersoft.fsadsdk.advertising.AdManager")
+                val stateEnumClass = cl.loadClass("com.fingersoft.fsadsdk.advertising.AdManager\$AdManagerState")
+                val constants = stateEnumClass.enumConstants ?: emptyArray()
+                for (enumConst in constants) {
+                    if (enumConst.toString() == "NO_ADS" || enumConst.toString() == "AD_FREE_NO_ADS") {
+                        for (f in adMgrClass.declaredFields) {
+                            if (f.type == stateEnumClass && java.lang.reflect.Modifier.isStatic(f.modifiers)) {
+                                f.isAccessible = true
+                                f.set(null, enumConst)
+                                Log.i(TAG, "neutralizeEulaAndAdPreferences: set AdManager.${f.name} = $enumConst")
+                            }
+                        }
+                        break
+                    }
+                }
+            } catch (_: Throwable) {}
+        } catch (e: Throwable) {
+            Log.w(TAG, "neutralizeEulaAndAdPreferences error", e)
+        }
+    }
+
+    private fun neutralizeInMobi(classLoader: ClassLoader) {
+        try {
+            val armCls = try {
+                classLoader.loadClass("com.inmobi.commons.internal.ActivityRecognitionManager")
+            } catch (_: ClassNotFoundException) { null }
+
+            if (armCls != null) {
+                for (f in armCls.declaredFields) {
+                    try {
+                        f.isAccessible = true
+                        if (java.lang.reflect.Modifier.isStatic(f.modifiers)) {
+                            if (f.type == Int::class.javaPrimitiveType) {
+                                f.setInt(null, -1)
+                            } else if (f.name == "a" || f.name == "b" || f.name == "d" || f.name == "e") {
+                                f.set(null, null)
+                            }
+                        }
+                    } catch (_: Throwable) {}
+                }
+                Log.i(TAG, "neutralizeInMobi: ActivityRecognitionManager neutralized")
+            }
+
+            val arsCls = try {
+                classLoader.loadClass("com.inmobi.commons.internal.ActivityRecognitionSampler")
+            } catch (_: ClassNotFoundException) { null }
+
+            if (arsCls != null) {
+                for (m in arsCls.declaredMethods) {
+                    if (m.name.contains("stop", ignoreCase = true) && m.parameterTypes.isEmpty()) {
+                        try {
+                            m.isAccessible = true
+                            m.invoke(null)
+                            Log.i(TAG, "neutralizeInMobi: stopped ActivityRecognitionSampler")
+                        } catch (_: Throwable) {}
+                    }
+                }
+            }
+        } catch (e: Throwable) {
+            Log.w(TAG, "neutralizeInMobi error", e)
+        }
+    }
+
+    private fun neutralizeAdMarvel(classLoader: ClassLoader) {
+        try {
+            val cls = classLoader.loadClass("com.admarvel.android.ads.AdMarvelUtils")
+            for (m in cls.declaredMethods) {
+                if (m.name.contains("Location", ignoreCase = true) && m.parameterTypes.size == 1 && m.parameterTypes[0] == Boolean::class.javaPrimitiveType) {
+                    m.isAccessible = true
+                    m.invoke(null, false)
+                    Log.i(TAG, "neutralizeAdMarvel: disabled location via AdMarvelUtils.${m.name}(false)")
+                }
+            }
+        } catch (_: Throwable) {}
     }
 
     private fun neutralizePrime31(activity: Activity) {
@@ -245,6 +358,62 @@ object AdSdkNeutralizer {
             }
         } catch (e: Throwable) {
             Log.w(TAG, "neutralizeMoPub error", e)
+        }
+    }
+
+    private fun neutralizeAdMob(activity: Activity) {
+        fun cleanViews(view: android.view.View?) {
+            if (view == null) return
+            val className = view.javaClass.name
+            if (className.contains("AdView", ignoreCase = true) ||
+                className.contains("ViewSwitcher", ignoreCase = true) ||
+                className.startsWith("com.google.android.gms.ads")
+            ) {
+                view.visibility = android.view.View.GONE
+                try {
+                    (view.parent as? android.view.ViewGroup)?.removeView(view)
+                } catch (_: Throwable) {}
+            }
+            if (view is android.widget.TextView) {
+                val txt = view.text?.toString() ?: ""
+                if (txt.contains("Missing internet permission", ignoreCase = true) ||
+                    txt.contains("Missing AdActivity", ignoreCase = true) ||
+                    txt.contains("android.permission.INTERNET", ignoreCase = true)
+                ) {
+                    view.visibility = android.view.View.GONE
+                    try {
+                        val parent = view.parent as? android.view.ViewGroup
+                        parent?.visibility = android.view.View.GONE
+                        (parent?.parent as? android.view.ViewGroup)?.removeView(parent)
+                    } catch (_: Throwable) {}
+                }
+            }
+            if (view is android.view.ViewGroup) {
+                for (i in 0 until view.childCount) {
+                    cleanViews(view.getChildAt(i))
+                }
+            }
+        }
+
+        try {
+            val content = activity.findViewById<android.view.ViewGroup>(android.R.id.content)
+            if (content != null) {
+                cleanViews(content)
+                content.setOnHierarchyChangeListener(object : android.view.ViewGroup.OnHierarchyChangeListener {
+                    override fun onChildViewAdded(parent: android.view.View?, child: android.view.View?) {
+                        cleanViews(child)
+                    }
+                    override fun onChildViewRemoved(parent: android.view.View?, child: android.view.View?) {}
+                })
+            }
+            activity.window?.decorView?.post {
+                try {
+                    cleanViews(activity.window?.decorView)
+                } catch (_: Throwable) {}
+            }
+            Log.i(TAG, "AdMob neutralized")
+        } catch (e: Throwable) {
+            Log.w(TAG, "neutralizeAdMob error", e)
         }
     }
 }

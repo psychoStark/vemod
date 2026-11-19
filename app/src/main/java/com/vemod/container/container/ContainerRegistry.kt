@@ -17,7 +17,7 @@ import java.io.File
 object ContainerRegistry {
     private const val TAG = "ContainerRegistry"
 
-    private fun getContainersDir(context: Context): File {
+    fun getContainersDir(context: Context): File {
         return File(context.filesDir, "containers").apply { mkdirs() }
     }
 
@@ -233,9 +233,65 @@ object ContainerRegistry {
             ShortcutManagerCompat.removeDynamicShortcuts(context, listOf("dynamic_$packageName", "shortcut_$packageName"))
         } catch (_: Throwable) {}
 
+        // Release any running process slots associated with this container
+        try {
+            val prefs = context.getSharedPreferences("vemod_guest_processes", Context.MODE_PRIVATE)
+            val editor = prefs.edit()
+            for (i in 1..com.vemod.container.proxy.GuestProcessManager.NUM_PROCESSES) {
+                if (prefs.getString("proc_$i", null) == packageName) {
+                    editor.remove("proc_$i")
+                }
+            }
+            editor.apply()
+        } catch (_: Throwable) {}
+
         val dir = File(getContainersDir(context), packageName)
-        val success = dir.deleteRecursively()
+        val success = deleteRecursivelyWithPerms(dir)
         Log.i(TAG, "Uninstalled $packageName: success=$success")
         return success
+    }
+
+    fun recordAppLaunch(context: Context, packageName: String) {
+        try {
+            val prefs = context.getSharedPreferences("vemod_settings", Context.MODE_PRIVATE)
+            prefs.edit().putLong("last_launch_$packageName", System.currentTimeMillis()).apply()
+        } catch (e: Throwable) {
+            Log.w(TAG, "Failed to record app launch: $packageName", e)
+        }
+    }
+
+    fun getLastLaunchTime(context: Context, packageName: String): Long {
+        return try {
+            val prefs = context.getSharedPreferences("vemod_settings", Context.MODE_PRIVATE)
+            prefs.getLong("last_launch_$packageName", 0L)
+        } catch (_: Throwable) {
+            0L
+        }
+    }
+
+    fun isPipEnabledForApp(context: Context, packageName: String): Boolean {
+        val prefs = context.getSharedPreferences("vemod_settings", Context.MODE_PRIVATE)
+        val key = "pip_enabled_$packageName"
+        return if (prefs.contains(key)) {
+            prefs.getBoolean(key, false)
+        } else {
+            prefs.getBoolean("pip_enabled", false)
+        }
+    }
+
+    fun setPipEnabledForApp(context: Context, packageName: String, enabled: Boolean) {
+        val prefs = context.getSharedPreferences("vemod_settings", Context.MODE_PRIVATE)
+        prefs.edit().putBoolean("pip_enabled_$packageName", enabled).apply()
+    }
+
+    private fun deleteRecursivelyWithPerms(file: File): Boolean {
+        if (!file.exists()) return true
+        file.walkBottomUp().forEach { f ->
+            try {
+                f.setWritable(true, false)
+            } catch (_: Throwable) {}
+            f.delete()
+        }
+        return !file.exists()
     }
 }

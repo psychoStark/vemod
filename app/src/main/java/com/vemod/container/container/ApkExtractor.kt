@@ -139,6 +139,12 @@ object ApkExtractor {
 
         val manifestInfo = getManifestInfo(apkFile)
         val packageName = if (manifestInfo.packageName.isNotEmpty()) manifestInfo.packageName else pkgInfo.packageName
+
+        // Block container stubs from being installed inside Vemod (recursive protection)
+        if (packageName.startsWith(StubApkGenerator.STUB_PKG_PREFIX) || packageName.startsWith("com.vemod.stub.")) {
+            error("This is a Vemod app drawer stub ($packageName) and cannot be installed inside Vemod. " +
+                  "To use this app, tap it in your system app drawer instead.")
+        }
         val activities = pkgInfo.activities
         val manifestLauncher = manifestInfo.launcherActivity
         var launchActivityInfo = if (manifestLauncher != null) {
@@ -156,16 +162,16 @@ object ApkExtractor {
                 activities?.firstOrNull()
             } else null
         if (unityPlayerActivity != null &&
-            (launchActivityInfo?.name?.endsWith("UnityPlayerProxyActivity") == true ||
-             launchActivityInfo?.name?.endsWith("UnityPlayerNativeActivity") == true ||
-             manifestLauncher?.endsWith("UnityPlayerProxyActivity") == true ||
-             manifestLauncher?.endsWith("UnityPlayerNativeActivity") == true)) {
+            (launchActivityInfo?.name == "com.unity3d.player.UnityPlayerProxyActivity" ||
+             launchActivityInfo?.name == "com.unity3d.player.UnityPlayerNativeActivity" ||
+             manifestLauncher == "com.unity3d.player.UnityPlayerProxyActivity" ||
+             manifestLauncher == "com.unity3d.player.UnityPlayerNativeActivity")) {
             Log.i(TAG, "extractFromFile: preferring UnityPlayerActivity over ${launchActivityInfo?.name ?: manifestLauncher}")
             launchActivityInfo = unityPlayerActivity
         }
         val launchActivity = if (unityPlayerActivity != null &&
-            (manifestLauncher?.endsWith("UnityPlayerProxyActivity") == true ||
-             manifestLauncher?.endsWith("UnityPlayerNativeActivity") == true)) {
+            (manifestLauncher == "com.unity3d.player.UnityPlayerProxyActivity" ||
+             manifestLauncher == "com.unity3d.player.UnityPlayerNativeActivity")) {
             "com.unity3d.player.UnityPlayerActivity"
         } else {
             launchActivityInfo?.name ?: manifestLauncher
@@ -265,16 +271,17 @@ object ApkExtractor {
                 }
             }
 
-            if (iconDrawable != null) {
-                val bitmap = if (iconDrawable is BitmapDrawable && iconDrawable.bitmap != null) {
-                    iconDrawable.bitmap
+            val drawable = iconDrawable
+            if (drawable != null) {
+                val bitmap = if (drawable is BitmapDrawable && drawable.bitmap != null) {
+                    drawable.bitmap
                 } else {
-                    val w = if (iconDrawable.intrinsicWidth > 0) iconDrawable.intrinsicWidth else 192
-                    val h = if (iconDrawable.intrinsicHeight > 0) iconDrawable.intrinsicHeight else 192
+                    val w = if (drawable.intrinsicWidth > 0) drawable.intrinsicWidth else 192
+                    val h = if (drawable.intrinsicHeight > 0) drawable.intrinsicHeight else 192
                     val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
                     val canvas = Canvas(bmp)
-                    iconDrawable.setBounds(0, 0, canvas.width, canvas.height)
-                    iconDrawable.draw(canvas)
+                    drawable.setBounds(0, 0, canvas.width, canvas.height)
+                    drawable.draw(canvas)
                     bmp
                 }
                 FileOutputStream(iconFile).use { fos ->
@@ -336,6 +343,15 @@ object ApkExtractor {
                     } else {
                         Log.w(TAG, "Host proxy template missing at ${hostProxyTemplate.absolutePath}")
                     }
+                } else if (name.startsWith("assets/") && (name.endsWith(".dll.so") || name.endsWith(".dll"))) {
+                    // Extract Unity Mono managed and AOT precompiled libraries into lib32Dir so guest_dlopen can locate them
+                    val libName = name.substringAfterLast("/")
+                    val targetLib = File(lib32Dir, libName)
+                    FileOutputStream(targetLib).use { fos ->
+                        zis.copyTo(fos)
+                    }
+                    extractedLibs.add(libName)
+                    Log.i(TAG, "Extracted Unity Mono library: $libName (${targetLib.length()} bytes)")
                 }
                 entry = zis.nextEntry
             }
@@ -674,43 +690,41 @@ object ApkExtractor {
                                     }
                                 }
                                 if (!mdName.isNullOrEmpty()) {
-                                    var resolved = false
                                     if (mdRes != 0) {
-                                        try {
-                                            val intVal = res.getInteger(mdRes)
-                                            metaData.putInt(mdName, intVal)
-                                            resolved = true
-                                        } catch (_: Throwable) {}
-                                        if (!resolved) {
-                                            try {
-                                                val strVal = res.getString(mdRes)
-                                                val intVal = strVal.toIntOrNull()
-                                                if (intVal != null) metaData.putInt(mdName, intVal)
-                                                else metaData.putString(mdName, strVal)
-                                                resolved = true
-                                            } catch (_: Throwable) {}
-                                        }
-                                        if (!resolved) {
-                                            metaData.putInt(mdName, mdRes)
-                                        }
+                                        metaData.putInt(mdName, mdRes)
                                     } else if (mdVal != null) {
                                         if (mdVal.startsWith("@")) {
                                             val resId = mdVal.substring(1).toIntOrNull()
                                             if (resId != null) {
+                                                var resolved = false
                                                 try {
-                                                    val intVal = res.getInteger(resId)
-                                                    metaData.putInt(mdName, intVal)
-                                                    resolved = true
+                                                    val type = try { res.getResourceTypeName(resId) } catch (_: Throwable) { null }
+                                                    when (type) {
+                                                        "string" -> {
+                                                            metaData.putString(mdName, res.getString(resId))
+                                                            resolved = true
+                                                        }
+                                                        "integer" -> {
+                                                            metaData.putInt(mdName, res.getInteger(resId))
+                                                            resolved = true
+                                                        }
+                                                        "bool", "boolean" -> {
+                                                            metaData.putBoolean(mdName, res.getBoolean(resId))
+                                                            resolved = true
+                                                        }
+                                                        else -> {
+                                                            try {
+                                                                metaData.putString(mdName, res.getString(resId))
+                                                                resolved = true
+                                                            } catch (_: Throwable) {
+                                                                try {
+                                                                    metaData.putInt(mdName, res.getInteger(resId))
+                                                                    resolved = true
+                                                                } catch (_: Throwable) {}
+                                                            }
+                                                        }
+                                                    }
                                                 } catch (_: Throwable) {}
-                                                if (!resolved) {
-                                                    try {
-                                                        val strVal = res.getString(resId)
-                                                        val intVal = strVal.toIntOrNull()
-                                                        if (intVal != null) metaData.putInt(mdName, intVal)
-                                                        else metaData.putString(mdName, strVal)
-                                                        resolved = true
-                                                    } catch (_: Throwable) {}
-                                                }
                                                 if (!resolved) {
                                                     metaData.putInt(mdName, resId)
                                                 }

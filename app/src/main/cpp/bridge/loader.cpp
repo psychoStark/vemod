@@ -135,6 +135,12 @@ static bool should_override_with_host(const char* name) {
     if (strcmp(name, "__system_property_get") == 0) return true;
     // Android logcat passthrough
     if (strncmp(name, "__android_log_", 14) == 0) return true;
+    // Exit & abort overrides so guest exit/crash is captured with stack backtrace
+    if (strcmp(name, "exit") == 0 || strcmp(name, "_exit") == 0 || strcmp(name, "_Exit") == 0 ||
+        strcmp(name, "abort") == 0 || strcmp(name, "raise") == 0 ||
+        strcmp(name, "__assert2") == 0 || strcmp(name, "__assert") == 0 ||
+        strcmp(name, "__android_log_assert") == 0 ||
+        strcmp(name, "__stack_chk_fail") == 0) return true;
     // Mono runtime thread suspension override (prevent signal deadlocks)
     if (strcmp(name, "mono_thread_suspend_all_other_threads") == 0) return true;
     if (strcmp(name, "mono_gc_collect") == 0) return true;
@@ -858,16 +864,36 @@ const std::string& get_guest_lib_dir() {
 
 static std::string s_container_dir;
 static std::string s_guest_apk_path;
+static std::string s_tmp_dir;
 
 void set_container_dir(const char* dir) {
     if (dir) {
         s_container_dir = dir;
         s_guest_apk_path = s_container_dir + "/base.apk";
+        s_tmp_dir = s_container_dir + "/cache";
+        mkdir(s_tmp_dir.c_str(), 0775);
     }
 }
 
 const std::string& get_container_dir() {
     return s_container_dir;
+}
+
+const std::string& get_vemod_tmp_dir() {
+    if (s_tmp_dir.empty()) {
+        if (!s_container_dir.empty()) {
+            s_tmp_dir = s_container_dir + "/cache";
+        } else {
+            const char* env_tmp = getenv("TMPDIR");
+            if (env_tmp && *env_tmp) {
+                s_tmp_dir = env_tmp;
+            } else {
+                s_tmp_dir = "/data/data/com.psychostark.vemod/cache";
+            }
+        }
+        mkdir(s_tmp_dir.c_str(), 0775);
+    }
+    return s_tmp_dir;
 }
 
 const std::string& get_guest_apk_path() {
@@ -989,13 +1015,18 @@ u32 guest_dlopen(const char* name, int flags) {
     NB_LOGI("guest dlopen(\"%s\", 0x%x)", name ? name : "(null)", flags);
     if (!name) return 0x00d1ffff;
 
-    if (strncmp(name, "/assets/", 8) == 0 || strncmp(name, "assets/", 7) == 0) {
-        return 0;
-    }
-
     std::string req(name);
     auto slash = req.rfind('/');
     std::string base_name = (slash != std::string::npos) ? req.substr(slash + 1) : req;
+
+    // Reject raw asset reads unless they refer to a native library or precompiled binary (.so / .dll.so)
+    if (strncmp(name, "/assets/", 8) == 0 || strncmp(name, "assets/", 7) == 0) {
+        if (req.find(".so") == std::string::npos) {
+            return 0;
+        }
+        NB_LOGI("guest dlopen: asset path contains native module '%s', attempting resolution via base_name '%s'",
+                name, base_name.c_str());
+    }
 
     if (base_name == "libGLESv2.so") {
         if (s_guest_lib_dir.find("com.polarbit.RecklessRacingLite") != std::string::npos) {
@@ -1021,6 +1052,16 @@ u32 guest_dlopen(const char* name, int flags) {
             size_t idx = g_modules.size() - 1;
             u32 hdl = g_modules[idx]->soinfo ? g_modules[idx]->soinfo : (0x00d10001 + static_cast<u32>(idx));
             NB_LOGI("guest dlopen(\"%s\") -> dynamically loaded module %zu (%s) handle %#x", name, idx, full_path.c_str(), hdl);
+            return hdl;
+        }
+    }
+
+    if (!s_container_dir.empty()) {
+        std::string full_path = s_container_dir + "/lib32/" + base_name;
+        if (access(full_path.c_str(), R_OK) == 0 && load_guest_library(full_path.c_str())) {
+            size_t idx = g_modules.size() - 1;
+            u32 hdl = g_modules[idx]->soinfo ? g_modules[idx]->soinfo : (0x00d10001 + static_cast<u32>(idx));
+            NB_LOGI("guest dlopen(\"%s\") -> loaded container module %zu (%s) handle %#x", name, idx, full_path.c_str(), hdl);
             return hdl;
         }
     }

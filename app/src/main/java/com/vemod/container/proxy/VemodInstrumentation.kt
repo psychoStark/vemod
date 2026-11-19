@@ -64,6 +64,28 @@ class VemodInstrumentation(
                 val c2 = addAssetPath.invoke(am, baseApk.absolutePath) as? Int ?: 0
                 Log.i(TAG, "createGuestResources: c1(framework)=$c1, c2(guest)=$c2 for ${baseApk.name}")
 
+                // Add guest baseApk to host context.assets so Chromium can find file:///android_asset/...
+                try {
+                    addAssetPath.invoke(context.assets, baseApk.absolutePath)
+                    Log.i(TAG, "Added guest baseApk to context.assets")
+                } catch (e: Throwable) {
+                    Log.w(TAG, "Failed to add baseApk to context.assets", e)
+                }
+
+                // Add WebView package assets to guest am so Chromium internal .pak files resolve
+                try {
+                    val wvf = Class.forName("android.webkit.WebViewFactory")
+                    val m = wvf.getDeclaredMethod("getLoadedPackageInfo")
+                    m.isAccessible = true
+                    val loadedPkg = m.invoke(null) as? android.content.pm.PackageInfo
+                    val appInfo = loadedPkg?.applicationInfo
+                    if (appInfo != null) {
+                        addAssetPath.invoke(am, appInfo.sourceDir)
+                        appInfo.splitSourceDirs?.forEach { addAssetPath.invoke(am, it) }
+                        Log.i(TAG, "Added WebView package assets to guest AssetManager")
+                    }
+                } catch (_: Throwable) {}
+
                 try {
                     val getAssignedPackages = android.content.res.AssetManager::class.java.getDeclaredMethod("getAssignedPackageIdentifiers")
                     getAssignedPackages.isAccessible = true
@@ -315,8 +337,8 @@ class VemodInstrumentation(
         }
 
         if (launchActivity != null && containerPath != null && baseApkPath != null) {
-            if (launchActivity.endsWith("UnityPlayerProxyActivity") ||
-                launchActivity.endsWith("UnityPlayerNativeActivity")) {
+            if (launchActivity == "com.unity3d.player.UnityPlayerProxyActivity" ||
+                launchActivity == "com.unity3d.player.UnityPlayerNativeActivity") {
                 Log.i(TAG, "newActivity: auto-aliasing $launchActivity -> com.unity3d.player.UnityPlayerActivity")
                 launchActivity = "com.unity3d.player.UnityPlayerActivity"
                 intent.putExtra(GuestProxyActivity.EXTRA_LAUNCH_ACTIVITY, launchActivity)
@@ -749,11 +771,11 @@ class VemodInstrumentation(
             }
 
             // Fill in missing platform attributes with system defaults using force=false so guest theme customizations are preserved.
-            // Use Light fallback for light themes so light styling (text colors, list backgrounds) isn't crushed by dark mode.
+            // Use NoActionBar fallback to ensure legacy titlebars/actionbars never render on top of guest apps.
             try {
-                val fallbackStyle = if (isLight) android.R.style.Theme_DeviceDefault_Light else android.R.style.Theme_DeviceDefault
+                val fallbackStyle = if (isLight) android.R.style.Theme_DeviceDefault_Light_NoActionBar else android.R.style.Theme_DeviceDefault_NoActionBar
                 activity.theme.applyStyle(fallbackStyle, false)
-                Log.i(TAG, "Applied ${if (isLight) "Theme_DeviceDefault_Light" else "Theme_DeviceDefault"} fallback (force=false) to activity.theme")
+                Log.i(TAG, "Applied ${if (isLight) "Theme_DeviceDefault_Light_NoActionBar" else "Theme_DeviceDefault_NoActionBar"} fallback (force=false) to activity.theme")
             } catch (e: Throwable) {
                 Log.w(TAG, "Failed to apply fallback theme", e)
             }
@@ -783,43 +805,13 @@ class VemodInstrumentation(
                 } catch (_: Throwable) {}
             }
 
+            // Unconditionally strip titlebar/header to guarantee fullscreen game presentation
             try {
-                var shouldDisableTitle = false
-                try {
-                    val a = activity.theme.obtainStyledAttributes(intArrayOf(
-                        android.R.attr.windowNoTitle,
-                        android.R.attr.windowActionBar,
-                        android.R.attr.windowTitleStyle
-                    ))
-                    val noTitle = a.getBoolean(0, false)
-                    val hasActionBar = a.getBoolean(1, false)
-                    val hasTitleStyle = a.hasValue(2)
-                    a.recycle()
-
-                    val appNoTitleId = activity.resources.getIdentifier("windowNoTitle", "attr", pkgName)
-                    var appNoTitle = false
-                    if (appNoTitleId != 0) {
-                        try {
-                            val a2 = activity.theme.obtainStyledAttributes(intArrayOf(appNoTitleId))
-                            appNoTitle = a2.getBoolean(0, false)
-                            a2.recycle()
-                        } catch (_: Throwable) {}
-                    }
-
-                    if (noTitle || appNoTitle || !hasTitleStyle || !hasActionBar) {
-                        shouldDisableTitle = true
-                    }
-                } catch (_: Throwable) {
-                    shouldDisableTitle = true
-                }
-
-                if (shouldDisableTitle) {
-                    activity.requestWindowFeature(android.view.Window.FEATURE_NO_TITLE)
-                    activity.window?.requestFeature(android.view.Window.FEATURE_NO_TITLE)
-                    Log.i(TAG, "Requested FEATURE_NO_TITLE for ${activity.javaClass.name}")
-                }
+                activity.requestWindowFeature(android.view.Window.FEATURE_NO_TITLE)
+                activity.window?.requestFeature(android.view.Window.FEATURE_NO_TITLE)
+                Log.i(TAG, "Requested FEATURE_NO_TITLE for ${activity.javaClass.name}")
             } catch (e: Throwable) {
-                Log.w(TAG, "Failed to configure window title feature", e)
+                Log.w(TAG, "Failed to configure FEATURE_NO_TITLE", e)
             }
 
             try {
@@ -861,8 +853,24 @@ class VemodInstrumentation(
                 val proxy = java.lang.reflect.Proxy.newProxyInstance(
                     delegateInterface.classLoader,
                     arrayOf(delegateInterface)
-                ) { _, method, _ ->
-                    if (method.name == "isChangeEnabled") false else null
+                ) { p, method, args ->
+                    if (method.name == "equals") {
+                        val other = args?.getOrNull(0)
+                        return@newProxyInstance p === other
+                    }
+                    if (method.name == "hashCode") {
+                        return@newProxyInstance System.identityHashCode(p)
+                    }
+                    if (method.name == "toString") {
+                        return@newProxyInstance "Compatibility\$BehaviorChangeDelegate\$Proxy"
+                    }
+                    if (method.name == "isChangeEnabled") false
+                    else when (method.returnType) {
+                        Boolean::class.javaPrimitiveType -> false
+                        Int::class.javaPrimitiveType -> 0
+                        Long::class.javaPrimitiveType -> 0L
+                        else -> null
+                    }
                 }
                 val setDelegate = compatClass.getDeclaredMethod("setBehaviorChangeDelegate", delegateInterface)
                 setDelegate.isAccessible = true
@@ -968,15 +976,70 @@ class VemodInstrumentation(
             try {
                 activity.window.setIcon(android.R.color.transparent)
             } catch (_: Throwable) {}
+
+            // Disable auto-enter PiP unless user opted in (checks per-app override then global setting)
+            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.S) {
+                val isPipAllowed = com.vemod.container.container.ContainerRegistry.isPipEnabledForApp(activity, pkgName)
+                if (!isPipAllowed) {
+                    try {
+                        activity.setPictureInPictureParams(
+                            android.app.PictureInPictureParams.Builder()
+                                .setAutoEnterEnabled(false)
+                                .build()
+                        )
+                    } catch (_: Throwable) {}
+                }
+            }
+
+            // Set TaskDescription EARLY so Recent Apps captures the guest app's title and icon
+            applyTaskDescription(activity)
         }
 
         if (activity !is GuestProxyActivity) {
             fixCpuAndAbiSpoofing(activity.classLoader)
+            AdSdkNeutralizer.neutralize(activity)
+        }
+    }
+
+    private fun applyTaskDescription(activity: Activity) {
+        if (activity is GuestProxyActivity) return
+        val intent = activity.intent
+        val cDir = intent?.getStringExtra(GuestProxyActivity.EXTRA_CONTAINER_DIR) ?: activeContainerDir
+        val pName = intent?.getStringExtra(GuestProxyActivity.EXTRA_PACKAGE_NAME) ?: activePackageName
+        if (cDir != null && pName != null) {
+            val iconFile = File(cDir, "icon.png")
+            val bmp = if (iconFile.exists()) {
+                android.graphics.BitmapFactory.decodeFile(iconFile.absolutePath)
+            } else null
+
+            try {
+                val containerDir = File(cDir)
+                val containerApp = com.vemod.container.container.ApkExtractor.readMetadata(containerDir)
+                val label = containerApp?.appName ?: pName
+
+                @Suppress("DEPRECATION")
+                val td = android.app.ActivityManager.TaskDescription(
+                    label,
+                    bmp,
+                    android.graphics.Color.parseColor("#121212")
+                )
+                activity.setTaskDescription(td)
+                activity.title = label
+                try {
+                    activity.actionBar?.hide()
+                } catch (_: Throwable) {}
+                Log.i(TAG, "Applied TaskDescription: label=$label, hasIcon=${bmp != null}")
+            } catch (e: Throwable) {
+                Log.w(TAG, "Failed to apply TaskDescription", e)
+            }
         }
     }
 
     private fun postGuestActivityOnCreate(activity: Activity) {
         AdSdkNeutralizer.neutralize(activity)
+        try {
+            activity.actionBar?.hide()
+        } catch (_: Throwable) {}
 
         // Show app-specific dynamic splash screen (real logo) instead of system blueprint icon
         if (activity !is GuestProxyActivity) {
@@ -992,27 +1055,6 @@ class VemodInstrumentation(
                     android.graphics.BitmapFactory.decodeFile(iconFile.absolutePath)
                 } else null
 
-                // Set TaskDescription so Recent Apps displays the guest app's title and icon
-                try {
-                    val appThreadClass = Class.forName("android.app.ActivityThread")
-                    val currentApp = appThreadClass.getDeclaredMethod("currentApplication").invoke(null) as? android.app.Application
-                    val containerApp = if (currentApp != null) com.vemod.container.container.ContainerRegistry.getApp(currentApp, pName) else null
-                    val label = containerApp?.appName ?: pName
-
-                    @Suppress("DEPRECATION")
-                    val td = android.app.ActivityManager.TaskDescription(
-                        label,
-                        bmp,
-                        android.graphics.Color.parseColor("#121212")
-                    )
-                    activity.setTaskDescription(td)
-                    Log.i(TAG, "Applied TaskDescription: label=$label, hasIcon=${bmp != null}")
-                } catch (e: Throwable) {
-                    Log.w(TAG, "Failed to apply TaskDescription", e)
-                }
-
-
-
                 if (bmp != null && activity !is android.app.NativeActivity) {
                     showSplashOverlay(activity, bmp)
                 }
@@ -1020,20 +1062,27 @@ class VemodInstrumentation(
         }
     }
 
+    private fun isGmsThrowable(e: Throwable): Boolean {
+        var curr: Throwable? = e
+        while (curr != null) {
+            val hasGms = curr.stackTrace.any {
+                it.className.contains("google.android.gms") ||
+                it.className.contains("GoogleAnalytics") ||
+                it.className.contains("GooglePlayServices")
+            }
+            if (hasGms) return true
+            curr = curr.cause
+        }
+        return false
+    }
+
     override fun callActivityOnCreate(activity: Activity, icicle: Bundle?) {
         prepareGuestActivity(activity)
         try {
             base.callActivityOnCreate(activity, icicle)
         } catch (e: Throwable) {
-            val isGms = e.stackTrace.any {
-                it.className.contains("google.android.gms") ||
-                it.className.contains("GoogleAnalytics")
-            } || (e.cause?.stackTrace?.any {
-                it.className.contains("google.android.gms") ||
-                it.className.contains("GoogleAnalytics")
-            } == true)
-            if (isGms && (e is NullPointerException || e.cause is NullPointerException)) {
-                Log.w(TAG, "Swallowed GMS NullPointerException during callActivityOnCreate: ${e.message}")
+            if (isGmsThrowable(e)) {
+                Log.w(TAG, "Swallowed GMS exception during callActivityOnCreate: ${e.javaClass.simpleName}: ${e.message}")
             } else {
                 throw e
             }
@@ -1050,15 +1099,8 @@ class VemodInstrumentation(
                 base.callActivityOnCreate(activity, icicle)
             }
         } catch (e: Throwable) {
-            val isGms = e.stackTrace.any {
-                it.className.contains("google.android.gms") ||
-                it.className.contains("GoogleAnalytics")
-            } || (e.cause?.stackTrace?.any {
-                it.className.contains("google.android.gms") ||
-                it.className.contains("GoogleAnalytics")
-            } == true)
-            if (isGms && (e is NullPointerException || e.cause is NullPointerException)) {
-                Log.w(TAG, "Swallowed GMS NullPointerException during callActivityOnCreate: ${e.message}")
+            if (isGmsThrowable(e)) {
+                Log.w(TAG, "Swallowed GMS exception during callActivityOnCreate: ${e.javaClass.simpleName}: ${e.message}")
             } else {
                 throw e
             }
@@ -1112,33 +1154,58 @@ class VemodInstrumentation(
     override fun callActivityOnResume(activity: Activity) {
         try {
             base.callActivityOnResume(activity)
-        } catch (e: SecurityException) {
-            Log.w(TAG, "Swallowed SecurityException during onResume: ${e.message}")
+        } catch (e: Throwable) {
+            if (isGmsThrowable(e) || e is SecurityException) {
+                Log.w(TAG, "Swallowed exception during onResume: ${e.message}")
+            } else {
+                throw e
+            }
         }
         AdSdkNeutralizer.neutralize(activity)
+        applyTaskDescription(activity)
     }
 
     override fun callActivityOnPause(activity: Activity) {
         try {
             base.callActivityOnPause(activity)
-        } catch (e: SecurityException) {
-            Log.w(TAG, "Swallowed SecurityException during onPause: ${e.message}")
+        } catch (e: Throwable) {
+            if (isGmsThrowable(e) || e is SecurityException) {
+                Log.w(TAG, "Swallowed exception during onPause: ${e.message}")
+            } else {
+                throw e
+            }
         }
     }
 
     override fun callActivityOnStart(activity: Activity) {
         try {
             base.callActivityOnStart(activity)
-        } catch (e: SecurityException) {
-            Log.w(TAG, "Swallowed SecurityException during onStart: ${e.message}")
+        } catch (e: Throwable) {
+            if (isGmsThrowable(e) || e is SecurityException) {
+                Log.w(TAG, "Swallowed exception during onStart: ${e.message}")
+            } else {
+                throw e
+            }
         }
         AdSdkNeutralizer.neutralize(activity)
+        applyTaskDescription(activity)
     }
 
-    override fun callActivityOnStop(activity: Activity) = base.callActivityOnStop(activity)
+    override fun callActivityOnStop(activity: Activity) {
+        try {
+            base.callActivityOnStop(activity)
+        } catch (e: Throwable) {
+            if (isGmsThrowable(e) || e is SecurityException) {
+                Log.w(TAG, "Swallowed exception during onStop: ${e.message}")
+            } else {
+                throw e
+            }
+        }
+    }
 
     private fun neutralizeGameHelper(activity: Activity) {
         AdSdkNeutralizer.neutralize(activity)
+        applyTaskDescription(activity)
     }
 
     private fun fixCpuAndAbiSpoofing(classLoader: ClassLoader?) {

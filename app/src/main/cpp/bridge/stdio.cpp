@@ -608,6 +608,16 @@ int x_fputwc(u32 wc, u32 gf) {
     return (f && f->f) ? fputwc(wchar_t(wc), f->f) : -1;
 }
 u32 x_tmpfile() {
+    const std::string& tmpdir = get_vemod_tmp_dir();
+    char pattern[512];
+    snprintf(pattern, sizeof(pattern), "%s/tmpfile_XXXXXX", tmpdir.c_str());
+    int fd = mkstemp(pattern);
+    if (fd >= 0) {
+        unlink(pattern);
+        FILE* f = fdopen(fd, "w+b");
+        if (f) return wrap_file(f);
+        close(fd);
+    }
     FILE* f = tmpfile();
     if (!f) {
         errno_from_host();
