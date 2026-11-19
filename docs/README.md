@@ -4,7 +4,7 @@ Welcome to the Vemod documentation suite.
 
 ## 📚 Table of Contents
 
-- **[Architecture & Implementation Reference](documentation.md)** ([Interactive Architecture Diagram](../archify/vemod.html))
+- **[Architecture & Implementation Reference](documentation.md)**
   Deep technical dive into:
   - 32-bit execution model on 64-bit-only hardware (AArch64 / ARMv8 / ARMv9)
   - In-process Dynarmic ARM32 Just-In-Time (JIT) CPU recompiler

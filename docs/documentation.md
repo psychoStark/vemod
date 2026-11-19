@@ -18,8 +18,6 @@ Vemod allows users to install **multiple 32-bit APKs simultaneously**, launch th
 
 ## 2. Architecture Overview
 
-> **Interactive Diagram:** An interactive standalone architecture diagram with animated trace flows, guided subsystem views, and verifiable source citations is available at [`archify/vemod.html`](../archify/vemod.html).
-
 Rather than attempting full OS-level hardware virtualization (which is slow, heavyweight, and complex), Vemod runs as a lightweight userspace compatibility layer:
 * **Java / Kotlin Bytecode:** Runs **natively at full speed** on the host's 64-bit ART Virtual Machine.
 * **Native 32-bit Machine Code:** Intercepted and recompiled on-the-fly via an in-process **Dynarmic A32 JIT engine**.
