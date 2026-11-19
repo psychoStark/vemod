@@ -1,6 +1,6 @@
 # Vemod: 32-Bit Android APK Container for 64-Bit-Only Android Systems
 **Comprehensive Architecture, Implementation, and Troubleshooting Documentation**
-*App Version: 0.5.0 (versionCode: 50, versionName: "0.5.0")*
+*App Version: 0.5.0-beta (versionCode: 50, versionName: "0.5.0-beta")*
 
 ---
 
@@ -677,7 +677,7 @@ Neutralizes permanently defunct ad networks (`AdColony`, `Chartboost`, `Flurry`,
 * **Hardware:** Physical smartphone (`Nothing Phone (3a) Pro`).
 * **SoC & Architecture:** Snapdragon 7s Gen 3 (`arm64-v8a`, 64-bit-only hardware, 4 KB page size).
 * **OS:** Android 16 (SDK 36, Vanilla Ice Cream Preview).
-* **Host Package:** `com.psychostark.vemod` (Version 0.5.0).
+* **Host Package:** `com.psychostark.vemod` (Version 0.5.0-beta).
 
 ### Verified Applications Matrix:
 | Benchmark Application | Engine & Native Binaries | Key Systems Verified | Status |
