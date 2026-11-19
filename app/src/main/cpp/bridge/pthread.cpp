@@ -65,7 +65,7 @@ Pool<sem_t> g_sems;
 
 pthread_mutex_t* new_mutex_handle(gaddr gm, u32 type_word, bool force) {
     // Treat ALL mutexes as RECURSIVE on Android host to avoid EDEADLK crashes
-    // when guest threads re-enter locks in callbacks/nested calls (e.g. Rovio games, Orange Roulette).
+    // when guest threads re-enter locks in callbacks/nested calls (e.g. nested rendering callbacks).
     int type = PTHREAD_MUTEX_RECURSIVE;
     u32 idx = g_mutexes.add([type](pthread_mutex_t& m) {
         pthread_mutexattr_t at;

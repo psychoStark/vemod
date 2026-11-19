@@ -350,8 +350,11 @@ On modern Android devices featuring 120Hz or 240Hz touch digitizers and displays
 #### 1. Problem with Emulated Libc Thunks
 Complex C++ game engines use internal `std::string`, `std::vector`, `std::iostream`, jemalloc metadata, and custom exception unwinding (`_Unwind_*`, `__cxa_*`) that assume byte-for-byte fidelity with 32-bit Android Bionic structures. Incomplete struct layouts in host thunks caused subtle heap corruptions, thread-local storage misalignment, and unwinding crashes.
 
-#### 2. Hybrid Sysroot Engine
-Vemod loads official Android Nougat 7.0 AOSP (`armeabi-v7a`, API 24) system libraries (`libc.so`, `libm.so`, `libstdc++.so`, `libz.so`, `libc++.so`, `liblog.so`, `libcutils.so`) directly into the Dynarmic 32-bit guest address space:
+#### 2. Hybrid Sysroot Engine & Runtime Provisioning (`SysrootManager.kt`)
+To guarantee 100% open-source licensing compliance and eliminate precompiled OS rootfs blobs from the base application package, Vemod provisions its sysroot runtime dynamically via `SysrootManager.kt`:
+* On first launch, Vemod checks for an initialized sysroot in `context.filesDir/sysroot/`. If missing, it downloads a lightweight (~700 KB compressed) package (`sysroot-arm32.tar.gz`) from official releases with SHA-256 verification, reducing initial APK size to ~6 MB.
+* **Preserved Custom Bionic Enhancements:** Loads `libbionic_guest.so` (containing custom recursive mutexes, futex normalization, and semaphore handling compiled from `custom_bionic/`) as the highest-priority module.
+* **Upstream AOSP 7.0 (Nougat / API 24) System Libraries:** Loads clean, stock AOSP libraries (`libc.so`, `libm.so`, `libstdc++.so`, `libz.so`, `libc++.so`, `liblog.so`, `libcutils.so`) under Apache 2.0 / BSD directly into the Dynarmic 32-bit guest address space:
 * **Bionic TLS & Thread State:**
   - TLS slots 0 through 5 are initialized per thread according to Bionic conventions (`kSlotSelf`, `kSlotThreadId`, `kSlotErrno`, `kSlotOpenGLApi`, `kSlotOpenGL`, `kSlotStackGuard`).
   - Circular `pthread_internal_t` structure placed at `tls + 0x20` with guest tid at offset `0x08`, satisfying Bionic `pthread_self()` and `gettid()`.
@@ -707,6 +710,14 @@ Following in-depth investigation of legacy titles documented in `DIAGNOSIS_REPOR
   - **Selective Internal vs. External Intent Routing ([`VemodInstrumentation.kt`](app/src/main/java/com/vemod/container/proxy/VemodInstrumentation.kt)):** Updated `route(intent)` to evaluate `isInternalGuestTarget = (comp.packageName.isEmpty() || comp.packageName == activePackageName)`. External intents and GMS targets are delegated directly via `MicroGManager.rewriteGmsIntent(intent, appContext)` to launch host microG activities, while internal transitions remain isolated in `GuestProxyActivity`.
   - **microG Extended Access & Impersonation ([`AndroidManifest.xml`](app/src/main/AndroidManifest.xml) & [`MainActivity.kt`](app/src/main/java/com/vemod/container/ui/MainActivity.kt)):** Declared `app.revanced.gms.EXTENDED_ACCESS`, `org.microg.gms.EXTENDED_ACCESS`, and Google Auth permissions in `AndroidManifest.xml`. In `MainActivity.checkMicroGPermissions()`, dynamically queries and requests ungranted microG permissions at runtime. This satisfies microG's `callerHasGooglePackagePermission` check, permitting `PackageUtils.getAndCheckCallingPackageOrImpersonation` to securely allow `com.psychostark.vemod` to impersonate guest packages, returning `SIGN_IN_REQUIRED` with valid resolution `PendingIntent`s for Google Play Games sign-in.
 
+#### 29. Generic OpenGL ES 1.1 Compatibility Fallback & Neutralizer Sanitization
+* **The Problem:** Hardcoding commercial game bundle identifiers in native loader code (`loader.cpp`) or reflectively forcing proprietary ad SDKs into `NO_ADS` states in `AdSdkNeutralizer.kt` created trademark/IP exposure and commercial tampering liabilities.
+* **Implementation:**
+  - In [`ApkExtractor.kt`](app/src/main/java/com/vemod/container/container/ApkExtractor.kt), dynamically detect legacy OpenGL ES 1.x requirements (`reqFeatures.glEsVersion < 0x00020000` or `targetSdkVersion < 14`) upon ingestion and create a generic `.force_gles1` flag in the container directory.
+  - In [`loader.cpp`](app/src/main/cpp/bridge/loader.cpp), replaced hardcoded package string matching with a generic container check (`access((s_container_dir + "/.force_gles1").c_str(), F_OK) == 0`), returning `NULL` for `guest_dlopen("libGLESv2.so")` to trigger clean GLES 1.1 fixed-function fallbacks across all legacy titles.
+  - In [`VemodInstrumentation.kt`](app/src/main/java/com/vemod/container/proxy/VemodInstrumentation.kt), universalized `TouchPacer.install(activity)` for all guest containers, pacing sub-60ms `ACTION_UP` events universally without vendor-specific package filters.
+  - In [`AdSdkNeutralizer.kt`](app/src/main/java/com/vemod/container/proxy/AdSdkNeutralizer.kt), removed all proprietary state manipulation (such as forcing `NO_ADS` or targeting internal ProGuard-obfuscated fields), restricting neutralization strictly to framework-level crash suppression (catching looper exceptions, hiding dead permission error overlays, and handling unresolvable web views).
+
 ---
 
 ## 4. Maximum 32-Bit Compatibility: The Five Architectural Pillars
@@ -832,12 +843,10 @@ vemod/
 │   │       └── third_party/
 │   │           └── dynarmic/              # ARM32 JIT recompiler with cycle-guarded IR identity traversal
 │   └── assets/
-│       ├── stub/
-│       │   ├── template_classes.dex       # Companion stub classes.dex (whitelisted)
-│       │   ├── template_manifest.axml     # Companion stub binary manifest template
-│       │   └── template_resources.arsc    # Companion stub binary resources template
-│       └── sysroot/
-│           └── NOTICE.txt                 # AOSP and upstream open-source license notices
+│       └── stub/
+│           ├── template_classes.dex       # Companion stub classes.dex (whitelisted)
+│           ├── template_manifest.axml     # Companion stub binary manifest template
+│           └── template_resources.arsc    # Companion stub binary resources template
 ├── docs/
 │   ├── README.md                          # Documentation index
 │   └── documentation.md                   # Comprehensive technical documentation (this document)

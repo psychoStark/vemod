@@ -36,25 +36,6 @@ object AdSdkNeutralizer {
 
     private fun neutralizeEulaAndAdPreferences(activity: Activity) {
         try {
-            // Pre-accept Fingersoft EULA & AdManager settings
-            activity.getSharedPreferences("ADMANAGER_SETTINGS", android.content.Context.MODE_PRIVATE)
-                .edit()
-                .putInt("EULAVERSION_1_SHOWED", 1)
-                .putInt("startup_counter", 10)
-                .apply()
-
-            activity.getSharedPreferences("fsadsdk", android.content.Context.MODE_PRIVATE)
-                .edit()
-                .putBoolean("fsadsdk_eula_accepted", true)
-                .putBoolean("EULA_KEY", true)
-                .putInt("EULAVERSION_1_SHOWED", 1)
-                .apply()
-
-            activity.getSharedPreferences("fsadsdk_eula", android.content.Context.MODE_PRIVATE)
-                .edit()
-                .putBoolean("fsadsdk_eula_accepted", true)
-                .apply()
-
             // Generic privacy/EULA/consent preferences for legacy 32-bit games
             activity.getSharedPreferences("consent", android.content.Context.MODE_PRIVATE)
                 .edit()
@@ -63,26 +44,6 @@ object AdSdkNeutralizer {
                 .putBoolean("gdpr_consent", true)
                 .putBoolean("terms_accepted", true)
                 .apply()
-
-            // Reflectively disable Fingersoft AdManager state if loaded
-            val cl = activity.classLoader
-            try {
-                val adMgrClass = cl.loadClass("com.fingersoft.fsadsdk.advertising.AdManager")
-                val stateEnumClass = cl.loadClass("com.fingersoft.fsadsdk.advertising.AdManager\$AdManagerState")
-                val constants = stateEnumClass.enumConstants ?: emptyArray()
-                for (enumConst in constants) {
-                    if (enumConst.toString() == "NO_ADS" || enumConst.toString() == "AD_FREE_NO_ADS") {
-                        for (f in adMgrClass.declaredFields) {
-                            if (f.type == stateEnumClass && java.lang.reflect.Modifier.isStatic(f.modifiers)) {
-                                f.isAccessible = true
-                                f.set(null, enumConst)
-                                Log.i(TAG, "neutralizeEulaAndAdPreferences: set AdManager.${f.name} = $enumConst")
-                            }
-                        }
-                        break
-                    }
-                }
-            } catch (_: Throwable) {}
         } catch (e: Throwable) {
             Log.w(TAG, "neutralizeEulaAndAdPreferences error", e)
         }
@@ -101,8 +62,6 @@ object AdSdkNeutralizer {
                         if (java.lang.reflect.Modifier.isStatic(f.modifiers)) {
                             if (f.type == Int::class.javaPrimitiveType) {
                                 f.setInt(null, -1)
-                            } else if (f.name == "a" || f.name == "b" || f.name == "d" || f.name == "e") {
-                                f.set(null, null)
                             }
                         }
                     } catch (_: Throwable) {}

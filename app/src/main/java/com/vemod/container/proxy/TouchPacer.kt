@@ -17,7 +17,7 @@ import java.lang.reflect.Proxy
  *
  * On modern 120Hz/240Hz screens, quick taps often deliver ACTION_DOWN and ACTION_UP
  * within a few milliseconds, causing both events to be queued and dispatched to the
- * game engine in the exact same render frame. In engines like Rovio Fusion (Angry Birds),
+ * game engine in the exact same render frame. In decoupled multithreaded rendering engines,
  * if TouchBegan and TouchEnded arrive in the same frame without an engine update tick,
  * the button transitions to pressed/held state without firing its click callback.
  *

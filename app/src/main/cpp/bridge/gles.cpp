@@ -744,7 +744,7 @@ static GLboolean x_glIsVertexArrayOES(GLuint array) {
     return p_glIsVertexArrayOES ? p_glIsVertexArrayOES(array) : GL_FALSE;
 }
 
-// Fixed-point texture parameters (Reckless Racing / Polarbit fuseGL)
+// Fixed-point texture parameters (OpenGL ES 1.1 fixed-function pipeline)
 static void x_glTexParameterx(GLenum target, GLenum pname, GLfixed param) {
     switch (pname) {
         case GL_TEXTURE_MIN_FILTER:
@@ -788,7 +788,7 @@ static void x_glGetTexParameterxv(GLenum target, GLenum pname, gaddr params_addr
     }
 }
 
-// Instanced rendering (Gameloft / Spider-Man Unlimited)
+// Instanced rendering (Hardware instancing extensions)
 static void x_glDrawArraysInstanced(GLenum mode, GLint first, GLsizei count, GLsizei instancecount) {
     static auto fn = (PFNGLDRAWARRAYSINSTANCEDPROC)eglGetProcAddress("glDrawArraysInstanced");
     if (!fn) fn = (PFNGLDRAWARRAYSINSTANCEDPROC)eglGetProcAddress("glDrawArraysInstancedEXT");
@@ -1407,12 +1407,12 @@ void register_gles() {
     NB_REG("glIsVertexArrayOES", x_glIsVertexArrayOES);
     NB_REG("glDiscardFramebufferEXT", x_glDiscardFramebufferEXT);
 
-    // Fixed-point texture parameters (Reckless Racing / Polarbit fuseGL)
+    // Fixed-point texture parameters (OpenGL ES 1.1 fixed-function pipeline)
     NB_REG("glTexParameterx", x_glTexParameterx);
     NB_REG("glTexParameterxv", x_glTexParameterxv);
     NB_REG("glGetTexParameterxv", x_glGetTexParameterxv);
 
-    // Instanced rendering (Gameloft / Spider-Man Unlimited)
+    // Instanced rendering (Hardware instancing extensions)
     NB_REG("glDrawArraysInstanced", x_glDrawArraysInstanced);
     NB_REG("glDrawArraysInstancedEXT", x_glDrawArraysInstanced);
     NB_REG("glDrawArraysInstancedARB", x_glDrawArraysInstanced);

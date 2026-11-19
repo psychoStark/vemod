@@ -894,9 +894,7 @@ class VemodInstrumentation(
                     field.setInt(am, 23)
                     Log.i(TAG, "Set AlarmManager.mTargetSdkVersion = 23 to prevent cancel(null) crash")
                 }
-                if (pkgName.startsWith("com.rovio.")) {
-                    TouchPacer.install(activity)
-                }
+                TouchPacer.install(activity)
             } catch (e: Throwable) {
                 Log.w(TAG, "Failed to install system service hooks in callActivityOnCreate", e)
             }

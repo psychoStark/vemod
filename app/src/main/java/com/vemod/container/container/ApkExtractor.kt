@@ -374,6 +374,17 @@ object ApkExtractor {
             applicationClass = manifestInfo.applicationClass
         )
 
+        // Detect legacy OpenGL ES 1.x requirement to configure GLES 1.1 fallback
+        val reqGl = pkgInfo.reqFeatures?.firstOrNull { it.reqGlEsVersion != 0 }?.reqGlEsVersion ?: 0
+        val isLegacyGles1 = (reqGl in 1..0x0001ffff) ||
+                            ((appInfo?.targetSdkVersion ?: 30) < 14 && reqGl == 0)
+        if (isLegacyGles1) {
+            try {
+                File(containerDir, ".force_gles1").createNewFile()
+                Log.i(TAG, "Legacy GLES 1.x requirement detected for $packageName; activated .force_gles1 fallback")
+            } catch (_: Throwable) {}
+        }
+
         // Save metadata JSON
         saveMetadata(containerDir, containerApp)
 

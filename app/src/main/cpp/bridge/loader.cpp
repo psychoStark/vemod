@@ -1029,8 +1029,8 @@ u32 guest_dlopen(const char* name, int flags) {
     }
 
     if (base_name == "libGLESv2.so") {
-        if (s_guest_lib_dir.find("com.polarbit.RecklessRacingLite") != std::string::npos) {
-            NB_LOGI("guest dlopen(\"libGLESv2.so\") -> returning NULL for Reckless Racing GLES 1.1 fallback");
+        if (!s_container_dir.empty() && access((s_container_dir + "/.force_gles1").c_str(), F_OK) == 0) {
+            NB_LOGI("guest dlopen(\"libGLESv2.so\") -> returning NULL (forced GLES 1.1 fallback active)");
             return 0;
         }
     }
