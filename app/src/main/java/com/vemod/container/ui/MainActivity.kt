@@ -94,6 +94,7 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         handleInstallIntent(intent)
+        checkMicroGPermissions()
 
         setContent {
             val prefs = remember { getSharedPreferences("vemod_settings", Context.MODE_PRIVATE) }
@@ -130,6 +131,33 @@ class MainActivity : ComponentActivity() {
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         handleInstallIntent(intent)
+    }
+
+    private fun checkMicroGPermissions() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && MicroGManager.isMicroGInstalled(this)) {
+            val candidates = listOf(
+                "app.revanced.gms.EXTENDED_ACCESS",
+                "org.microg.gms.EXTENDED_ACCESS",
+                "app.revanced.android.googleapps.permission.GOOGLE_AUTH.local",
+                "app.revanced.android.googleapps.permission.GOOGLE_AUTH.mail",
+                "app.revanced.android.googleapps.permission.GOOGLE_AUTH.cp",
+                "app.revanced.android.googleapps.permission.GOOGLE_AUTH.writely",
+                "com.google.android.gms.permission.ACTIVITY_RECOGNITION",
+                "app.revanced.android.gms.permission.ACTIVITY_RECOGNITION"
+            )
+            val needed = candidates.filter { perm ->
+                try {
+                    packageManager.getPermissionInfo(perm, 0)
+                    checkSelfPermission(perm) != android.content.pm.PackageManager.PERMISSION_GRANTED
+                } catch (_: Throwable) {
+                    false
+                }
+            }
+            if (needed.isNotEmpty()) {
+                Log.i(TAG, "Requesting microG permissions: $needed")
+                requestPermissions(needed.toTypedArray(), 1002)
+            }
+        }
     }
 
     private fun handleInstallIntent(intent: Intent?) {

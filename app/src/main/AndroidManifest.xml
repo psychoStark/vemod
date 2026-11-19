@@ -18,6 +18,18 @@
     <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
     <uses-permission android:name="android.permission.HIGH_SAMPLING_RATE_SENSORS" />
 
+    <!-- microG Extended Access & Impersonation permissions -->
+    <uses-permission android:name="app.revanced.gms.EXTENDED_ACCESS" />
+    <uses-permission android:name="org.microg.gms.EXTENDED_ACCESS" />
+    <uses-permission android:name="app.revanced.android.googleapps.permission.GOOGLE_AUTH.local" />
+    <uses-permission android:name="app.revanced.android.googleapps.permission.GOOGLE_AUTH.mail" />
+    <uses-permission android:name="app.revanced.android.googleapps.permission.GOOGLE_AUTH.cp" />
+    <uses-permission android:name="app.revanced.android.googleapps.permission.GOOGLE_AUTH.writely" />
+    <uses-permission android:name="app.revanced.android.providers.gsf.permission.READ_GSERVICES" />
+    <uses-permission android:name="com.google.android.providers.gsf.permission.READ_GSERVICES" />
+    <uses-permission android:name="com.google.android.gms.permission.ACTIVITY_RECOGNITION" />
+    <uses-permission android:name="app.revanced.android.gms.permission.ACTIVITY_RECOGNITION" />
+
     <queries>
         <package android:name="com.google.android.gms" />
         <package android:name="app.revanced.android.gms" />

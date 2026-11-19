@@ -324,11 +324,19 @@ class PackageManagerHook(
                     val activeMicroG = appContext?.let { MicroGManager.getActiveMicroGPackage(it) }
                     if (activeMicroG != null) {
                         try {
+                            val realGmsAppInfo = try {
+                                val gmsArgs = args.map { it }.toTypedArray()
+                                gmsArgs[0] = "com.google.android.gms"
+                                method.invoke(real, *gmsArgs) as? ApplicationInfo
+                            } catch (_: Throwable) { null }
+
                             val newArgs = args.map { it }.toTypedArray()
                             newArgs[0] = activeMicroG
-                            val realAppInfo = method.invoke(real, *newArgs) as? ApplicationInfo
-                            if (realAppInfo != null) {
-                                return ApplicationInfo(realAppInfo).apply {
+                            val microGAppInfo = method.invoke(real, *newArgs) as? ApplicationInfo
+
+                            val sourceAppInfo = realGmsAppInfo ?: microGAppInfo
+                            if (sourceAppInfo != null) {
+                                return ApplicationInfo(sourceAppInfo).apply {
                                     packageName = targetPkg
                                     flags = flags or ApplicationInfo.FLAG_SYSTEM
                                 }
@@ -374,24 +382,38 @@ class PackageManagerHook(
                     val activeMicroG = appContext?.let { MicroGManager.getActiveMicroGPackage(it) }
                     if (activeMicroG != null) {
                         try {
+                            // Query real com.google.android.gms first to acquire authentic Google release certificates
+                            val gmsArgs = args.map { it }.toTypedArray()
+                            gmsArgs[0] = "com.google.android.gms"
+                            if (gmsArgs.size > 1) {
+                                val reqFlags = (gmsArgs[1] as? Number)?.toLong() ?: 0L
+                                val fullFlags = reqFlags or 0x40L or 0x08000000L
+                                gmsArgs[1] = if (gmsArgs[1] is Long) fullFlags else fullFlags.toInt()
+                            }
+                            val realGmsInfo = try {
+                                method.invoke(real, *gmsArgs) as? PackageInfo
+                            } catch (_: Throwable) { null }
+
                             val newArgs = args.map { it }.toTypedArray()
                             newArgs[0] = activeMicroG
-                            val realInfo = method.invoke(real, *newArgs) as? PackageInfo
-                            if (realInfo != null) {
+                            val microGInfo = method.invoke(real, *newArgs) as? PackageInfo
+
+                            val sourceInfo = realGmsInfo ?: microGInfo
+                            if (sourceInfo != null) {
                                 val pi = PackageInfo()
                                 pi.packageName = targetPkg
-                                pi.versionName = realInfo.versionName ?: "24.09.13"
-                                pi.versionCode = if (realInfo.versionCode > 0) realInfo.versionCode else 240913000
+                                pi.versionName = sourceInfo.versionName ?: "24.09.13"
+                                pi.versionCode = if (sourceInfo.versionCode > 0) sourceInfo.versionCode else 255070313
                                 if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.P) {
                                     pi.longVersionCode = pi.versionCode.toLong()
-                                    pi.signingInfo = realInfo.signingInfo
+                                    pi.signingInfo = realGmsInfo?.signingInfo ?: microGInfo?.signingInfo
                                 }
-                                pi.signatures = realInfo.signatures
-                                pi.applicationInfo = ApplicationInfo(realInfo.applicationInfo ?: ApplicationInfo()).apply {
+                                pi.signatures = realGmsInfo?.signatures ?: microGInfo?.signatures
+                                pi.applicationInfo = ApplicationInfo(sourceInfo.applicationInfo ?: ApplicationInfo()).apply {
                                     packageName = targetPkg
                                     flags = flags or ApplicationInfo.FLAG_SYSTEM
                                 }
-                                Log.i(TAG, "getPackageInfo: synthesized $targetPkg backed by $activeMicroG (version=${pi.versionName}, code=${pi.versionCode})")
+                                Log.i(TAG, "getPackageInfo: synthesized $targetPkg backed by $activeMicroG (hasRealGmsCerts=${realGmsInfo?.signatures != null}, version=${pi.versionName}, code=${pi.versionCode})")
                                 return pi
                             }
                         } catch (e: Throwable) {

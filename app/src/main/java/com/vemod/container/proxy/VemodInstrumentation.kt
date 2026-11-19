@@ -154,6 +154,13 @@ class VemodInstrumentation(
 
     private fun route(intent: Intent?): Intent? {
         if (intent == null) return null
+
+        val appContext = VemodApp.instance
+        if (appContext != null && MicroGManager.isGmsTarget(intent)) {
+            Log.i(TAG, "Routing: delegating GMS intent to host microG: $intent")
+            return MicroGManager.rewriteGmsIntent(intent, appContext)
+        }
+
         val comp = intent.component ?: return intent
 
         // If intent targets GuestProxyActivity or any of its concurrent subclasses, let it proceed
@@ -161,10 +168,15 @@ class VemodInstrumentation(
             return intent
         }
 
-        // If intent targets a guest activity (internal activity transition within guest app)
+        val pkg = activePackageName
         val hostPkg = VemodApp.instance?.packageName ?: "com.psychostark.vemod"
-        if (!comp.className.startsWith(hostPkg) && !comp.className.startsWith("com.vemod.container")) {
-            val pkg = activePackageName
+
+        // An intent is an internal guest transition ONLY if it targets the guest app itself
+        val isInternalGuestTarget = (comp.packageName.isEmpty() || comp.packageName == pkg) &&
+                                    !comp.className.startsWith(hostPkg) &&
+                                    !comp.className.startsWith("com.vemod.container")
+
+        if (isInternalGuestTarget) {
             val cDir = activeContainerDir
             val bApk = activeBaseApk
 

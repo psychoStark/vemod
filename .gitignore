@@ -101,11 +101,7 @@ armeabi-v7a-24_r07.zip
 DIAGNOSIS_REPORT.md
 FIX_PLAN.md
 
-# Archify temporary files, receipts and review dirs
+# Archify diagram and build artifacts
 .archify/
-archify/*.finalize*.json
-archify/*.browser-check.json
-archify/*.delivery*.json
-archify/review-*/
-archify/*.backup.json
+archify/
 
