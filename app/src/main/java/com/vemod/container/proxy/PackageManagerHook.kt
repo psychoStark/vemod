@@ -22,13 +22,19 @@ class PackageManagerHook(
 
     companion object {
         private const val TAG = "PackageManagerHook"
+        @Volatile
+        var realPm: Any? = null
+        @Volatile
+        var appContext: Context? = null
 
         fun install(context: Context) {
             try {
+                appContext = context.applicationContext
                 val activityThreadClass = Class.forName("android.app.ActivityThread")
                 val getPmMethod = activityThreadClass.getDeclaredMethod("getPackageManager")
                 getPmMethod.isAccessible = true
                 val currentPm = getPmMethod.invoke(null) ?: return
+                realPm = currentPm
                 if (Proxy.isProxyClass(currentPm.javaClass)) return
 
                 val ipmClass = Class.forName("android.content.pm.IPackageManager")
@@ -315,8 +321,25 @@ class PackageManagerHook(
 
             if (methodName == "getApplicationInfo") {
                 if (targetPkg == "com.google.android.gms" || targetPkg == "com.google.android.gms.location") {
-                    Log.i(TAG, "getApplicationInfo: concealing $targetPkg to force offline/fallback mode")
-                    return null
+                    val activeMicroG = appContext?.let { MicroGManager.getActiveMicroGPackage(it) }
+                    if (activeMicroG != null) {
+                        try {
+                            val newArgs = args.map { it }.toTypedArray()
+                            newArgs[0] = activeMicroG
+                            val realAppInfo = method.invoke(real, *newArgs) as? ApplicationInfo
+                            if (realAppInfo != null) {
+                                return ApplicationInfo(realAppInfo).apply {
+                                    packageName = targetPkg
+                                    flags = flags or ApplicationInfo.FLAG_SYSTEM
+                                }
+                            }
+                        } catch (e: Throwable) {
+                            Log.w(TAG, "Failed resolving real microG application info: ${e.message}")
+                        }
+                    } else {
+                        Log.i(TAG, "getApplicationInfo: concealing $targetPkg to force offline/fallback mode (microG not installed)")
+                        return null
+                    }
                 }
                 if (targetPkg != null && (targetPkg == guestPkg || targetPkg == hostPackage)) {
                     val guestApk = VemodInstrumentation.activeBaseApk
@@ -348,11 +371,37 @@ class PackageManagerHook(
 
             if (methodName == "getPackageInfo") {
                 if (targetPkg == "com.google.android.gms" || targetPkg == "com.google.android.gms.location") {
-                    // Returning null causes ApplicationPackageManager.getPackageInfo to throw NameNotFoundException.
-                    // This signals to GooglePlayServicesUtil and ad/analytics SDKs (InMobi, GameHelper) that GMS is
-                    // not present on this device/container, putting them safely into offline/fallback mode.
-                    Log.i(TAG, "getPackageInfo: concealing $targetPkg from guest to force offline mode")
-                    return null
+                    val activeMicroG = appContext?.let { MicroGManager.getActiveMicroGPackage(it) }
+                    if (activeMicroG != null) {
+                        try {
+                            val newArgs = args.map { it }.toTypedArray()
+                            newArgs[0] = activeMicroG
+                            val realInfo = method.invoke(real, *newArgs) as? PackageInfo
+                            if (realInfo != null) {
+                                val pi = PackageInfo()
+                                pi.packageName = targetPkg
+                                pi.versionName = realInfo.versionName ?: "24.09.13"
+                                pi.versionCode = if (realInfo.versionCode > 0) realInfo.versionCode else 240913000
+                                if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.P) {
+                                    pi.longVersionCode = pi.versionCode.toLong()
+                                    pi.signingInfo = realInfo.signingInfo
+                                }
+                                pi.signatures = realInfo.signatures
+                                pi.applicationInfo = ApplicationInfo(realInfo.applicationInfo ?: ApplicationInfo()).apply {
+                                    packageName = targetPkg
+                                    flags = flags or ApplicationInfo.FLAG_SYSTEM
+                                }
+                                Log.i(TAG, "getPackageInfo: synthesized $targetPkg backed by $activeMicroG (version=${pi.versionName}, code=${pi.versionCode})")
+                                return pi
+                            }
+                        } catch (e: Throwable) {
+                            Log.w(TAG, "Failed resolving real microG package info: ${e.message}")
+                        }
+                    } else {
+                        // Concealing GMS signals to GooglePlayServicesUtil and ad SDKs that GMS is absent
+                        Log.i(TAG, "getPackageInfo: concealing $targetPkg from guest to force offline mode (microG not installed)")
+                        return null
+                    }
                 }
 
                 val guestApk = VemodInstrumentation.activeBaseApk

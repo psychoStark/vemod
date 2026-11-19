@@ -1,5 +1,6 @@
 package com.vemod.container.ui
 
+import com.vemod.container.proxy.MicroGManager
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
@@ -500,6 +501,9 @@ class MainActivity : ComponentActivity() {
                         horizontalArrangement = Arrangement.spacedBy(10.dp),
                         verticalArrangement = Arrangement.spacedBy(18.dp)
                     ) {
+                        item(span = { androidx.compose.foundation.lazy.grid.GridItemSpan(4) }) {
+                            MicroGRecommendationCard(context)
+                        }
                         items(filteredApps, key = { it.packageName }) { app ->
                             AppDrawerGridItem(
                                 app = app,
@@ -1622,6 +1626,64 @@ class MainActivity : ComponentActivity() {
                         )
                     }
 
+                    HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.3f))
+
+                    // 4. Google Play Services / microG Status
+                    val currentContext = LocalContext.current
+                    val microGInstalled = MicroGManager.isMicroGInstalled(currentContext)
+                    val microGDisplayName = MicroGManager.getMicroGDisplayName(currentContext)
+                    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                        Text(
+                            text = "Google Play Services (microG)",
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = MaterialTheme.colorScheme.primary
+                        )
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    text = if (microGInstalled) "Status: Detected" else "Status: Not Installed",
+                                    fontWeight = FontWeight.SemiBold,
+                                    fontSize = 14.sp,
+                                    color = if (microGInstalled) Color(0xFF4CAF50) else MaterialTheme.colorScheme.onSurface
+                                )
+                                Text(
+                                    text = microGDisplayName,
+                                    fontSize = 11.5.sp,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+                            if (microGInstalled) {
+                                val settingsIntent = MicroGManager.createSettingsIntent(currentContext)
+                                if (settingsIntent != null) {
+                                    OutlinedButton(
+                                        onClick = {
+                                            try {
+                                                currentContext.startActivity(settingsIntent)
+                                            } catch (e: Throwable) {
+                                                Log.w("MainActivity", "Failed launching microG settings: ${e.message}")
+                                            }
+                                        },
+                                        shape = RoundedCornerShape(10.dp)
+                                    ) {
+                                        Text("Configure", fontSize = 12.sp)
+                                    }
+                                }
+                            } else {
+                                Button(
+                                    onClick = { currentContext.startActivity(MicroGManager.createInstallIntent()) },
+                                    shape = RoundedCornerShape(10.dp)
+                                ) {
+                                    Text("Get microG", fontSize = 12.sp)
+                                }
+                            }
+                        }
+                    }
+
                     Spacer(modifier = Modifier.height(4.dp))
 
                     Button(
@@ -1637,10 +1699,50 @@ class MainActivity : ComponentActivity() {
     }
 
     @Composable
+    fun MicroGRecommendationCard(context: Context) {
+        val isInstalled = remember { MicroGManager.isMicroGInstalled(context) }
+        if (isInstalled) return
+
+        Card(
+            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
+            shape = RoundedCornerShape(16.dp),
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 16.dp, vertical = 8.dp)
+        ) {
+            Column(modifier = Modifier.padding(16.dp)) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Icon(
+                        imageVector = Icons.Default.CloudSync,
+                        contentDescription = null,
+                        tint = MaterialTheme.colorScheme.primary
+                    )
+                    Spacer(Modifier.width(8.dp))
+                    Text(
+                        text = "Enable Google Play Games with microG",
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.Bold
+                    )
+                }
+                Spacer(Modifier.height(4.dp))
+                Text(
+                    text = "Install open-source microG to enable Google Play Games login, cloud saves, and online features without tracking.",
+                    style = MaterialTheme.typography.bodySmall
+                )
+                Spacer(Modifier.height(12.dp))
+                Button(onClick = { context.startActivity(MicroGManager.createInstallIntent()) }) {
+                    Text("Get microG (Open Source)")
+                }
+            }
+        }
+    }
+
+    @Composable
     fun EmptyAppDrawerView(
         onInstallClick: () -> Unit,
         useDarkTheme: Boolean
     ) {
+        val context = LocalContext.current
         Column(
             modifier = Modifier
                 .fillMaxSize()
@@ -1648,6 +1750,8 @@ class MainActivity : ComponentActivity() {
             horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.Center
         ) {
+            MicroGRecommendationCard(context)
+            Spacer(modifier = Modifier.height(16.dp))
             Surface(
                 modifier = Modifier
                     .fillMaxWidth(0.9f)

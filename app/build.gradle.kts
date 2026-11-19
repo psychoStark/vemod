@@ -72,7 +72,10 @@ android {
 
     packaging {
         resources {
-            excludes += "/META-INF/{AL2.0,LGPL2.1}"
+            excludes += listOf(
+                "/META-INF/{AL2.0,LGPL2.1}",
+                "META-INF/versions/9/OSGI-INF/MANIFEST.MF"
+            )
         }
         jniLibs {
             useLegacyPackaging = true
@@ -101,6 +104,10 @@ dependencies {
 
     // Official Google APK signature generator (v1, v2, v3) for micro-stubs
     implementation("com.android.tools.build:apksig:8.7.3")
+
+    // Bouncy Castle for dynamic self-signed X.509 keystore generation
+    implementation("org.bouncycastle:bcprov-jdk18on:1.79")
+    implementation("org.bouncycastle:bcpkix-jdk18on:1.79")
 
     debugImplementation("androidx.compose.ui:ui-tooling")
     debugImplementation("androidx.compose.ui:ui-test-manifest")

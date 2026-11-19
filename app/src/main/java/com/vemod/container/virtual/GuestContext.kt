@@ -147,17 +147,26 @@ class GuestContext(
         val action = service.action ?: ""
         return pkg.contains("com.google.android.gms") ||
                action.contains("com.google.android.gms") ||
-               pkg.contains("google")
+               pkg.contains("google") ||
+               action.contains("licensing", ignoreCase = true) ||
+               pkg.contains("licensing", ignoreCase = true) ||
+               pkg.contains("com.android.vending")
     }
 
     override fun startActivity(intent: android.content.Intent) {
         try {
-            val targetIntent = if (intent.action == android.content.Intent.ACTION_SEND) {
-                android.content.Intent.createChooser(intent, null).apply {
+            val isGms = com.vemod.container.proxy.MicroGManager.isGmsTarget(intent)
+            val baseIntent = if (isGms && com.vemod.container.proxy.MicroGManager.isMicroGInstalled(baseContext)) {
+                com.vemod.container.proxy.MicroGManager.rewriteGmsIntent(intent, baseContext)
+            } else {
+                intent
+            }
+            val targetIntent = if (baseIntent.action == android.content.Intent.ACTION_SEND) {
+                android.content.Intent.createChooser(baseIntent, null).apply {
                     addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
                 }
             } else {
-                android.content.Intent(intent).apply {
+                android.content.Intent(baseIntent).apply {
                     addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
                 }
             }
@@ -169,12 +178,18 @@ class GuestContext(
 
     override fun startActivity(intent: android.content.Intent, options: android.os.Bundle?) {
         try {
-            val targetIntent = if (intent.action == android.content.Intent.ACTION_SEND) {
-                android.content.Intent.createChooser(intent, null).apply {
+            val isGms = com.vemod.container.proxy.MicroGManager.isGmsTarget(intent)
+            val baseIntent = if (isGms && com.vemod.container.proxy.MicroGManager.isMicroGInstalled(baseContext)) {
+                com.vemod.container.proxy.MicroGManager.rewriteGmsIntent(intent, baseContext)
+            } else {
+                intent
+            }
+            val targetIntent = if (baseIntent.action == android.content.Intent.ACTION_SEND) {
+                android.content.Intent.createChooser(baseIntent, null).apply {
                     addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
                 }
             } else {
-                android.content.Intent(intent).apply {
+                android.content.Intent(baseIntent).apply {
                     addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
                 }
             }
@@ -185,8 +200,40 @@ class GuestContext(
     }
 
     override fun bindService(service: android.content.Intent, conn: android.content.ServiceConnection, flags: Int): Boolean {
-        if (com.vemod.container.proxy.MockBillingService.isBillingOrLicensing(service)) {
+        val isGmsTarget = com.vemod.container.proxy.MicroGManager.isGmsTarget(service)
+        val isBillingOrLicensing = service.action?.contains("billing", ignoreCase = true) == true ||
+                                   service.action?.contains("licensing", ignoreCase = true) == true
+
+        if (isBillingOrLicensing) {
+            if (com.vemod.container.proxy.MicroGManager.isMicroGInstalled(baseContext)) {
+                val rewritten = com.vemod.container.proxy.MicroGManager.rewriteGmsIntent(service, baseContext)
+                val canResolve = baseContext.packageManager.resolveService(rewritten, 0) != null
+                if (canResolve) {
+                    return try {
+                        baseContext.bindService(rewritten, conn, flags)
+                    } catch (e: Throwable) {
+                        Log.w("GuestContext", "Delegated service bind to microG billing failed, falling back to mock: ${e.message}")
+                        com.vemod.container.proxy.MockBillingService.mockBind(service, conn)
+                    }
+                }
+            }
             return com.vemod.container.proxy.MockBillingService.mockBind(service, conn)
+        }
+
+        if (isGmsTarget) {
+            if (com.vemod.container.proxy.MicroGManager.isMicroGInstalled(baseContext)) {
+                val rewritten = com.vemod.container.proxy.MicroGManager.rewriteGmsIntent(service, baseContext)
+                Log.i("GuestContext", "Delegating service bind directly to host microG: $rewritten (original: $service)")
+                return try {
+                    baseContext.bindService(rewritten, conn, flags)
+                } catch (e: Throwable) {
+                    Log.w("GuestContext", "Delegated service bind to microG failed: ${e.message}")
+                    false
+                }
+            } else {
+                Log.i("GuestContext", "microG not installed; routing to safe offline stub: $service")
+                return com.vemod.container.proxy.MockBillingService.mockBind(service, conn)
+            }
         }
         if (isGoogleService(service)) {
             Log.w("GuestContext", "Preventing bindService to Google service: $service")
@@ -201,6 +248,19 @@ class GuestContext(
     }
 
     override fun startService(service: android.content.Intent): android.content.ComponentName? {
+        val isGmsTarget = com.vemod.container.proxy.MicroGManager.isGmsTarget(service)
+        if (isGmsTarget) {
+            if (com.vemod.container.proxy.MicroGManager.isMicroGInstalled(baseContext)) {
+                val rewritten = com.vemod.container.proxy.MicroGManager.rewriteGmsIntent(service, baseContext)
+                return try {
+                    baseContext.startService(rewritten)
+                } catch (e: Throwable) {
+                    Log.w("GuestContext", "Delegated startService to microG failed: ${e.message}")
+                    null
+                }
+            }
+            return null
+        }
         if (isGoogleService(service)) {
             Log.w("GuestContext", "Preventing startService to Google service: $service")
             return null

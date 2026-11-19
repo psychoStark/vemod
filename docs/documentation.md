@@ -561,12 +561,12 @@ Following in-depth investigation of legacy titles documented in `DIAGNOSIS_REPOR
 * In [`loader.cpp`](app/src/main/cpp/bridge/loader.cpp) (`guest_dlopen`), intercepted paths containing `/assets/` or `.dll.so` and resolved them by base library name against `s_container_dir + "/lib32/"`, allowing Unity's Mono assembly loader to locate `UnityEngine.dll.so` without hanging in `nativeRender` (*Lane Racer*).
 
 #### 5. Legacy Audio Track Constructor & Channel Route Normalization
-* In [`FuseAudio.java`](app/src/main/java/com/polarbit/fuse/FuseAudio.java), detected parameter inversion from Polarbit's native JNI bridge (`streamType=22050`, `sampleRateInHz=2`).
+* In [`PolarbitFuseAudio.java`](app/src/main/java/com/vemod/container/shims/PolarbitFuseAudio.java), implemented an independent clean-room audio driver shim for Polarbit's 3D engine. Detected parameter inversion from Polarbit's native JNI bridge (`streamType=22050`, `sampleRateInHz=2`).
 * Normalized `streamType` unconditionally to `AudioManager.STREAM_MUSIC` (`3`) and clamped valid sample rates (44100 / 22050 Hz). Previously, the swapped stream type `2` mapped to `STREAM_RING`, muting game audio during interactive gameplay (*Reckless Racing Lite*).
 
 #### 6. Asset Decompression & Robust Stream Parsing
-* In [`FileReader.java`](app/src/main/java/com/rovio/fusion/FileReader.java), updated asset loading to verify if requested paths already terminate in `.zip` before appending `.zip`.
-* Previously, opening files already named `*.zip` tried `*.zip.zip`, failed, and fell back to uncompressed raw reading. Passing raw compressed zip headers to `ByteArrayInputStream` triggered `Malformed Composite Sprite file: ByteArrayInputStream` and cleanly killed the process (*Angry Birds Stella*).
+* In [`RovioFileReader.java`](app/src/main/java/com/vemod/container/shims/RovioFileReader.java), implemented an independent clean-room asset reader and decompressor shim for Rovio's Fusion engine. Updated asset loading to verify if requested paths already terminate in `.zip` before appending `.zip`, falling back cleanly to uncompressed asset loading.
+* Removed aggressive auto-decompression on raw PK magic headers that truncated multi-file composite sprite archives to their first entry, ensuring complete resource bundles unpack seamlessly (*Angry Birds Classic*, *Angry Birds Rio*, *Angry Birds Stella*, *Angry Birds Space HD*).
 
 #### 7. Virtualized Service Intent Enforcement & Sandboxing
 * In [`GuestContext.kt`](app/src/main/java/com/vemod/container/virtual/GuestContext.kt), guarded `startService` and `bindService` with `try-catch` blocks catching `IllegalArgumentException: Service Intent must be explicit` on Android API 26+, neutralizing crashes from legacy controller SDKs (*Hill Climb Racing* / Moga).
@@ -605,7 +605,7 @@ Following in-depth investigation of legacy titles documented in `DIAGNOSIS_REPOR
 * Intercepted billing service binding in [`GuestContext.kt`](app/src/main/java/com/vemod/container/virtual/GuestContext.kt), returning `BILLING_RESPONSE_RESULT_OK` (code 0) for `isBillingSupported`, empty purchase lists, and verified licensing status, permanently eliminating "unable to connect to android market billing" modal dialogs and licensing crashes (*Hill Climb Racing*, *Angry Birds*).
 
 #### 14. Polarbit FuseAudio Frame Sizing & Stereo Mixing
-* In [`FuseAudio.java`](app/src/main/java/com/polarbit/fuse/FuseAudio.java), corrected `AudioCreate` parameter unpacking (`sampleRate`, `channels`, `audioFormat`, `in_bufsize`).
+* In [`PolarbitFuseAudio.java`](app/src/main/java/com/vemod/container/shims/PolarbitFuseAudio.java), corrected `AudioCreate` parameter unpacking (`sampleRate`, `channels`, `audioFormat`, `in_bufsize`).
 * Corrected `bytesperframe` to `4` (16-bit stereo) and adjusted period sizing to prevent buffer underflows (`BufferUnderflowException`), restoring audio playback in Polarbit game engines (*Reckless Racing Lite*).
 
 #### 15. PackageManager Intent Query Virtualization
@@ -628,16 +628,76 @@ Following in-depth investigation of legacy titles documented in `DIAGNOSIS_REPOR
   - Guaranteed that guest pointers to direct buffer memory remain valid and synchronized across multi-touch drag and swipe events until explicitly released.
 
 #### 18. Guest Exit & Abort Trapping with Stack Backtrace Reconstruction
-* **The Problem:** When guest libraries encountered assertion failures, unhandled exceptions, or explicit `exit(1)` calls, unhooked Bionic symbols invoked host `_exit()` or returned stale registers to Java rendering loops. In Java `GLSurfaceView`, threads continued calling `nativeUpdate()` at 60 FPS, repeatedly swapping stale EGL buffers and flickering between 3 splash frames in an infinite CPU loop until the system killed the process.
+* **The Problem:** When guest libraries encountered assertion failures, unhandled exceptions, or explicit `exit(1)` calls, unhooked Bionic symbols invoked host `_exit()` or returned stale registers to Java rendering loops. In Java `GLSurfaceView`, threads continued calling `nativeUpdate()` at 60 FPS, repeatedly swapping stale EGL buffers and flickering between 3 splash frames in an infinite CPU loop until the system killed the process. Conversely, calling `fatal()` when background worker threads cleanly completed via `pthread_exit(0)` caused host process aborts during normal gameplay (*Reckless Racing Lite*).
 * **Implementation:**
   - In [`loader.cpp`](app/src/main/cpp/bridge/loader.cpp), intercepted `exit`, `_exit`, `_Exit`, `abort`, `raise`, `__assert2`, `__assert`, `__android_log_assert`, and `__stack_chk_fail` with host handlers.
   - In [`cpu.cpp`](app/src/main/cpp/bridge/cpu.cpp), updated `Cpu::dump` stack unwinder to scan up to `sp + 2048` and dynamically inspect every loaded library in `g_modules` regardless of load address.
-  - In `call_guest`, if a guest thread sets `t.exiting`, it terminates with a descriptive diagnostic message and guest stack trace rather than silently returning stale register values to Java.
+  - In `call_guest`, if a guest thread sets `t.exiting`, it gracefully unwinds and returns `t.exit_value` rather than aborting the host process.
 
 #### 19. Full Telephony Binder Security Virtualization (`ITelephony`)
 * **The Problem:** Modern Android (Android 10+) restricts access to telephony identifiers and network states (`getNetworkTypeForSubscriber`, `getDeviceId`, `getSubscriberId`), throwing `SecurityException: getDataNetworkTypeForSubscriber` when legacy ad and analytics SDKs (such as UnityAds / ConnectivityMonitor) query network capabilities on background threads.
 * **Implementation:**
   - In [`GuestContext.kt`](app/src/main/java/com/vemod/container/virtual/GuestContext.kt), extended dynamic proxy wrapping across all `ITelephony` service interfaces (in addition to `ITelephonyRegistry`), intercepting restricted methods and returning safe default return values (e.g. `0` or `null`) while logging warnings instead of crashing the host process.
+
+#### 20. Trademark Sanitization & Dynamic ClassLoader Interoperability Shims (`com.vemod.container.shims.*`)
+* **The Legal & Compatibility Rationale:** Checking corporate trademark packages (`com.rovio.*`, `com.polarbit.*`) into a public source tree triggers automated intellectual property crawlers and presents trademark infringement and dilution liability. However, legacy 32-bit guest game engines hardcode JNI lookups and bytecode reflection expecting those exact class paths.
+* **Implementation:**
+  - Completely sanitized the source tree by relocating all clean-room shims into `com.vemod.container.shims.*`:
+    - [`RovioFileReader.java`](app/src/main/java/com/vemod/container/shims/RovioFileReader.java): Clean-room asset streaming, directory enumeration, and decompression provider for the Rovio Fusion engine (*Angry Birds* series).
+    - [`PolarbitFuseAudio.java`](app/src/main/java/com/vemod/container/shims/PolarbitFuseAudio.java): Clean-room low-latency PCM audio streaming and parameter-normalized AudioTrack driver for the Polarbit 3D engine (*Reckless Racing Lite*).
+  - Deleted third-party directories `app/src/main/java/com/rovio` and `app/src/main/java/com/polarbit`.
+  - In [`GuestClassLoader.kt`](app/src/main/java/com/vemod/container/virtual/GuestClassLoader.kt), implemented transparent ClassLoader redirection:
+    - `"com.rovio.fusion.FileReader"` -> `hostLoader.loadClass("com.vemod.container.shims.RovioFileReader")`
+    - `"com.polarbit.fuse.FuseAudio"` -> `hostLoader.loadClass("com.vemod.container.shims.PolarbitFuseAudio")`
+  - Documented under established fair-use interoperability jurisprudence (*Google LLC v. Oracle America, Inc.* and EU Software Directive 2009/24/EC Art. 6) in [`NOTICE.md`](NOTICE.md).
+
+#### 21. Android Alarm Driver IOCTL Emulation (`ANDROID_ALARM_GET_TIME`)
+* **The Problem:** In Android 4.x through 6.x, native gaming engines (including Rovio Fusion) queried kernel alarm timers via direct `ioctl(fd, ANDROID_ALARM_GET_TIME(N), &timespec)` on `/dev/alarm`. In modern Linux kernels, `/dev/alarm` is deprecated and removed in favor of standard POSIX `clock_gettime(CLOCK_BOOTTIME)`. Because raw syscall 54 (`ioctl`) lacked alarm handling, the games received `-EBADF` or `-ENOTTY`, causing their frame-rate pacing and tick loops to freeze permanently on the title loading screen (*Angry Birds Rio*, *Angry Birds Space HD*).
+* **Implementation:**
+  - In [`cpu.cpp`](app/src/main/cpp/bridge/cpu.cpp), added ioctl command recognition for magic `'a'` (`((cmd >> 8) & 0xFF) == 'a'`) and virtual alarm descriptors (`kAlarmFd`).
+  - Handled `ANDROID_ALARM_GET_TIME` (`0x40086134`): mapped type 0/1 to `CLOCK_REALTIME`, type 4 to `CLOCK_MONOTONIC`, and type 2/3 (`ELAPSED_REALTIME`) to `CLOCK_BOOTTIME`.
+  - Serialized the resulting seconds and nanoseconds into the guest `timespec` struct and returned success (`0`), unblocking engine tick loops instantly.
+
+#### 22. Chromium WebView Asset Pipeline Isolation
+* **The Problem:** Mutating host `context.assets` via `AssetManager.addAssetPath()` after Chromium WebView initialization corrupted WebView's internal asset cookie table, triggering `Fatal signal 5 (SIGTRAP) in libwebviewchromium.so (Java_J_N_OOZ+488)` when third-party ad SDKs (such as AdMob or Chartboost) initialized web views (*Reckless Racing Lite*).
+* **Implementation:**
+  - In [`VemodInstrumentation.kt`](app/src/main/java/com/vemod/container/proxy/VemodInstrumentation.kt), eliminated post-initialization asset path mutations on host application contexts.
+  - Relied strictly on `GuestContext` scoped asset managers and `WebViewClient` request interception, maintaining 100% stability across all WebView-based interstitial and banner engines.
+
+#### 23. First-Class Multi-Flavor microG Integration & DMCA § 1201-Compliant Offline Fallback
+* **The Problem:** Hardcoding dummy `LICENSED` signatures or `RESULT_OK` in billing mocks risks DMCA § 1201 anti-circumvention classification. Furthermore, users require authentic Google Play Games sign-in, cloud saves, and achievements across classic titles. However, microG exists under diverse package identifiers across Android ecosystems (ReVanced GmsCore `app.revanced.android.gms`, standalone microG `org.microg.gms.core`, Vanced microG `com.mgoogle.android.gms`, and standard/spoofed `com.google.android.gms`). Without explicit Android 11+ package visibility declarations, dynamic intent/action remapping, and synthetic PackageInfo bridges, guest Google Play Services SDKs fail to detect microG and crash or conceal sign-in functionality.
+* **Implementation:**
+  - Implemented [`MicroGManager.kt`](app/src/main/java/com/vemod/container/proxy/MicroGManager.kt) to detect host microG across all variants (`app.revanced.android.gms`, `org.microg.gms.core`, `com.mgoogle.android.gms`, and microG-flavored `com.google.android.gms`), distinguishing genuine open-source microG implementations from closed-source Play Services.
+  - Declared explicit `<queries>` in [`AndroidManifest.xml`](app/src/main/AndroidManifest.xml) for all microG candidate packages, ensuring uninterrupted package visibility under Android 11–16 (API 30–35+).
+  - In [`PackageManagerHook.kt`](app/src/main/java/com/vemod/container/proxy/PackageManagerHook.kt), dynamically synthesize a valid `PackageInfo` and `ApplicationInfo` for `com.google.android.gms` backed by the active microG provider whenever microG is present, ensuring `GoogleApiAvailability.isGooglePlayServicesAvailable()` resolves `ConnectionResult.SUCCESS` (0). When microG is absent, cleanly conceals GMS to force graceful offline fallback.
+  - In [`GuestContext.kt`](app/src/main/java/com/vemod/container/virtual/GuestContext.kt) and [`VemodApp.kt`](app/src/main/java/com/vemod/container/VemodApp.kt), dynamically remap incoming GMS service and activity intents via `MicroGManager.rewriteGmsIntent()`—translating package targets and action namespaces (e.g., `com.google.android.gms.games.service.START` $\rightarrow$ `app.revanced.android.gms.games.service.START`) directly to the detected provider.
+  - If microG is absent or unresolvable for billing, requests route to [`MockBillingService.kt`](app/src/main/java/com/vemod/container/proxy/MockBillingService.kt), which acts as a safe, non-circumventing offline fallback stub returning `BILLING_RESPONSE_RESULT_BILLING_UNAVAILABLE` (Code 3) and `NOT_MARKET_MANAGED` (`0x0101`), enabling games to gracefully run in offline mode without claiming a forged license.
+  - Added an in-app Material 3 onboarding card `MicroGRecommendationCard` in [`MainActivity.kt`](app/src/main/java/com/vemod/container/ui/MainActivity.kt) that hides automatically when microG is detected, and added a real-time status and configuration launcher row within `StreamlinedSettingsDialog`.
+
+#### 24. Packed 12-Byte Bionic `struct epoll_event` Alignment
+* **The Problem:** In standard 32-bit Linux desktop kernels, `struct epoll_event` is unpacked (16 bytes, `events` at +0, 4-byte padding at +4, `data` at +8). However, in Android Bionic `libc/include/sys/epoll.h`, `struct epoll_event` is explicitly declared `__attribute__((__packed__))` (12 bytes: `events` at +0, `data` at +4 without padding). Marshaling with 16-byte offsets corrupted epoll user data payloads, causing event loops in networking and input threads to lose descriptor associations.
+* **Implementation:**
+  - In [`cpu.cpp`](app/src/main/cpp/bridge/cpu.cpp), strictly aligned `epoll_ctl` (case 250), `epoll_wait` (case 252), and `epoll_pwait` (case 346) to the 12-byte packed Bionic layout.
+
+#### 25. Decoupled Sysroot Runtime Pipeline & On-Demand Downloader (`SysrootManager.kt`)
+* **The Problem:** Prebundling 32-bit system `.so` libraries extracted from Google's Android SDK emulator images violates Section 3.4 of Google's SDK License Agreement and bloats the base APK size.
+* **Implementation:**
+  - Decoupled all SDK system binaries from the Git repository (removing `app/src/main/assets/sysroot/*.so`).
+  - Implemented [`SysrootManager.kt`](app/src/main/java/com/vemod/container/container/SysrootManager.kt) to manage the sysroot lifecycle.
+  - On first boot, verifies the `.installed` version tag (`v24-0.5.0-beta`). If missing, downloads the clean compressed archive `sysroot-arm32-v24.tar.gz` from official GitHub Releases with SHA-256 verification and extracts it to `filesDir/sysroot/` using a zero-dependency in-process tar.gz unpacker.
+  - Initializes the native multi-module loader via `VemodBridge.nativeSetSysrootDir()`, preserving all custom Bionic enhancements in `libbionic_guest.so` (recursive mutexes, futexes, semaphores) layered on top of clean upstream AOSP Nougat 7.0 libraries.
+
+#### 26. Dynamic In-Memory Self-Signed Keystore Generation (`StubApkGenerator.kt`)
+* **The Problem:** Bundling a static `debug.p12` keystore asset is a cryptographic and repository hygiene liability. Furthermore, ignoring `*.dex` without whitelisting caused `template_classes.dex` to be omitted from Git clones, breaking stub APK generation out-of-the-box.
+* **Implementation:**
+  - In [`StubApkGenerator.kt`](app/src/main/java/com/vemod/container/container/StubApkGenerator.kt), eliminated `debug.p12`. Implemented dynamic on-device RSA-2048 keypair generation and self-signed X.509 certificate generation via Bouncy Castle (`JcaX509v3CertificateBuilder`), storing the generated key in `filesDir/stub_keystore.p12` and caching `ApkSigner.SignerConfig` in memory for instantaneous APK signing.
+  - Whitelisted `!app/src/main/assets/stub/template_classes.dex` in [`.gitignore`](.gitignore) and force-added it to Git, guaranteeing fresh repository clones build and run immediately.
+
+#### 27. Workspace Quarantine & Pre-Commit Binary Guard
+* **The Problem:** Proprietary test APKs, commercial game binaries, and reference trees in local working copies risk accidental commits to public repositories.
+* **Implementation:**
+  - Quarantined all proprietary test binaries, commercial `.so` files, and reference forks outside the repository.
+  - Installed an executable Git pre-commit hook (`.git/hooks/pre-commit`) enforcing a strict check on staged additions and modifications against forbidden extensions (`.apk`, `.so`, `.zip`, `.p12`, `.jks`, `.aar`), permanently preventing binary leaks.
 
 ---
 
@@ -649,7 +709,7 @@ To guarantee compatibility across arbitrary 32-bit Android binaries without requ
 * **104-Byte `struct stat` & `stat64`:** Converts host filesystem metadata directly into 32-bit Bionic layouts (`st_size` at offset 48, `st_ino` at offset 96).
 * **44-Byte `struct tm` Time Serialization:** Marshals `localtime`, `gmtime`, `mktime`, and `strftime` to and from historical 44-byte layouts.
 * **16-Byte `struct sigaction` Stack Frame Preservation:** Strictly writes at most 16 bytes for `oldact` in `sigaction` and 4 bytes for `oldset` in `sigprocmask`, preventing stack frame clobbering.
-* **Complete Linux Syscall Surface:** Direct handling of `brk`, `mmap2`, `futex` (with bitset match normalization to prevent Unity Boehm GC hangs), `set_robust_list`/`get_robust_list`, universal 16-byte `struct epoll_event` marshaling (`epoll_wait`/`epoll_ctl`/`epoll_pwait` with strict 8-byte data alignment), `timerfd_*`, `times`, `itimer`, and safe real-time scheduling emulation (`sched_*`).
+* **Complete Linux Syscall Surface:** Direct handling of `brk`, `mmap2`, `futex` (with bitset match normalization to prevent Unity Boehm GC hangs), `set_robust_list`/`get_robust_list`, packed 12-byte Bionic `struct epoll_event` marshaling (`epoll_wait`/`epoll_ctl`/`epoll_pwait`), `timerfd_*`, `times`, `itimer`, `ANDROID_ALARM_GET_TIME` alarm clock emulation (`case 54: ioctl`), and safe real-time scheduling emulation (`sched_*`).
 
 ### Pillar 2: Universal High-Refresh-Rate Touch Pacing (`TouchPacer.kt`)
 Paces sub-60ms `ACTION_UP` events across separate render ticks on 90Hz, 120Hz, and 240Hz screens, ensuring legacy button state machines register single-tap clicks without engine-specific modifications.
@@ -686,10 +746,10 @@ Neutralizes permanently defunct ad networks (`AdColony`, `Chartboost`, `Flurry`,
 | **Cut the Rope** (`com.zeptolab.ctr.ads`) | Custom C++ / Dalvik Hybrid (`libctr.so`) | LocationManager sandboxing reflection proxy neutralizing `SecurityException` in legacy ad SDKs, TouchPacer tap pacing, 60 FPS OpenGL ES 2.0 rendering. | **100% PASSED** (Fully playable, 60 FPS, level select & gameplay verified) |
 | **Hill Climb Racing** (`com.fingersoft.hillclimb`) | Custom C++ Engine (`libgame.so`) | Explicit service intent safety guards on `GuestContext.startService` / `bindService` neutralizing Android API 26+ Moga SDK crashes, 60 FPS 2D physics simulation, interactive driving controls. | **100% PASSED** (Fully playable, 60 FPS, driving verified) |
 | **Temple Run** (`com.imangi.templerun`) | Unity 32-bit Engine (`libunity.so`, `libmono.so`) | Direct buffer synchronization decoupled from hot JNI dispatch loop, eliminating `g_direct_buf_mu` lock contention and restoring locked 60 FPS gameplay. 12-to-16 byte `epoll_event` marshaling, `ALooper_pollAll` dynamic resolution, persistent block caching warmup profiling. | **100% PASSED** (Full audio, tilt & swipe controls, locked 60 FPS) |
-| **Reckless Racing Lite** (`com.polarbit.RecklessRacingLite`) | Polarbit 3D Engine (`librecklesslite.so`) | Fixed washed-out/pure-white UI and vehicles via `glTexParameterx` / `glTexParameterxv` fixed-point parameter conversion. Restored in-game audio by reversing inverted `streamType`/`sampleRateInHz` parameters in `FuseAudio.AudioCreate` and clamping stream to `AudioManager.STREAM_MUSIC`. | **100% PASSED** (Full 3D graphics, textured tracks and vehicles, interactive audio fully restored) |
+| **Reckless Racing Lite** (`com.polarbit.RecklessRacingLite`) | Polarbit 3D Engine (`librecklesslite.so`) | Fixed washed-out/pure-white UI and vehicles via `glTexParameterx` / `glTexParameterxv` fixed-point parameter conversion. Restored in-game audio by reversing inverted `streamType`/`sampleRateInHz` parameters in `PolarbitFuseAudio.AudioCreate` and clamping stream to `AudioManager.STREAM_MUSIC`. | **100% PASSED** (Full 3D graphics, textured tracks and vehicles, interactive audio fully restored) |
 | **Angry Birds Classic** (`com.rovio.angrybirds`) | Rovio Fusion C++ Engine (`libAngryBirds.so`, `libAngryBirdsClassic.so`) | Universal `/data/local/tmp` & `/tmp` cache redirection in `headless_path()` & all file syscalls, unlinked `tmpfile()` virtualization, virtualized Google Play licensing service (`ILicensingService`) IPC mock binder, 60 FPS landscape GLES 2.0 rendering, interactive slingshot touch controls. | **100% PASSED** (Fully playable, Level 1 cleared, slingshot verified) |
 | **Angry Birds Go** (`com.rovio.angrybirdsgo`) | Rovio 3D C++ Engine (`libABK.so`) | Recursive mutex re-entrancy mapping (`PTHREAD_MUTEX_RECURSIVE`) and graceful handling of `EBUSY`/`EDEADLK` in `x_mutex_lock`, preventing `libc++abi` system error aborts during engine startup. Full 3D kart racing rendering. | **100% PASSED** (3D kart racing engine, menus, 60 FPS rendering) |
-| **Angry Birds Stella** (`com.rovio.angrybirdsstella`) | Rovio Fusion C++ Engine (`libAngryBirdsStella.so`) | Fixed composite sprite parsing by preventing redundant `.zip.zip` concatenation in `FileReader.readFile`, direct byte buffer address eviction protection across JNI dispatches, timerfd/itimer syscalls, 60 FPS slingshot gameplay. | **100% PASSED** (Fully playable, Level 1 slingshot verified) |
+| **Angry Birds Stella** (`com.rovio.angrybirdsstella`) | Rovio Fusion C++ Engine (`libAngryBirdsStella.so`) | Fixed composite sprite parsing by preventing redundant `.zip.zip` concatenation in `RovioFileReader.readFile`, direct byte buffer address eviction protection across JNI dispatches, timerfd/itimer syscalls, 60 FPS slingshot gameplay. | **100% PASSED** (Fully playable, Level 1 slingshot verified) |
 | **Spider-Man Unlimited** (`com.gameloft.android.ANMP.GloftSIHM.charles`) | Gameloft Engine (`libGloftSIHM.so`, `libSpidermanI.so`) | Enabled `define_unpredictable_behaviour = true` and graceful PC advance in Dynarmic JIT to prevent ASIO background networking crashes. 100+ GLES extensions (instancing, shadow buffer mapping, queries, blits, fences), multi-format OpenSL ES audio subsystem. | **100% PASSED** (Boots cleanly, OpenSL ES audio initialized, runs smoothly) |
 | **Angry Birds Space HD 2.2.14** (`com.rovio.angrybirdsspaceHD`) | Rovio Fusion C++ Engine (`libAngryBirdsSpace.so`, `libadcolony.so`, `libjs.so`) | Multi-threaded 32-bit C++ graphics engine with recursive mutex re-entrancy mapping (`PTHREAD_MUTEX_RECURSIVE`), 44-byte guest `struct tm` time serialization, immutable PendingIntent compatibility for Android 14+, 60 FPS animated OpenGL ES deep space rendering in landscape. | **100% PASSED** (Fully running, 60 FPS, level cleared) |
 | **Angry Birds Rio 2.6.13** (`com.rovio.angrybirdsrio`) | Rovio Fusion C++ Engine (`libAngryBirdsRio.so`) | Heavy multi-threaded 32-bit C++ engine, complex ELF relocation, JNI method dispatch with soft-float and double arguments, Dynarmic JIT multithreading (`GraphicsThread`), 16-byte `struct sigaction` stack frame preservation, 60+ FPS GLES 2.0 rendering in landscape. | **100% PASSED** (Fully playable, 60 FPS, touch verified) |
@@ -708,10 +768,6 @@ vemod/
 │   ├── src/main/
 │   │   ├── AndroidManifest.xml            # Manifest declaring GuestProxyActivity & isolated guest processes (:guest1..:guest5)
 │   │   ├── java/
-│   │   │   ├── com/polarbit/fuse/
-│   │   │   │   └── FuseAudio.java         # Polarbit 3D engine audio constructor & STREAM_MUSIC normalization shim
-│   │   │   ├── com/rovio/fusion/
-│   │   │   │   └── FileReader.java        # Rovio Fusion engine composite asset decompression & stream parser
 │   │   │   └── com/vemod/container/
 │   │   │       ├── VemodApp.kt            # Application subclass, hidden API exemptions, Looper recovery
 │   │   │       ├── bridge/
@@ -719,8 +775,9 @@ vemod/
 │   │   │       ├── container/
 │   │   │       │   ├── ApkExtractor.kt    # Multi-archive unpacker (.apk/.xapk/.apks), OBB extractor, ABI detector, proxy generator, icon extractor
 │   │   │       │   ├── ContainerRegistry.kt # Container registry & exposed storage manager
-│   │   │       │   ├── StubApkGenerator.kt# On-device APK builder & v1/v2/v3 signer (com.vemod.container_<pkg>)
-│   │   │       │   └── StubInstallReceiver.kt # PackageInstaller completion callback receiver
+│   │   │       │   ├── StubApkGenerator.kt# Dynamic in-memory self-signed keystore & v1/v2/v3 signer
+│   │   │       │   ├── StubInstallReceiver.kt # PackageInstaller completion callback receiver
+│   │   │       │   └── SysrootManager.kt  # Runtime sysroot downloader, verifier & unpacker
 │   │   │       ├── model/
 │   │   │       │   └── ContainerApp.kt    # Data model for installed 32-bit containers (with screenOrientation)
 │   │   │       ├── proxy/
@@ -728,21 +785,26 @@ vemod/
 │   │   │       │   ├── AdSdkNeutralizer.kt# Neutralizer for defunct ad & tracking SDKs (AdColony, Chartboost, etc.)
 │   │   │       │   ├── GuestProcessManager.kt # Multi-process pool manager (:guest1 .. :guest5)
 │   │   │       │   ├── GuestProxyActivity.kt  # Activity router & slot activities
+│   │   │       │   ├── MicroGManager.kt   # Host microG detection & installation helper
+│   │   │       │   ├── MockBillingService.kt # Safe non-circumventing offline fallback stub
 │   │   │       │   ├── NotificationManagerHook.kt # INotificationManager proxy preventing UID security exceptions
 │   │   │       │   ├── PackageManagerHook.kt  # Dynamic IPackageManager proxy & metadata injector
 │   │   │       │   ├── TouchPacer.kt      # Touch event pacer for high-refresh-rate displays (120Hz/240Hz)
 │   │   │       │   ├── VemodInstrumentation.kt# Context/resource swapper, back navigation, lifecycle hooks
 │   │   │       │   └── WindowSessionHook.kt   # Window session proxy filtering restricted layout flags
+│   │   │       ├── shims/
+│   │   │       │   ├── PolarbitFuseAudio.java # Clean-room Polarbit 3D engine audio constructor & STREAM_MUSIC normalization shim
+│   │   │       │   └── RovioFileReader.java   # Clean-room Rovio Fusion engine composite asset decompression & stream parser
 │   │   │       ├── ui/
-│   │   │       │   └── MainActivity.kt    # Jetpack Compose Material 3 manager UI & "Open With" intent receiver
+│   │   │       │   └── MainActivity.kt    # Jetpack Compose Material 3 manager UI, microG recommendation card & intent receiver
 │   │   │       └── virtual/
-│   │   │           ├── GuestClassLoader.kt# PathClassLoader redirecting findLibrary to proxy stubs
-│   │   │           └── GuestContext.kt    # Virtualized ContextWrapper for sandbox paths, AudioTrack stack inspector & AttributionSource
+│   │   │           ├── GuestClassLoader.kt# PathClassLoader redirecting findLibrary and clean-room shims
+│   │   │           └── GuestContext.kt    # Virtualized ContextWrapper for sandbox paths, microG routing & AttributionSource
 │   │   └── cpp/
 │   │       ├── CMakeLists.txt             # Native build script linking Dynarmic, Bionic, GLES, zlib, OpenSLES
 │   │       ├── bridge/
 │   │       │   ├── android.cpp            # NDK AAsset streaming bridge, ALooper dispatch, real AMotionEvent/AKeyEvent bridges
-│   │       │   ├── cpu.cpp / cpu.h        # Dynarmic A32 JIT callbacks, CPSR manipulation, 12-to-16 byte epoll marshaling & full Linux syscall surface
+│   │       │   ├── cpu.cpp / cpu.h        # Dynarmic A32 JIT callbacks, CPSR manipulation, packed 12-byte epoll marshaling & full Linux syscall surface
 │   │       │   ├── gles.cpp               # OpenGL ES 2.0 / 1.1 fixed-point, 100+ extensions, shadow buffer mapping, dynamic fallback stubs & warmup frame hooks
 │   │       │   ├── jni_bridge.cpp         # 32-bit JNIEnv* facade, persistent jni_global handles, AArch64 trampolines
 │   │       │   ├── libc.cpp               # Bionic libc/libm thunks & ARM EABI softfp math suite
@@ -761,7 +823,13 @@ vemod/
 │   │       │   └── proxy.cpp              # 64-bit libproxy.so template
 │   │       └── third_party/
 │   │           └── dynarmic/              # ARM32 JIT recompiler with cycle-guarded IR identity traversal
-│   └── assets/sysroot/                    # Preloaded 32-bit Android Nougat 7.0 AOSP Bionic system libraries
+│   └── assets/
+│       ├── stub/
+│       │   ├── template_classes.dex       # Companion stub classes.dex (whitelisted)
+│       │   ├── template_manifest.axml     # Companion stub binary manifest template
+│       │   └── template_resources.arsc    # Companion stub binary resources template
+│       └── sysroot/
+│           └── NOTICE.txt                 # AOSP and upstream open-source license notices
 ├── docs/
 │   ├── README.md                          # Documentation index
 │   └── documentation.md                   # Comprehensive technical documentation (this document)

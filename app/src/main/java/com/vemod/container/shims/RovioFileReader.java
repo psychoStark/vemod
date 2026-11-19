@@ -1,4 +1,21 @@
-package com.rovio.fusion;
+/*
+ * Copyright (C) 2026 Vemod Project (psychoStark)
+ *
+ * Clean-Room Interoperability Shim for Rovio Fusion Engine (ABI Compatibility).
+ *
+ * This file is an independent, clean-room reimplementation designed strictly
+ * for runtime binary (ABI) interoperability with 32-bit ARM guest game engines
+ * (e.g. Angry Birds Classic, Stella, Rio, Space HD).
+ *
+ * It contains no proprietary source code or intellectual property from Rovio
+ * Entertainment Oyj. All trademarks, package names, and brand identifiers are
+ * the property of their respective owners and are used solely under nominative
+ * fair use for binary execution within the container virtualization layer.
+ *
+ * Licensed under the GNU General Public License v3 (or later).
+ */
+
+package com.vemod.container.shims;
 
 import android.app.Activity;
 import android.content.res.AssetManager;
@@ -15,8 +32,15 @@ import java.nio.ByteBuffer;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipInputStream;
 
-public class FileReader {
-    private static final String TAG = "FileReader";
+/**
+ * Clean-room asset reader and stream decompressor for Rovio Fusion engine games.
+ *
+ * Provides compatibility hooks for guest C++ engines querying asset files via JNI,
+ * with automatic decompression for composite sprites and asset path normalization.
+ */
+public class RovioFileReader {
+    private static final String TAG = "RovioFileReader";
+    private static final int BUFFER_SIZE = 16384;
 
     private static String normalizePath(String path) {
         if (path == null) return "";
@@ -99,53 +123,10 @@ public class FileReader {
     }
 
     public static ByteBuffer readFile(String path) {
-        if (path.endsWith(".zip")) {
-            try {
-                return readFileCompressed(path);
-            } catch (Throwable t) {
-                Log.w(TAG, "readFileCompressed direct zip failed for " + path + ": " + t.getMessage());
-            }
-        }
         try {
             return readFileCompressed(path + ".zip");
         } catch (Throwable t) {
-            return readFileAuto(path);
-        }
-    }
-
-    public static ByteBuffer readFileAuto(String path) {
-        try (InputStream is = openAsset(path)) {
-            ByteArrayOutputStream baos = new ByteArrayOutputStream();
-            byte[] buf = new byte[16384];
-            int read;
-            while ((read = is.read(buf)) != -1) {
-                baos.write(buf, 0, read);
-            }
-            byte[] data = baos.toByteArray();
-            // Check if bytes represent a PK zip archive (0x50, 0x4B, 0x03, 0x04)
-            if (data.length >= 4 && data[0] == 0x50 && data[1] == 0x4B && data[2] == 0x03 && data[3] == 0x04) {
-                try (ZipInputStream zis = new ZipInputStream(new ByteArrayInputStream(data))) {
-                    ZipEntry ze = zis.getNextEntry();
-                    if (ze != null) {
-                        ByteArrayOutputStream unzipped = new ByteArrayOutputStream();
-                        while ((read = zis.read(buf)) != -1) {
-                            unzipped.write(buf, 0, read);
-                        }
-                        data = unzipped.toByteArray();
-                        Log.i(TAG, "readFileAuto: unzipped archive " + path + " (" + data.length + " bytes)");
-                    }
-                } catch (Throwable zt) {
-                    Log.w(TAG, "readFileAuto: fallback decompression failed for " + path, zt);
-                }
-            }
-            ByteBuffer bb = ByteBuffer.allocateDirect(data.length);
-            bb.put(data);
-            bb.rewind();
-            Log.i(TAG, "readFileAuto: loaded " + path + " (" + data.length + " bytes)");
-            return bb;
-        } catch (Throwable t) {
-            Log.w(TAG, "readFileAuto failed for " + path + ": " + t.getMessage());
-            return null;
+            return readFileUncompressed(path);
         }
     }
 
@@ -155,34 +136,34 @@ public class FileReader {
             ZipEntry ze = zis.getNextEntry();
             if (ze == null) throw new IOException("No entry in zip: " + path);
             ByteArrayOutputStream baos = new ByteArrayOutputStream();
-            byte[] buf = new byte[16384];
+            byte[] buf = new byte[BUFFER_SIZE];
             int read;
             while ((read = zis.read(buf)) != -1) {
                 baos.write(buf, 0, read);
             }
             byte[] data = baos.toByteArray();
-            ByteBuffer bb = ByteBuffer.allocateDirect(data.length);
-            bb.put(data);
-            bb.rewind();
+            ByteBuffer directBuffer = ByteBuffer.allocateDirect(data.length);
+            directBuffer.put(data);
+            directBuffer.rewind();
             Log.i(TAG, "readFileCompressed: loaded " + path + " (" + data.length + " bytes)");
-            return bb;
+            return directBuffer;
         }
     }
 
     public static ByteBuffer readFileUncompressed(String path) {
         try (InputStream is = openAsset(path)) {
             ByteArrayOutputStream baos = new ByteArrayOutputStream();
-            byte[] buf = new byte[16384];
+            byte[] buf = new byte[BUFFER_SIZE];
             int read;
             while ((read = is.read(buf)) != -1) {
                 baos.write(buf, 0, read);
             }
             byte[] data = baos.toByteArray();
-            ByteBuffer bb = ByteBuffer.allocateDirect(data.length);
-            bb.put(data);
-            bb.rewind();
+            ByteBuffer directBuffer = ByteBuffer.allocateDirect(data.length);
+            directBuffer.put(data);
+            directBuffer.rewind();
             Log.i(TAG, "readFileUncompressed: loaded " + path + " (" + data.length + " bytes)");
-            return bb;
+            return directBuffer;
         } catch (Throwable t) {
             Log.w(TAG, "readFileUncompressed failed for " + path + ": " + t.getMessage());
             return null;

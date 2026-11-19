@@ -124,12 +124,46 @@ class VemodApp : Application() {
         val action = service.action ?: ""
         return pkg.contains("com.google.android.gms") ||
                action.contains("com.google.android.gms") ||
-               pkg.contains("google")
+               pkg.contains("google") ||
+               action.contains("licensing", ignoreCase = true) ||
+               pkg.contains("licensing", ignoreCase = true) ||
+               pkg.contains("com.android.vending")
     }
 
     override fun bindService(service: android.content.Intent, conn: android.content.ServiceConnection, flags: Int): Boolean {
-        if (com.vemod.container.proxy.MockBillingService.isBillingOrLicensing(service)) {
+        val isGmsTarget = com.vemod.container.proxy.MicroGManager.isGmsTarget(service)
+        val isBillingOrLicensing = service.action?.contains("billing", ignoreCase = true) == true ||
+                                   service.action?.contains("licensing", ignoreCase = true) == true
+
+        if (isBillingOrLicensing) {
+            if (com.vemod.container.proxy.MicroGManager.isMicroGInstalled(this)) {
+                val rewritten = com.vemod.container.proxy.MicroGManager.rewriteGmsIntent(service, this)
+                val canResolve = packageManager.resolveService(rewritten, 0) != null
+                if (canResolve) {
+                    return try {
+                        super.bindService(rewritten, conn, flags)
+                    } catch (e: Throwable) {
+                        Log.w("VemodApp", "Delegated service bind to microG billing failed, falling back to mock: ${e.message}")
+                        com.vemod.container.proxy.MockBillingService.mockBind(service, conn)
+                    }
+                }
+            }
             return com.vemod.container.proxy.MockBillingService.mockBind(service, conn)
+        }
+
+        if (isGmsTarget) {
+            if (com.vemod.container.proxy.MicroGManager.isMicroGInstalled(this)) {
+                val rewritten = com.vemod.container.proxy.MicroGManager.rewriteGmsIntent(service, this)
+                Log.i("VemodApp", "Delegating application bindService directly to host microG: $rewritten")
+                return try {
+                    super.bindService(rewritten, conn, flags)
+                } catch (e: Throwable) {
+                    Log.w("VemodApp", "Delegated application bindService to microG failed: ${e.message}")
+                    false
+                }
+            } else {
+                return com.vemod.container.proxy.MockBillingService.mockBind(service, conn)
+            }
         }
         if (isGoogleService(service)) {
             Log.w("VemodApp", "Preventing Application.bindService to Google service: $service")
@@ -139,6 +173,19 @@ class VemodApp : Application() {
     }
 
     override fun startService(service: android.content.Intent): android.content.ComponentName? {
+        val isGmsTarget = com.vemod.container.proxy.MicroGManager.isGmsTarget(service)
+        if (isGmsTarget) {
+            if (com.vemod.container.proxy.MicroGManager.isMicroGInstalled(this)) {
+                val rewritten = com.vemod.container.proxy.MicroGManager.rewriteGmsIntent(service, this)
+                return try {
+                    super.startService(rewritten)
+                } catch (e: Throwable) {
+                    Log.w("VemodApp", "Delegated startService to microG failed: ${e.message}")
+                    null
+                }
+            }
+            return null
+        }
         if (isGoogleService(service)) {
             Log.w("VemodApp", "Preventing Application.startService to Google service: $service")
             return null
@@ -148,22 +195,9 @@ class VemodApp : Application() {
 
     private fun extractSysroot() {
         try {
-            val sysrootDir = java.io.File(filesDir, "sysroot")
-            if (!sysrootDir.exists()) {
-                sysrootDir.mkdirs()
-            }
-            val files = assets.list("sysroot") ?: emptyArray()
-            for (filename in files) {
-                val outFile = java.io.File(sysrootDir, filename)
-                val assetBytes = assets.open("sysroot/$filename").use { it.readBytes() }
-                if (!outFile.exists() || outFile.length() != assetBytes.size.toLong()) {
-                    outFile.writeBytes(assetBytes)
-                    Log.i("VemodApp", "Updated sysroot asset: $filename (${assetBytes.size} bytes)")
-                }
-            }
-            com.vemod.container.bridge.VemodBridge.nativeSetSysrootDir(sysrootDir.absolutePath)
+            com.vemod.container.container.SysrootManager.ensureSysroot(this)
         } catch (e: Throwable) {
-            Log.e("VemodApp", "Failed to extract sysroot", e)
+            Log.e("VemodApp", "Failed to initialize sysroot", e)
         }
     }
 }

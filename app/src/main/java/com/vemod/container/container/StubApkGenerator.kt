@@ -138,16 +138,7 @@ object StubApkGenerator {
             }
 
             // 6. Sign APK with v1, v2, v3 via official ApkSigner
-            val ks = KeyStore.getInstance("PKCS12")
-            context.assets.open("stub/debug.p12").use { ks.load(it, "android".toCharArray()) }
-            val privateKey = ks.getKey("androiddebugkey", "android".toCharArray()) as PrivateKey
-            val cert = ks.getCertificate("androiddebugkey") as X509Certificate
-
-            val signerConfig = ApkSigner.SignerConfig.Builder(
-                "androiddebugkey",
-                privateKey,
-                listOf(cert)
-            ).build()
+            val signerConfig = getSignerConfig(context)
 
             if (targetApk.exists()) targetApk.delete()
 
@@ -167,6 +158,56 @@ object StubApkGenerator {
                 tempUnsigned.delete()
             }
         }
+    }
+
+    private var cachedSignerConfig: ApkSigner.SignerConfig? = null
+
+    @Synchronized
+    private fun getSignerConfig(context: Context): ApkSigner.SignerConfig {
+        cachedSignerConfig?.let { return it }
+
+        val keystoreFile = File(context.filesDir, "stub_keystore.p12")
+        val password = "vemod_internal_debug".toCharArray()
+        val alias = "vemod_stub"
+        val ks = KeyStore.getInstance("PKCS12")
+
+        if (!keystoreFile.exists()) {
+            ks.load(null, null)
+            val kpg = java.security.KeyPairGenerator.getInstance("RSA")
+            kpg.initialize(2048)
+            val keyPair = kpg.generateKeyPair()
+
+            val cert = generateSelfSignedCertificate(keyPair, "CN=Vemod Stub, O=Vemod")
+            ks.setKeyEntry(alias, keyPair.private, password, arrayOf(cert))
+            keystoreFile.outputStream().use { ks.store(it, password) }
+            Log.i(TAG, "Generated fresh self-signed PKCS12 keystore for stub signing")
+        } else {
+            keystoreFile.inputStream().use { ks.load(it, password) }
+        }
+
+        val privateKey = ks.getKey(alias, password) as PrivateKey
+        val cert = ks.getCertificate(alias) as X509Certificate
+        val config = ApkSigner.SignerConfig.Builder(alias, privateKey, listOf(cert)).build()
+        cachedSignerConfig = config
+        return config
+    }
+
+    private fun generateSelfSignedCertificate(keyPair: java.security.KeyPair, dn: String): X509Certificate {
+        val subject = org.bouncycastle.asn1.x500.X500Name(dn)
+        val notBefore = java.util.Date(System.currentTimeMillis() - 24 * 3600 * 1000L)
+        val notAfter = java.util.Date(System.currentTimeMillis() + 30L * 365 * 24 * 3600 * 1000L)
+        val serial = java.math.BigInteger(64, java.security.SecureRandom())
+        val builder = org.bouncycastle.cert.jcajce.JcaX509v3CertificateBuilder(
+            subject,
+            serial,
+            notBefore,
+            notAfter,
+            subject,
+            keyPair.public
+        )
+        val signer = org.bouncycastle.operator.jcajce.JcaContentSignerBuilder("SHA256withRSA").build(keyPair.private)
+        val certHolder = builder.build(signer)
+        return org.bouncycastle.cert.jcajce.JcaX509CertificateConverter().getCertificate(certHolder)
     }
 
     fun installStub(context: Context, app: ContainerApp) {

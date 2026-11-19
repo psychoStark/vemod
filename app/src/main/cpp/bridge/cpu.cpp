@@ -1038,8 +1038,35 @@ static void do_syscall(Cpu& cpu) {
         int fd = r[0];
         u32 cmd = r[1];
         gaddr arg = r[2];
-        if (fd == kAlarmFd) { r[0] = 0; return; }
-        int res = ioctl(fd, cmd, arg ? h(arg) : nullptr);
+        if (vfd_is(fd)) {
+            if (cmd == 0x541B) {
+                s64 pos = vfd_lseek(fd, 0, SEEK_CUR);
+                if (arg && is_mapped(arg)) wr<s32>(arg, s32(vfd_size(fd)) - s32(pos));
+                r[0] = 0;
+            } else {
+                r[0] = u32(-ENOTTY);
+            }
+            return;
+        }
+        if (fd == kAlarmFd || ((cmd >> 8) & 0xFF) == 'a') {
+            u8 nr = cmd & 0xFF;
+            u8 op = nr & 0x0F;
+            u8 type = nr >> 4;
+            if (op == 4) {  // ANDROID_ALARM_GET_TIME
+                clockid_t cid = CLOCK_BOOTTIME;
+                if (type == 0 || type == 1) cid = CLOCK_REALTIME;
+                else if (type == 4) cid = CLOCK_MONOTONIC;
+                struct timespec ts;
+                clock_gettime(cid, &ts);
+                if (arg && is_mapped(arg)) {
+                    wr<s32>(arg, s32(ts.tv_sec));
+                    wr<s32>(arg + 4, s32(ts.tv_nsec));
+                }
+            }
+            r[0] = 0;
+            return;
+        }
+        int res = ioctl(fd, cmd, arg && is_mapped(arg) ? h(arg) : nullptr);
         r[0] = res < 0 ? -errno : res;
         return;
     }
@@ -2099,8 +2126,8 @@ static void do_syscall(Cpu& cpu) {
         struct epoll_event* p_ev = nullptr;
         if (ev_addr && is_mapped(ev_addr)) {
             host_ev.events = rd<u32>(ev_addr);
-            // ARM 32-bit epoll_event has 4-byte padding after events: data is at offset 8
-            host_ev.data.u64 = rd<u64>(ev_addr + 8);
+            // ARM 32-bit Android Bionic epoll_event is packed (12 bytes): data is at offset 4
+            host_ev.data.u64 = rd<u64>(ev_addr + 4);
             p_ev = &host_ev;
         }
         int res = epoll_ctl(epfd, op, fd, p_ev);
@@ -2121,12 +2148,11 @@ static void do_syscall(Cpu& cpu) {
         int res = epoll_wait(epfd, host_events, safe_max, timeout);
         if (res > 0) {
             for (int i = 0; i < res; ++i) {
-                // ARM 32-bit struct epoll_event size is 16 bytes:
-                // offset 0: events (u32), offset 4: padding (u32), offset 8: data (u64)
-                gaddr out = ev_addr + i * 16;
+                // ARM 32-bit struct epoll_event size is 12 bytes packed:
+                // offset 0: events (u32), offset 4: data (u64)
+                gaddr out = ev_addr + i * 12;
                 wr<u32>(out + 0, host_events[i].events);
-                wr<u32>(out + 4, 0);
-                wr<u64>(out + 8, host_events[i].data.u64);
+                wr<u64>(out + 4, host_events[i].data.u64);
             }
         }
         r[0] = res < 0 ? -errno : res;
@@ -2157,12 +2183,11 @@ static void do_syscall(Cpu& cpu) {
         int res = epoll_pwait(epfd, host_events, safe_max, timeout, p_sigmask);
         if (res > 0) {
             for (int i = 0; i < res; ++i) {
-                // ARM 32-bit struct epoll_event size is 16 bytes:
-                // offset 0: events (u32), offset 4: padding (u32), offset 8: data (u64)
-                gaddr out = ev_addr + i * 16;
+                // ARM 32-bit struct epoll_event size is 12 bytes packed:
+                // offset 0: events (u32), offset 4: data (u64)
+                gaddr out = ev_addr + i * 12;
                 wr<u32>(out + 0, host_events[i].events);
-                wr<u32>(out + 4, 0);
-                wr<u64>(out + 8, host_events[i].data.u64);
+                wr<u64>(out + 4, host_events[i].data.u64);
             }
         }
         r[0] = res < 0 ? -errno : res;
@@ -2506,10 +2531,7 @@ u64 call_guest(gaddr fn, const GArg* args, size_t n) {
             c.jit->ClearHalt(Dynarmic::HaltReason::UserDefined1);
         }
     }
-    if (t.exiting) {
-        fatal("call_guest: guest thread %u exited with status %u", t.tid, t.exit_value);
-    }
-    u64 res = R[0] | (u64(R[1]) << 32);
+    u64 res = t.exiting ? t.exit_value : (R[0] | (u64(R[1]) << 32));
     --t.depth;
     return res;
 }

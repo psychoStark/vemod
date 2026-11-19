@@ -17,8 +17,16 @@ class GuestClassLoader(
     } catch (_: Throwable) { null }
 
     override fun loadClass(name: String, resolve: Boolean): Class<*> {
-        // Force Vemod bridge classes, Rovio FileReader, and FuseAudio hook to resolve from the host loader
-        if (name.startsWith("com.vemod.container.bridge.") || name == "com.rovio.fusion.FileReader" || name == "com.polarbit.fuse.FuseAudio") {
+        // Transparently map guest JNI/reflection lookups to clean Vemod shims
+        when (name) {
+            "com.rovio.fusion.FileReader" -> {
+                return hostLoader.loadClass("com.vemod.container.shims.RovioFileReader")
+            }
+            "com.polarbit.fuse.FuseAudio" -> {
+                return hostLoader.loadClass("com.vemod.container.shims.PolarbitFuseAudio")
+            }
+        }
+        if (name.startsWith("com.vemod.container.bridge.")) {
             return hostLoader.loadClass(name)
         }
         if (name.startsWith("org.apache.http.") && httpLoader != null) {

@@ -19,12 +19,20 @@
     <uses-permission android:name="android.permission.HIGH_SAMPLING_RATE_SENSORS" />
 
     <queries>
+        <package android:name="com.google.android.gms" />
+        <package android:name="app.revanced.android.gms" />
+        <package android:name="com.mgoogle.android.gms" />
+        <package android:name="org.microg.gms.core" />
+        <package android:name="com.android.vending" />
         <intent>
             <action android:name="android.intent.action.MAIN" />
         </intent>
         <intent>
             <action android:name="android.intent.action.DELETE" />
             <data android:scheme="package" />
+        </intent>
+        <intent>
+            <action android:name="com.google.android.gms.actions.SEARCH_ACTION" />
         </intent>
     </queries>
 

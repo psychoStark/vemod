@@ -64,28 +64,6 @@ class VemodInstrumentation(
                 val c2 = addAssetPath.invoke(am, baseApk.absolutePath) as? Int ?: 0
                 Log.i(TAG, "createGuestResources: c1(framework)=$c1, c2(guest)=$c2 for ${baseApk.name}")
 
-                // Add guest baseApk to host context.assets so Chromium can find file:///android_asset/...
-                try {
-                    addAssetPath.invoke(context.assets, baseApk.absolutePath)
-                    Log.i(TAG, "Added guest baseApk to context.assets")
-                } catch (e: Throwable) {
-                    Log.w(TAG, "Failed to add baseApk to context.assets", e)
-                }
-
-                // Add WebView package assets to guest am so Chromium internal .pak files resolve
-                try {
-                    val wvf = Class.forName("android.webkit.WebViewFactory")
-                    val m = wvf.getDeclaredMethod("getLoadedPackageInfo")
-                    m.isAccessible = true
-                    val loadedPkg = m.invoke(null) as? android.content.pm.PackageInfo
-                    val appInfo = loadedPkg?.applicationInfo
-                    if (appInfo != null) {
-                        addAssetPath.invoke(am, appInfo.sourceDir)
-                        appInfo.splitSourceDirs?.forEach { addAssetPath.invoke(am, it) }
-                        Log.i(TAG, "Added WebView package assets to guest AssetManager")
-                    }
-                } catch (_: Throwable) {}
-
                 try {
                     val getAssignedPackages = android.content.res.AssetManager::class.java.getDeclaredMethod("getAssignedPackageIdentifiers")
                     getAssignedPackages.isAccessible = true
