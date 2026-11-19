@@ -718,6 +718,13 @@ Following in-depth investigation of legacy titles documented in `DIAGNOSIS_REPOR
   - In [`VemodInstrumentation.kt`](app/src/main/java/com/vemod/container/proxy/VemodInstrumentation.kt), universalized `TouchPacer.install(activity)` for all guest containers, pacing sub-60ms `ACTION_UP` events universally without vendor-specific package filters.
   - In [`AdSdkNeutralizer.kt`](app/src/main/java/com/vemod/container/proxy/AdSdkNeutralizer.kt), removed all proprietary state manipulation (such as forcing `NO_ADS` or targeting internal ProGuard-obfuscated fields), restricting neutralization strictly to framework-level crash suppression (catching looper exceptions, hiding dead permission error overlays, and handling unresolvable web views).
 
+#### 30. Defunct AdMob Dynamite & GMS UID SecurityException Suppression in Background HandlerThreads
+* **The Problem:** Obsolete games containing embedded Google AdMob/Dynamite modules spawn background worker threads (e.g. `LooperProvider` / `HandlerThread`). These threads invoke obsolete GMS IPC endpoints where the system throws `SecurityException: UID [10618] is not related to packageName [...] (seems to be com.psychostark.vemod)`. Because these exceptions occur on background `HandlerThread`s with ProGuard-obfuscated classes (e.g. `m84.bsz`), standard class name filters fail to identify them, terminating the container process.
+* **Implementation:**
+  - In [`VemodApp.kt`](app/src/main/java/com/vemod/container/VemodApp.kt) and [`VemodInstrumentation.kt`](app/src/main/java/com/vemod/container/proxy/VemodInstrumentation.kt), enhanced the global and thread-level `UncaughtExceptionHandler` pipelines.
+  - Recursively inspect exception causes and inspect `StackTraceElement.fileName` (matching `google.android.gms` and `dynamite` source markers) in addition to class names.
+  - Explicitly trap and suppress `SecurityException`s with messages containing `"is not related to packageName"`, `"Unknown calling package name"`, or `"not owned by uid"`. Defunct ad threads are safely logged as warnings and terminated without killing the container's main rendering loop.
+
 ---
 
 ## 4. Maximum 32-Bit Compatibility: The Five Architectural Pillars

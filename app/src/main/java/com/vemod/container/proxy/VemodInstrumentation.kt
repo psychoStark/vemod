@@ -139,8 +139,33 @@ class VemodInstrumentation(
                     // Catch unhandled background handler/looper crashes in guest threads
                     val prevHandler = Thread.getDefaultUncaughtExceptionHandler()
                     Thread.setDefaultUncaughtExceptionHandler { t, e ->
-                        if (e.message?.contains("Can't create handler inside thread") == true) {
-                            Log.w(TAG, "Suppressed background thread looper exception on ${t.name}", e)
+                        var cur: Throwable? = e
+                        var shouldSwallow = false
+                        while (cur != null) {
+                            val msg = cur.message ?: ""
+                            val isAdOrGms = cur.stackTrace.any {
+                                it.className.contains("google.android.gms") ||
+                                (it.fileName?.contains("google.android.gms") == true) ||
+                                (it.fileName?.contains("dynamite") == true) ||
+                                it.className.contains("chartboost") ||
+                                it.className.contains("unity3d.ads") ||
+                                it.className.contains("applovin") ||
+                                it.className.contains("mopub") ||
+                                it.className.contains("vungle") ||
+                                it.className.contains("adcolony")
+                            }
+                            if (msg.contains("Can't create handler inside thread") ||
+                                msg.contains("is not related to packageName") ||
+                                msg.contains("not owned by uid") ||
+                                msg.contains("Unknown calling package name") ||
+                                isAdOrGms) {
+                                shouldSwallow = true
+                                break
+                            }
+                            cur = cur.cause
+                        }
+                        if (shouldSwallow) {
+                            Log.w(TAG, "Suppressed background thread exception on ${t.name}: ${e.message}")
                             return@setDefaultUncaughtExceptionHandler
                         }
                         prevHandler?.uncaughtException(t, e)

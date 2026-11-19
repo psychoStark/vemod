@@ -65,6 +65,8 @@ class VemodApp : Application() {
                 val isAdOrGms = t.stackTrace.any { 
                     it.className.contains("basegameutils") || 
                     it.className.contains("google.android.gms") ||
+                    (it.fileName?.contains("google.android.gms") == true) ||
+                    (it.fileName?.contains("dynamite") == true) ||
                     it.className.contains("chartboost") ||
                     it.className.contains("unity3d.ads") ||
                     it.className.contains("applovin") ||
@@ -80,6 +82,7 @@ class VemodApp : Application() {
                     msg.contains("Unknown calling package name") ||
                     msg.contains("Can't create handler inside thread") ||
                     msg.contains("not owned by uid") ||
+                    msg.contains("is not related to packageName") ||
                     msg.contains("org.apache.http") ||
                     isAdOrGms) {
                     shouldSwallow = true
